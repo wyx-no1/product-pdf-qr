@@ -1,0 +1,28 @@
+# Project convention file declaring this repository's expected automation behavior.
+# Whether Agent Orchestrator or any other tool automatically reads this file is not yet verified.
+
+version: 1 # Convention document version; this is not a claim of tool schema compatibility.
+
+automation: # Repository-wide expectations for automated behavior.
+  mode: notify-only # Default behavior is to notify a human and take no automated corrective action.
+  auto_rework: false # Never start remediation or code changes automatically.
+  auto_merge: false # Never merge a pull request automatically.
+  auto_advance: false # Never start the next delivery stage automatically.
+
+events: # Event-specific expectations; every event remains notification-only.
+  test_failure: # Behavior expected when any required test fails.
+    action: notify-only # Report failed tests without starting automated rework.
+    auto_rework: false # A human must explicitly authorize any test-failure remediation.
+    auto_merge: false # Failed tests can never trigger or permit an automatic merge.
+  review_changes_requested: # Behavior expected when a reviewer requests changes.
+    action: notify-only # Report requested review changes without modifying the branch automatically.
+    auto_rework: false # A worker must be explicitly assigned before review feedback is addressed.
+    auto_merge: false # Requested changes can never trigger or permit an automatic merge.
+  merge_conflict: # Behavior expected when the pull request has merge conflicts.
+    action: notify-only # Report merge conflicts without resolving or rewriting history automatically.
+    auto_rework: false # Conflict resolution requires an explicitly assigned human or worker action.
+    auto_merge: false # A conflicted pull request can never be merged automatically.
+  merge_ready: # Behavior expected when the pull request appears ready to merge.
+    action: notify-only # Report that checks indicate merge readiness, leaving the decision to a human.
+    auto_rework: false # Merge readiness does not start additional automated work.
+    auto_merge: false # Even a merge-ready pull request requires explicit human approval and merge.
