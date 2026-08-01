@@ -1,0 +1,63 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Dependencies and virtual environments
+node_modules/
+vendor/
+venv/
+.venv/
+env/
+.bundle/
+
+# Build artifacts
+dist/
+build/
+out/
+target/
+bin/
+obj/
+*.egg-info/
+
+# Test output and tool caches
+coverage/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.cache/
+__pycache__/
+*.py[cod]
+
+# Local uploads and storage
+uploads/
+storage/local/
+tmp/
+temp/
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs and runtime files
+*.log
+logs/
+*.pid
+*.pid.lock
