@@ -385,7 +385,7 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                     "restore-v2.pdf",
                 )
                 assert restore_v1.status_code == restore_v2.status_code == 201
-                restore_v1_id = cast(int, restore_v1.json()["id"])
+                restore_v1_id = cast(int, restore_v1.json()["version_id"])
                 restore_v3, _ = await asyncio.gather(
                     upload(
                         client,
@@ -401,7 +401,7 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                     ),
                 )
                 assert restore_v3.status_code == 201
-                restore_v3_id = cast(int, restore_v3.json()["id"])
+                restore_v3_id = cast(int, restore_v3.json()["version_id"])
 
         assert [response.status_code for response in responses].count(201) == 1
         assert [response.status_code for response in responses].count(409) == 7
