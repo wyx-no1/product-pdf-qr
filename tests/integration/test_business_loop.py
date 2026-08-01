@@ -113,6 +113,44 @@ async def upload(
     )
 
 
+async def simulate_locked_restore(
+    runtime_url: str,
+    product_id: int,
+    version_id: int,
+) -> None:
+    """Model the Phase 2 restore writer without exposing a management endpoint."""
+
+    async with await psycopg.AsyncConnection.connect(runtime_url) as connection:
+        async with connection.transaction():
+            locked = await connection.execute(
+                """
+                SELECT id
+                FROM products
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (product_id,),
+            )
+            assert await locked.fetchone() == (product_id,)
+            target = await connection.execute(
+                """
+                SELECT id
+                FROM pdf_versions
+                WHERE product_id = %s AND id = %s
+                """,
+                (product_id, version_id),
+            )
+            assert await target.fetchone() == (version_id,)
+            await connection.execute(
+                """
+                UPDATE products
+                SET current_version_id = %s, updated_at = now()
+                WHERE id = %s
+                """,
+                (version_id, product_id),
+            )
+
+
 @pytest.mark.e2e
 async def test_minimum_business_loop_and_four_public_states(
     clean_business_database: int,
@@ -330,6 +368,41 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                 )
                 assert [response.status_code for response in parallel_responses] == [201, 201]
 
+                restore_race = await create_product(client, "RESTORE-RACE")
+                restore_product_id = cast(int, restore_race["id"])
+                restore_v1 = await upload(
+                    client,
+                    restore_product_id,
+                    actor_id,
+                    synthetic_pdf(500),
+                    "restore-v1.pdf",
+                )
+                restore_v2 = await upload(
+                    client,
+                    restore_product_id,
+                    actor_id,
+                    synthetic_pdf(600),
+                    "restore-v2.pdf",
+                )
+                assert restore_v1.status_code == restore_v2.status_code == 201
+                restore_v1_id = cast(int, restore_v1.json()["id"])
+                restore_v3, _ = await asyncio.gather(
+                    upload(
+                        client,
+                        restore_product_id,
+                        actor_id,
+                        synthetic_pdf(700),
+                        "restore-v3.pdf",
+                    ),
+                    simulate_locked_restore(
+                        runtime_url,
+                        restore_product_id,
+                        restore_v1_id,
+                    ),
+                )
+                assert restore_v3.status_code == 201
+                restore_v3_id = cast(int, restore_v3.json()["id"])
+
         assert [response.status_code for response in responses].count(201) == 1
         assert [response.status_code for response in responses].count(409) == 7
         with psycopg.connect(runtime_url) as connection:
@@ -345,6 +418,23 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                 "SELECT current_version_id FROM products WHERE id = %s",
                 (product_id,),
             ).fetchone()
+            restore_current = connection.execute(
+                """
+                SELECT p.current_version_id, v.product_id
+                FROM products AS p
+                JOIN pdf_versions AS v ON v.id = p.current_version_id
+                WHERE p.id = %s
+                """,
+                (restore_product_id,),
+            ).fetchone()
+            restore_version_count = connection.execute(
+                "SELECT count(*) FROM pdf_versions WHERE product_id = %s",
+                (restore_product_id,),
+            ).fetchone()
         assert current is not None and current[0] is not None
+        assert restore_version_count == (3,)
+        assert restore_current is not None
+        assert restore_current[0] in {restore_v1_id, restore_v3_id}
+        assert restore_current[1] == restore_product_id
     finally:
         get_settings.cache_clear()
