@@ -7,6 +7,7 @@ import struct
 from pathlib import Path
 
 import pytest
+import segno
 from PIL import Image
 
 from product_pdf_qr.domains.qrcode import QRCodeGenerationError, QRCodeService
@@ -38,6 +39,32 @@ def test_qrcode_is_deterministic_1024_png_without_metadata(tmp_path: Path) -> No
     assert png_chunks(first) == ["IHDR", "IDAT", "IEND"]
     assert service.public_url(TOKEN) == f"http://127.0.0.1:8000/p/{TOKEN}"
     assert b"A001" not in first
+
+
+def test_rendered_modules_match_h_level_utf8_public_url(tmp_path: Path) -> None:
+    service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
+    payload = service.public_url(TOKEN)
+    image = Image.open(io.BytesIO(service.generate("A001", TOKEN)))
+    symbol = segno.make(
+        payload,
+        error="h",
+        encoding="utf-8",
+        micro=False,
+        boost_error=False,
+    )
+    matrix = tuple(tuple(bool(module) for module in row) for row in symbol.matrix)
+    module_count = len(matrix) + 8
+    pixels = image.load()
+    assert pixels is not None
+
+    for row_index, row in enumerate(matrix):
+        for column_index, expected_dark in enumerate(row):
+            x = ((column_index + 4) * 1024 + 512) // module_count
+            y = ((row_index + 4) * 1024 + 512) // module_count
+            assert (pixels[x, y] == 0) is expected_dark
+    for border_index in range(4):
+        coordinate = (border_index * 1024 + 512) // module_count
+        assert pixels[coordinate, coordinate] != 0
 
 
 @pytest.mark.anyio

@@ -34,6 +34,24 @@ def upload_file(
     )
 
 
+class InterruptedUpload(UploadFile):
+    """Synthetic client disconnect after one partial chunk."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            file=io.BytesIO(b"unused"),
+            filename="interrupted.pdf",
+            headers=Headers({"content-type": "application/pdf"}),
+        )
+        self.read_count = 0
+
+    async def read(self, size: int = -1) -> bytes:
+        self.read_count += 1
+        if self.read_count == 1:
+            return b"%PDF-partial"
+        raise ConnectionError("synthetic upload interruption")
+
+
 @pytest.mark.anyio
 async def test_valid_pdf_isolated_hashed_and_path_ignores_filename(tmp_path: Path) -> None:
     storage = StorageService(tmp_path, max_pdf_bytes=1024 * 1024)
@@ -98,6 +116,17 @@ async def test_size_limit_stops_receive_and_removes_partial_file(tmp_path: Path)
     assert captured.value.code == "pdf_too_large"
     assert captured.value.status_code == 413
     assert list(storage.temporary_root.iterdir()) == []
+
+
+@pytest.mark.anyio
+async def test_interrupted_receive_removes_partial_file(tmp_path: Path) -> None:
+    storage = StorageService(tmp_path, max_pdf_bytes=1024)
+
+    with pytest.raises(ConnectionError):
+        await storage.receive_and_validate(InterruptedUpload())
+
+    assert list(storage.temporary_root.iterdir()) == []
+    assert list(storage.files_root.rglob("*.pdf")) == []
 
 
 @pytest.mark.anyio

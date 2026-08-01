@@ -263,7 +263,19 @@ async def test_concurrent_identical_uploads_create_only_one_version(
         async with lifespan(app):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                created = await create_product(client, "CONCURRENT")
+                create_responses = await asyncio.gather(
+                    *[
+                        client.post("/api/products", json={"code": "CONCURRENT"})
+                        for _index in range(6)
+                    ]
+                )
+                assert [response.status_code for response in create_responses].count(201) == 1
+                assert [response.status_code for response in create_responses].count(409) == 5
+                created_response = next(
+                    response for response in create_responses if response.status_code == 201
+                )
+                created = created_response.json()
+                assert isinstance(created, dict)
                 product_id = cast(int, created["id"])
                 responses = await asyncio.gather(
                     *[
@@ -278,6 +290,46 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                     ]
                 )
 
+                different = await create_product(client, "DIFFERENT-CONTENT")
+                different_product_id = cast(int, different["id"])
+                different_responses = await asyncio.gather(
+                    upload(
+                        client,
+                        different_product_id,
+                        actor_id,
+                        synthetic_pdf(100),
+                        "different-a.pdf",
+                    ),
+                    upload(
+                        client,
+                        different_product_id,
+                        actor_id,
+                        synthetic_pdf(200),
+                        "different-b.pdf",
+                    ),
+                )
+                assert [response.status_code for response in different_responses] == [201, 201]
+
+                parallel_a = await create_product(client, "PARALLEL-A")
+                parallel_b = await create_product(client, "PARALLEL-B")
+                parallel_responses = await asyncio.gather(
+                    upload(
+                        client,
+                        cast(int, parallel_a["id"]),
+                        actor_id,
+                        synthetic_pdf(300),
+                        "parallel-a.pdf",
+                    ),
+                    upload(
+                        client,
+                        cast(int, parallel_b["id"]),
+                        actor_id,
+                        synthetic_pdf(400),
+                        "parallel-b.pdf",
+                    ),
+                )
+                assert [response.status_code for response in parallel_responses] == [201, 201]
+
         assert [response.status_code for response in responses].count(201) == 1
         assert [response.status_code for response in responses].count(409) == 7
         with psycopg.connect(runtime_url) as connection:
@@ -285,7 +337,10 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                 "SELECT count(*) FROM pdf_versions WHERE product_id = %s",
                 (product_id,),
             ).fetchone() == (1,)
-            assert connection.execute("SELECT count(*) FROM pdf_files").fetchone() == (1,)
+            assert connection.execute(
+                "SELECT count(*) FROM pdf_versions WHERE product_id = %s",
+                (different_product_id,),
+            ).fetchone() == (2,)
             current = connection.execute(
                 "SELECT current_version_id FROM products WHERE id = %s",
                 (product_id,),
