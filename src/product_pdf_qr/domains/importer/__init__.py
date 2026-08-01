@@ -1,0 +1,1 @@
+"""Import domain skeleton."""

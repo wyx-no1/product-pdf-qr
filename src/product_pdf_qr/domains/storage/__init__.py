@@ -1,0 +1,1 @@
+"""File-storage domain skeleton."""

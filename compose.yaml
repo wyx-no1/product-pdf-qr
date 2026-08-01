@@ -1,0 +1,90 @@
+name: product-pdf-qr
+
+services:
+  db:
+    image: postgres:16.14-alpine3.24@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      POSTGRES_DB: postgres
+      POSTGRES_SUPERUSER: ${POSTGRES_SUPERUSER}
+      APP_MIGRATE_PASSWORD: ${APP_MIGRATE_PASSWORD}
+      APP_RW_PASSWORD: ${APP_RW_PASSWORD}
+      APP_BACKUP_PASSWORD: ${APP_BACKUP_PASSWORD}
+      APP_DATABASE_NAME: ${POSTGRES_DB}
+      APP_TEST_DATABASE_NAME: ${POSTGRES_TEST_DB}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$POSTGRES_USER\" -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      target: runtime
+    environment:
+      DATABASE_URL: ${MIGRATION_DATABASE_URL}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      target: runtime
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      APP_BIND_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:-1}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-5}
+      STORAGE_ROOT: ${STORAGE_ROOT:-/data/files}
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    volumes:
+      - file_data:/data/files
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: development
+    environment:
+      DATABASE_URL: ${TEST_DATABASE_URL}
+      TEST_DATABASE_URL: ${TEST_DATABASE_URL}
+      TEST_MIGRATION_DATABASE_URL: ${TEST_MIGRATION_DATABASE_URL}
+      TEST_BACKUP_DATABASE_URL: ${TEST_BACKUP_DATABASE_URL}
+      STORAGE_ROOT: /tmp/product-pdf-qr-tests
+    command: ["make", "test"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  postgres_data:
+  file_data:

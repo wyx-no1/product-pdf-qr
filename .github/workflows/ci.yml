@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.1"
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen --all-groups
+      - run: make build-reproducible
+      - run: make typecheck
+      - run: make lint
+      - run: make test-unit
+      - run: make check-docs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quality-reports
+          path: reports/
+
+  database:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.1"
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cp .env.example .env
+      - run: docker compose up --detach --wait db
+      - run: uv sync --frozen --all-groups
+      - run: make test-integration
+        env:
+          TEST_DATABASE_URL: postgresql://app_rw:local-runtime-only@127.0.0.1:5432/product_pdf_qr_test
+          TEST_MIGRATION_DATABASE_URL: postgresql+psycopg://app_migrate:local-migrate-only@127.0.0.1:5432/product_pdf_qr_test
+          TEST_BACKUP_DATABASE_URL: postgresql://app_backup:local-backup-only@127.0.0.1:5432/product_pdf_qr_test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: database-reports
+          path: reports/
+      - if: always()
+        run: docker compose logs db
+      - if: always()
+        run: docker compose down --volumes
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose build --pull app migrate
+      - run: docker compose up --detach --wait
+      - run: curl --fail --silent --show-error http://127.0.0.1:8000/health/ready
+      - name: Verify non-root process
+        run: test "$(docker compose exec --no-TTY app id -u)" != "0"
+      - name: Inspect runtime image contents
+        run: |
+          docker run --rm product-pdf-qr-app python -c \
+            "import importlib.util; assert importlib.util.find_spec('pytest') is None; assert importlib.util.find_spec('mypy') is None"
+          docker run --rm --user 0 --entrypoint sh product-pdf-qr-app -c \
+            'test ! -e /root/.cache && test -z "$(find /app /opt/venv -type f \( -name ".env" -o -name "*.pem" -o -name "*.key" \) -print -quit)"'
+      - name: Scan runtime image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: product-pdf-qr-app
+          format: table
+          exit-code: "1"
+          ignore-unfixed: false
+          severity: CRITICAL,HIGH
+      - if: always()
+        run: docker compose logs
+      - if: always()
+        run: docker compose down --volumes

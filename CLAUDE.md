@@ -4,7 +4,7 @@
 
 ## 仓库与产品上下文
 
-当前仓库是绿地项目：只有文档，没有功能代码、依赖清单、构建配置、数据库或部署配置，技术栈尚未选择。因此，目前不存在可执行的 build、lint、test 或 deploy 命令；技术栈经评审确定后，必须把可复现命令补入相应文档。
+当前仓库已进入 Phase 1-A 工程初始化阶段。G-02 已确定技术栈为 Python 3.12 + FastAPI + PostgreSQL 16 + 服务端渲染；仓库已提供依赖锁、构建、类型检查、lint、测试、迁移和本地 Docker 开发命令，精确用法见 `README.md` 与 `docs/quality-gates-v1.md`。Phase 1-A 不含认证和业务逻辑，产物禁止对外暴露或部署到公网可达环境。
 
 当前唯一有效的业务事实来源是最新已确认的 requirements 文档，即 `docs/requirements-v2.md`。该文件已取代 `docs/requirements-v1.md`；v1 仅作为历史版本保留供追溯，不再作为实现依据。`docs/decision-register-v1.md` 只记录决策过程、技术默认值及覆盖历史，不承担业务事实来源角色。产品领域的核心不变量如下：
 
