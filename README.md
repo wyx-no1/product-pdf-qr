@@ -82,6 +82,14 @@ docker compose --profile test run --rm test make test-integration
 docker compose --profile test run --rm test
 ```
 
+从空卷连续验证三次完整启动顺序：
+
+```bash
+make verify-clean-start
+```
+
+该验证命令会删除并重建本项目的本地数据库与文件卷，每次确认数据库初始化健康事件早于 migration 容器启动，并将带时间戳的证据保存到 `reports/clean-start/`。
+
 本机已安装 Python 3.12 与 [uv](https://docs.astral.sh/uv/) 时，也可运行：
 
 ```bash

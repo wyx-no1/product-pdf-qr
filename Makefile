@@ -1,8 +1,10 @@
 .PHONY: \
 	build build-reproducible check-docs dev down format format-check \
-	lint migration-downgrade migration-upgrade test test-integration test-unit typecheck
+	lint migration-downgrade migration-upgrade test test-integration test-unit typecheck \
+	verify-clean-start
 
 UV ?= uv
+CLEAN_START_ATTEMPTS ?= 3
 
 build:
 	rm -rf build dist
@@ -53,3 +55,7 @@ dev:
 
 down:
 	docker compose down
+
+verify-clean-start:
+	@test -f .env || cp .env.example .env
+	./scripts/verify_clean_start.sh "$(CLEAN_START_ATTEMPTS)"

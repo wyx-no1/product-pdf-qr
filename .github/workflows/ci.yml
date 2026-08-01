@@ -68,7 +68,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: cp .env.example .env
       - run: docker compose build --pull app migrate
-      - run: docker compose up --detach --wait
+      - name: Verify repeated clean-volume startup ordering
+        run: make verify-clean-start
       - run: curl --fail --silent --show-error http://127.0.0.1:8000/health/ready
       - name: Verify non-root process
         run: test "$(docker compose exec --no-TTY app id -u)" != "0"
@@ -87,6 +88,11 @@ jobs:
           exit-code: "1"
           ignore-unfixed: false
           severity: CRITICAL,HIGH
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clean-start-evidence
+          path: reports/clean-start/
       - if: always()
         run: docker compose logs
       - if: always()
