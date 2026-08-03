@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
@@ -110,6 +110,32 @@ async def upload(
         f"/api/products/{product_id}/pdf",
         data={"actor_id": str(actor_id)},
         files={"file": (filename, content, "application/pdf")},
+    )
+
+
+class ChunkedRequestBody(httpx.AsyncByteStream):
+    """Track how many chunks the live ASGI stack consumes."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.yielded_chunks = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            self.yielded_chunks += 1
+            yield chunk
+
+
+def oversized_multipart_body() -> bytes:
+    return (
+        b"--integration-boundary\r\n"
+        b'Content-Disposition: form-data; name="actor_id"\r\n\r\n'
+        b"1\r\n"
+        b"--integration-boundary\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="large.pdf"\r\n'
+        b"Content-Type: application/pdf\r\n\r\n"
+        + (b"x" * (80 * 1024))
+        + b"\r\n--integration-boundary--\r\n"
     )
 
 
@@ -278,6 +304,72 @@ async def test_minimum_business_loop_and_four_public_states(
         assert version_count == (3,)
         assert file_count == (2,)
         assert {"product_create", "pdf_upload", "pdf_upload_rejected"}.issubset(actions)
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.e2e
+async def test_pre_parser_size_rejections_commit_independent_audits(
+    clean_business_database: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_url = required_environment("TEST_DATABASE_URL")
+    monkeypatch.setenv("DATABASE_URL", runtime_url)
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path))
+    monkeypatch.setenv("MAX_PDF_BYTES", "8")
+    get_settings.cache_clear()
+    app = create_app()
+    declared_body = ChunkedRequestBody([b"must-not-be-read"])
+    complete_chunked_body = oversized_multipart_body()
+    chunks = [
+        complete_chunked_body[index : index + (16 * 1024)]
+        for index in range(0, len(complete_chunked_body), 16 * 1024)
+    ]
+    chunked_body = ChunkedRequestBody(chunks)
+
+    try:
+        async with lifespan(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                declared = await client.post(
+                    "/api/products/5/pdf",
+                    content=declared_body,
+                    headers={
+                        "Content-Length": "70000",
+                        "Content-Type": "multipart/form-data; boundary=integration-boundary",
+                    },
+                )
+                chunked = await client.post(
+                    "/api/products/5/pdf",
+                    content=chunked_body,
+                    headers={"Content-Type": "multipart/form-data; boundary=integration-boundary"},
+                )
+
+        assert declared.status_code == chunked.status_code == 413
+        assert declared_body.yielded_chunks == 0
+        assert 0 < chunked_body.yielded_chunks < len(chunked_body.chunks)
+        with psycopg.connect(runtime_url) as connection:
+            rows = connection.execute(
+                """
+                SELECT actor_type, actor_id, target_type, target_id, request_id, detail
+                FROM audit_events
+                WHERE action = 'pdf_upload_rejected'
+                ORDER BY id
+                """
+            ).fetchall()
+        assert len(rows) == 2
+        assert {str(row[0]) for row in rows} == {"system"}
+        assert {row[1] for row in rows} == {None}
+        assert {str(row[2]) for row in rows} == {"product"}
+        assert {int(row[3]) for row in rows} == {5}
+        assert all(row[4] is not None for row in rows)
+        assert {
+            (str(row[5]["reason"]), str(row[5]["stage"]), str(row[5]["trigger"])) for row in rows
+        } == {
+            ("pdf_too_large", "pre_parser_size", "content_length"),
+            ("pdf_too_large", "pre_parser_size", "stream"),
+        }
     finally:
         get_settings.cache_clear()
 

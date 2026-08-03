@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import re
+from typing import cast
+from uuid import uuid4
 
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from product_pdf_qr.config import get_settings
+from product_pdf_qr.database import Database
+from product_pdf_qr.domains.audit import AuditEvent, append_independent_event
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
-PDF_UPLOAD_PATH = re.compile(r"^/api/products/[^/]+/pdf$", re.ASCII)
+PDF_UPLOAD_PATH = re.compile(
+    r"^/api/products/(?P<product_id>[^/]+)/pdf$",
+    re.ASCII,
+)
 
 
 class UploadRequestLimitMiddleware:
@@ -38,6 +45,7 @@ class UploadRequestLimitMiddleware:
         max_request_bytes = max_pdf_bytes + self.multipart_overhead_bytes
         content_length = self._content_length(scope)
         if content_length is not None and content_length > max_request_bytes:
+            await self._audit_rejection(scope, trigger="content_length")
             await self._reject(scope, receive, send)
             return
 
@@ -67,6 +75,7 @@ class UploadRequestLimitMiddleware:
             if not too_large:
                 raise
         if too_large:
+            await self._audit_rejection(scope, trigger="stream")
             await self._reject(scope, receive, send)
 
     @staticmethod
@@ -88,6 +97,35 @@ class UploadRequestLimitMiddleware:
                 return None
             return parsed if parsed >= 0 else None
         return None
+
+    @staticmethod
+    async def _audit_rejection(scope: Scope, *, trigger: str) -> None:
+        database = cast(Database, scope["app"].state.database)
+        match = PDF_UPLOAD_PATH.fullmatch(scope.get("path", ""))
+        product_id: int | None = None
+        if match is not None:
+            try:
+                candidate = int(match.group("product_id"))
+            except ValueError:
+                candidate = 0
+            if candidate > 0:
+                product_id = candidate
+        await append_independent_event(
+            database,
+            AuditEvent(
+                action="pdf_upload_rejected",
+                result="failure",
+                actor_type="system",
+                target_type="product",
+                target_id=product_id,
+                request_id=uuid4(),
+                detail={
+                    "reason": "pdf_too_large",
+                    "stage": "pre_parser_size",
+                    "trigger": trigger,
+                },
+            ),
+        )
 
     @staticmethod
     async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
