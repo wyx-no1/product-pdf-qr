@@ -1,0 +1,4754 @@
+diff --git a/.env.example b/.env.example
+index 6b2c83c..ced6fc8 100644
+--- a/.env.example
++++ b/.env.example
+@@ -21,3 +21,10 @@ APP_PORT=8000
+ DB_POOL_MIN_SIZE=1
+ DB_POOL_MAX_SIZE=5
+ STORAGE_ROOT=/data/files
++PUBLIC_BASE_URL=http://127.0.0.1:8000
++MAX_PDF_BYTES=52428800
++PDF_VALIDATION_TIMEOUT_SECONDS=5
++PDF_VALIDATION_CPU_SECONDS=3
++PDF_VALIDATION_MEMORY_BYTES=536870912
++PUBLIC_MISS_LIMIT=20
++PUBLIC_MISS_WINDOW_SECONDS=600
+diff --git a/README.md b/README.md
+index 16f2cf8..e60733b 100644
+--- a/README.md
++++ b/README.md
+@@ -1,9 +1,9 @@
+ # Product PDF QR
+ 
+ > [!CAUTION]
+-> **Phase 1-A 不含任何管理员认证或业务接口。仅允许在本机开发与 CI 的合成数据环境中运行，禁止对外暴露，禁止部署到任何公网可达环境。**
++> **Phase 1-B 仍不含管理员认证。仅允许在本机开发与 CI 的合成数据环境中运行，禁止对外暴露，禁止部署到任何公网可达环境。**
+ 
+-本仓库当前只提供产品 PDF 二维码系统的工程基础：Python 3.12 + FastAPI、PostgreSQL 16、服务端渲染模板骨架、数据库迁移、隔离测试环境与 Docker 开发环境。产品创建、PDF 上传、二维码生成、扫码访问、管理员认证等业务能力均尚未实现。
++本仓库当前实现 Phase 1-B 最小业务闭环：创建产品、上传并安全校验 PDF、追加当前版本、生成永久二维码，以及通过公开随机地址访问当前 PDF。产品停用态的公开读判定已经实现；认证、启停管理入口、历史恢复、Excel 导入和部署仍属后续阶段。
+ 
+ ## 环境要求
+ 
+@@ -25,9 +25,57 @@ make dev
+ 
+ - 存活检查：<http://127.0.0.1:8000/health/live>
+ - 就绪检查：<http://127.0.0.1:8000/health/ready>
++- OpenAPI：<http://127.0.0.1:8000/docs>
+ 
+ Compose 内部的应用进程监听容器网络，以便 Docker 健康检查和端口转发；宿主机端口明确绑定 `127.0.0.1`，不会监听所有主机接口。直接运行应用时的默认绑定同样是 `127.0.0.1`。
+ 
++## 本地最小闭环
++
++管理写接口在本阶段刻意不含认证，只能在本机合成数据环境使用。`pdf_versions.uploaded_by` 继续遵守既有 schema 的管理员外键，因此手工演示时先插入一条仅用于本地验证的合成管理员，并使用返回的 `id`：
++
++```bash
++docker compose exec db psql -U postgres -d product_pdf_qr_dev -c \
++  "SET ROLE app_rw; INSERT INTO admins
++   (username, password_hash, password_updated_at, created_at)
++   VALUES ('phase1b-synthetic', 'authentication-disabled', now(), now())
++   RETURNING id;"
++```
++
++创建产品（编码会先去首尾空格、校验，再统一转大写）：
++
++```bash
++curl -sS -X POST http://127.0.0.1:8000/api/products \
++  -H 'Content-Type: application/json' \
++  -d '{"code":" a001_1 "}'
++```
++
++响应包含产品 `id`、26 位随机 `public_token`、公开 URL 与二维码下载地址。使用产品 `id` 和上一步合成管理员 `id` 上传 PDF：
++
++```bash
++curl -sS -X POST http://127.0.0.1:8000/api/products/1/pdf \
++  -F actor_id=1 \
++  -F file=@./synthetic.pdf
++```
++
++上传入口在 multipart 解析前限制整个请求体，PDF 本体在隔离区再次执行 50 MB 精确限制。结构解析只在可终止子进程中运行，默认墙钟 5 秒、CPU 3 秒、地址空间 512 MiB；地址空间约为最大文件的十倍，为正常解析保留余量，同时限制紧凑恶意文件的放大效应。以上值由 `MAX_PDF_BYTES`、`PDF_VALIDATION_TIMEOUT_SECONDS`、`PDF_VALIDATION_CPU_SECONDS` 和 `PDF_VALIDATION_MEMORY_BYTES` 集中配置。
++
++下载二维码与公开扫码访问：
++
++```bash
++curl -OJ http://127.0.0.1:8000/api/products/1/qrcode
++curl -i http://127.0.0.1:8000/p/REPLACE_WITH_PUBLIC_TOKEN
++```
++
++二维码为 PNG、1024×1024、纠错等级 H、静区 4 模块，文件名精确等于规范化大写编码。公开入口对不存在、停用、未上传和正常四态统一返回 200，并始终设置 `Cache-Control: no-store`。
++
++只读孤儿文件对账报告：
++
++```bash
++curl -sS http://127.0.0.1:8000/api/storage/orphans
++```
++
++该报告只列出正式存储中没有 `pdf_files` 引用的文件，不提供删除、清理或定时任务。
++
+ 停止环境：
+ 
+ ```bash
+@@ -109,30 +157,30 @@ make check-docs
+ src/product_pdf_qr/
+ ├── config.py              # 集中配置
+ ├── database.py            # app_rw 连接池
+-├── errors.py              # 统一错误处理骨架
++├── dependencies.py        # Web 层基础设施依赖
++├── errors.py              # 统一安全错误处理
+ ├── main.py                # FastAPI 入口与健康检查
+-├── templates/             # Jinja2 服务端模板骨架
++├── templates/             # Jinja2 服务端模板
+ └── domains/
+-    ├── public/
+-    ├── product/
+-    ├── version/
+-    ├── storage/
++    ├── public/            # 四态公开扫码与 PDF 流
++    ├── product/           # 编码、token、创建与本地管理 API
++    ├── version/           # 锁内判重、版本追加与当前指针
++    ├── storage/           # 隔离校验、内容寻址与只读对账
+     ├── importer/
+-    ├── qrcode/
++    ├── qrcode/            # 确定性生成、缓存与失败补偿
+     ├── auth/
+-    └── audit/
++    └── audit/             # 只追加事件写入
+ ```
+ 
+-八个域目前只有模块边界，没有任何业务实现。初始 schema 位于 `migrations/versions/`；PostgreSQL 角色与开发/测试数据库初始化位于 `docker/postgres/init/`。
++Phase 1-B 在 Phase 1-A 的六表 schema、复合外键、只追加触发器与权限矩阵上开发，没有新增或修改 schema。初始 schema 位于 `migrations/versions/`；PostgreSQL 角色与开发/测试数据库初始化位于 `docker/postgres/init/`。
+ 
+ ## 当前阶段明确不包含
+ 
+-- 产品创建或任何业务表读写逻辑
+-- PDF 上传、校验或文件移动
+-- 二维码生成或下载
+-- 公开扫码访问
+ - 管理员认证、登录或会话逻辑
+-- Excel 导入、批量 ZIP、历史恢复、启停或审计写入逻辑
++- 停用、启用的管理入口（公开端停用态读判定已实现）
++- Excel 导入、批量 ZIP、历史版本界面或恢复入口
++- 完整审计查询界面
++- 孤儿文件自动清理、历史版本删除或任何不可逆操作
+ - 公网反向代理、TLS、生产 Compose 或任何部署配置
+ 
+-在后续阶段补齐认证并通过相应安全门禁前，本仓库产物始终禁止对外暴露。
++G-09 在本阶段为「部分覆盖，未判定通过」：仅覆盖新建即出码、未上传、首次上传和新版替换；恢复、停用、启用管理链路等待 Phase 2。在后续阶段补齐认证并通过相应安全门禁前，本仓库产物始终禁止对外暴露。
+diff --git a/compose.yaml b/compose.yaml
+index 0f009b1..5027e48 100644
+--- a/compose.yaml
++++ b/compose.yaml
+@@ -50,6 +50,13 @@ services:
+       DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:-1}
+       DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-5}
+       STORAGE_ROOT: ${STORAGE_ROOT:-/data/files}
++      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:8000}
++      MAX_PDF_BYTES: ${MAX_PDF_BYTES:-52428800}
++      PDF_VALIDATION_TIMEOUT_SECONDS: ${PDF_VALIDATION_TIMEOUT_SECONDS:-5}
++      PDF_VALIDATION_CPU_SECONDS: ${PDF_VALIDATION_CPU_SECONDS:-3}
++      PDF_VALIDATION_MEMORY_BYTES: ${PDF_VALIDATION_MEMORY_BYTES:-536870912}
++      PUBLIC_MISS_LIMIT: ${PUBLIC_MISS_LIMIT:-20}
++      PUBLIC_MISS_WINDOW_SECONDS: ${PUBLIC_MISS_WINDOW_SECONDS:-600}
+     ports:
+       - "127.0.0.1:${APP_PORT:-8000}:8000"
+     volumes:
+@@ -81,6 +88,7 @@ services:
+       TEST_MIGRATION_DATABASE_URL: ${TEST_MIGRATION_DATABASE_URL}
+       TEST_BACKUP_DATABASE_URL: ${TEST_BACKUP_DATABASE_URL}
+       STORAGE_ROOT: /tmp/product-pdf-qr-tests
++      PUBLIC_BASE_URL: http://127.0.0.1:8000
+     command: ["make", "test"]
+     depends_on:
+       db:
+diff --git a/pyproject.toml b/pyproject.toml
+index 16bba77..749dcfe 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -12,8 +12,12 @@ dependencies = [
+   "alembic==1.18.5",
+   "fastapi==0.141.1",
+   "jinja2==3.1.6",
++  "pillow==12.3.0",
+   "psycopg[binary,pool]==3.3.4",
+   "pydantic-settings==2.14.2",
++  "pypdf==6.14.2",
++  "python-multipart==0.0.32",
++  "segno==1.6.6",
+   "sqlalchemy==2.0.51",
+   "uvicorn==0.52.0",
+ ]
+diff --git a/src/product_pdf_qr/config.py b/src/product_pdf_qr/config.py
+index 4d36d9c..6f9e4b1 100644
+--- a/src/product_pdf_qr/config.py
++++ b/src/product_pdf_qr/config.py
+@@ -4,9 +4,13 @@ from functools import lru_cache
+ from pathlib import Path
+ from typing import Any, Self
+ 
+-from pydantic import Field, PostgresDsn, model_validator
++from pydantic import AnyHttpUrl, Field, PostgresDsn, model_validator
+ from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
++DEFAULT_PDF_VALIDATION_TIMEOUT_SECONDS = 5.0
++DEFAULT_PDF_VALIDATION_CPU_SECONDS = 3
++DEFAULT_PDF_VALIDATION_MEMORY_BYTES = 512 * 1024 * 1024
++
+ 
+ class Settings(BaseSettings):
+     """Runtime settings loaded from environment variables."""
+@@ -23,6 +27,24 @@ class Settings(BaseSettings):
+     db_pool_min_size: int = Field(default=1, ge=1)
+     db_pool_max_size: int = Field(default=5, ge=1)
+     storage_root: Path = Path("storage/local")
++    public_base_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:8000")
++    max_pdf_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
++    pdf_validation_timeout_seconds: float = Field(
++        default=DEFAULT_PDF_VALIDATION_TIMEOUT_SECONDS,
++        gt=0,
++        le=30,
++    )
++    pdf_validation_cpu_seconds: int = Field(
++        default=DEFAULT_PDF_VALIDATION_CPU_SECONDS,
++        ge=1,
++        le=10,
++    )
++    pdf_validation_memory_bytes: int = Field(
++        default=DEFAULT_PDF_VALIDATION_MEMORY_BYTES,
++        ge=128 * 1024 * 1024,
++    )
++    public_miss_limit: int = Field(default=20, ge=1)
++    public_miss_window_seconds: int = Field(default=600, ge=1)
+ 
+     def __init__(self, **values: Any) -> None:
+         """Allow required values to be supplied by BaseSettings sources."""
+diff --git a/src/product_pdf_qr/dependencies.py b/src/product_pdf_qr/dependencies.py
+new file mode 100644
+index 0000000..f97c686
+--- /dev/null
++++ b/src/product_pdf_qr/dependencies.py
+@@ -0,0 +1,41 @@
++"""Shared FastAPI dependencies."""
++
++from typing import cast
++
++from fastapi import Request
++
++from product_pdf_qr.config import Settings
++from product_pdf_qr.database import Database
++from product_pdf_qr.domains.public import PublicMissLimiter
++from product_pdf_qr.domains.qrcode import QRCodeService
++from product_pdf_qr.domains.storage import StorageService
++
++
++def get_database(request: Request) -> Database:
++    """Return the application-owned runtime database."""
++
++    return cast(Database, request.app.state.database)
++
++
++def get_runtime_settings(request: Request) -> Settings:
++    """Return the application-owned settings."""
++
++    return cast(Settings, request.app.state.settings)
++
++
++def get_storage_service(request: Request) -> StorageService:
++    """Return the application-owned content storage."""
++
++    return cast(StorageService, request.app.state.storage_service)
++
++
++def get_qrcode_service(request: Request) -> QRCodeService:
++    """Return the application-owned QR generator."""
++
++    return cast(QRCodeService, request.app.state.qrcode_service)
++
++
++def get_public_miss_limiter(request: Request) -> PublicMissLimiter:
++    """Return the process-local missing-token limiter."""
++
++    return cast(PublicMissLimiter, request.app.state.public_miss_limiter)
+diff --git a/src/product_pdf_qr/domains/audit/__init__.py b/src/product_pdf_qr/domains/audit/__init__.py
+index a75a336..f2b2980 100644
+--- a/src/product_pdf_qr/domains/audit/__init__.py
++++ b/src/product_pdf_qr/domains/audit/__init__.py
+@@ -1 +1,9 @@
+-"""Audit domain skeleton."""
++"""Append-only audit domain."""
++
++from product_pdf_qr.domains.audit.service import (
++    AuditEvent,
++    append_event,
++    append_independent_event,
++)
++
++__all__ = ["AuditEvent", "append_event", "append_independent_event"]
+diff --git a/src/product_pdf_qr/domains/audit/service.py b/src/product_pdf_qr/domains/audit/service.py
+new file mode 100644
+index 0000000..031db49
+--- /dev/null
++++ b/src/product_pdf_qr/domains/audit/service.py
+@@ -0,0 +1,78 @@
++"""Append-only audit event writes."""
++
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass
++from typing import Literal
++from uuid import UUID
++
++from psycopg.types.json import Jsonb
++
++from product_pdf_qr.database import Connection, Database
++
++logger = logging.getLogger(__name__)
++
++AuditResult = Literal["success", "failure"]
++
++
++@dataclass(frozen=True, slots=True)
++class AuditEvent:
++    """The safe, structured fields accepted by the audit table."""
++
++    action: str
++    result: AuditResult
++    actor_type: str = "system"
++    actor_id: int | None = None
++    target_type: str | None = None
++    target_id: int | None = None
++    product_code: str | None = None
++    request_id: UUID | None = None
++    detail: dict[str, object] | None = None
++
++
++async def append_event(connection: Connection, event: AuditEvent) -> None:
++    """Append an event using the caller's transaction."""
++
++    await connection.execute(
++        """
++        INSERT INTO audit_events (
++            occurred_at,
++            actor_type,
++            actor_id,
++            action,
++            target_type,
++            target_id,
++            product_code,
++            result,
++            request_id,
++            detail
++        ) VALUES (
++            now(), %s, %s, %s, %s, %s, %s, %s, %s, %s
++        )
++        """,
++        (
++            event.actor_type,
++            event.actor_id,
++            event.action,
++            event.target_type,
++            event.target_id,
++            event.product_code,
++            event.result,
++            event.request_id,
++            Jsonb(event.detail) if event.detail is not None else None,
++        ),
++    )
++
++
++async def append_independent_event(database: Database, event: AuditEvent) -> bool:
++    """Append and commit an event independently from a failed business transaction."""
++
++    try:
++        async with database.connection() as connection:
++            async with connection.transaction():
++                await append_event(connection, event)
++    except Exception:
++        logger.exception("Independent audit event write failed", extra={"action": event.action})
++        return False
++    return True
+diff --git a/src/product_pdf_qr/domains/product/__init__.py b/src/product_pdf_qr/domains/product/__init__.py
+index 0a5c55d..0fa0770 100644
+--- a/src/product_pdf_qr/domains/product/__init__.py
++++ b/src/product_pdf_qr/domains/product/__init__.py
+@@ -1 +1,17 @@
+-"""Product domain skeleton."""
++"""Product domain."""
++
++from product_pdf_qr.domains.product.service import (
++    Product,
++    create_product,
++    generate_public_token,
++    is_normalized_product_code,
++    normalize_product_code,
++)
++
++__all__ = [
++    "Product",
++    "create_product",
++    "generate_public_token",
++    "is_normalized_product_code",
++    "normalize_product_code",
++]
+diff --git a/src/product_pdf_qr/domains/product/router.py b/src/product_pdf_qr/domains/product/router.py
+new file mode 100644
+index 0000000..7644637
+--- /dev/null
++++ b/src/product_pdf_qr/domains/product/router.py
+@@ -0,0 +1,241 @@
++"""Local-only management endpoints for the Phase 1-B business loop."""
++
++from __future__ import annotations
++
++from typing import Annotated, cast
++from uuid import uuid4
++
++from fastapi import APIRouter, Depends, File, Form, Response, UploadFile, status
++from pydantic import BaseModel, Field
++
++from product_pdf_qr.database import Database
++from product_pdf_qr.dependencies import (
++    get_database,
++    get_qrcode_service,
++    get_storage_service,
++)
++from product_pdf_qr.domains.audit import AuditEvent, append_independent_event
++from product_pdf_qr.domains.product.service import Product, create_product
++from product_pdf_qr.domains.qrcode import QRCodeGenerationError, QRCodeResult, QRCodeService
++from product_pdf_qr.domains.storage import StorageService, UploadRejected
++from product_pdf_qr.domains.version import record_upload_rejection, upload_pdf
++from product_pdf_qr.errors import AppError
++
++router = APIRouter(prefix="/api/products", tags=["products"])
++
++
++class ProductCreateRequest(BaseModel):
++    """Product creation input."""
++
++    code: str = Field(min_length=1)
++
++
++class ProductCreateResponse(BaseModel):
++    """Product creation output for the local management client."""
++
++    id: int
++    code: str
++    public_token: str
++    status: str
++    current_version_id: int | None
++    public_url: str
++    qrcode_url: str
++    qrcode_status: str
++
++
++class PDFUploadResponse(BaseModel):
++    """Successful append-only upload output."""
++
++    version_id: int
++    version_no: int
++    sha256: str
++    size_bytes: int
++    original_filename: str
++
++
++class QRCodeRetryResponse(BaseModel):
++    """Manual QR retry result."""
++
++    status: str
++    cache_hit: bool
++
++
++async def _record_qrcode_outcome(
++    database: Database,
++    product: Product,
++    *,
++    action: str,
++    result: str,
++    reason: str | None = None,
++) -> None:
++    detail: dict[str, object] | None = {"reason": reason} if reason is not None else None
++    await append_independent_event(
++        database,
++        AuditEvent(
++            action=action,
++            result="success" if result == "success" else "failure",
++            target_type="product",
++            target_id=product.id,
++            product_code=product.code,
++            detail=detail,
++        ),
++    )
++
++
++async def _load_product(database: Database, product_id: int) -> Product:
++    async with database.connection() as connection:
++        cursor = await connection.execute(
++            """
++            SELECT id, code, public_token, status, current_version_id
++            FROM products
++            WHERE id = %s
++            """,
++            (product_id,),
++        )
++        row = await cursor.fetchone()
++    if row is None:
++        raise AppError("product_not_found", "产品不存在。", 404)
++    return Product(
++        id=cast(int, row["id"]),
++        code=str(row["code"]),
++        public_token=str(row["public_token"]),
++        status=str(row["status"]),
++        current_version_id=(
++            cast(int, row["current_version_id"]) if row["current_version_id"] is not None else None
++        ),
++    )
++
++
++async def _generate_with_audit(
++    database: Database,
++    qrcode_service: QRCodeService,
++    product: Product,
++) -> QRCodeResult:
++    try:
++        result = await qrcode_service.get_or_generate(product.code, product.public_token)
++    except QRCodeGenerationError as error:
++        await _record_qrcode_outcome(
++            database,
++            product,
++            action="qrcode_generation_failure",
++            result="failure",
++            reason=error.code,
++        )
++        raise
++    if result.cache_error is not None:
++        await _record_qrcode_outcome(
++            database,
++            product,
++            action="qrcode_cache_failure",
++            result="failure",
++            reason=result.cache_error,
++        )
++    return result
++
++
++@router.post("", response_model=ProductCreateResponse, status_code=status.HTTP_201_CREATED)
++async def create_product_endpoint(
++    payload: ProductCreateRequest,
++    database: Annotated[Database, Depends(get_database)],
++    qrcode_service: Annotated[QRCodeService, Depends(get_qrcode_service)],
++) -> ProductCreateResponse:
++    """Create first, commit, then pre-generate the derived QR cache best-effort."""
++
++    product = await create_product(database, payload.code, request_id=uuid4())
++    qrcode_status = "ready"
++    try:
++        result = await _generate_with_audit(database, qrcode_service, product)
++        if result.cache_error is not None:
++            qrcode_status = "ready_cache_degraded"
++    except QRCodeGenerationError:
++        qrcode_status = "generation_failed"
++    return ProductCreateResponse(
++        id=product.id,
++        code=product.code,
++        public_token=product.public_token,
++        status=product.status,
++        current_version_id=product.current_version_id,
++        public_url=qrcode_service.public_url(product.public_token),
++        qrcode_url=f"/api/products/{product.id}/qrcode",
++        qrcode_status=qrcode_status,
++    )
++
++
++@router.get("/{product_id}/qrcode")
++async def download_qrcode(
++    product_id: int,
++    database: Annotated[Database, Depends(get_database)],
++    qrcode_service: Annotated[QRCodeService, Depends(get_qrcode_service)],
++) -> Response:
++    """Download one QR PNG using the exact normalized code as its filename."""
++
++    product = await _load_product(database, product_id)
++    result = await _generate_with_audit(database, qrcode_service, product)
++    return Response(
++        content=result.image_bytes,
++        media_type="image/png",
++        headers={"Content-Disposition": f'attachment; filename="{product.code}.png"'},
++    )
++
++
++@router.post("/{product_id}/qrcode/retry", response_model=QRCodeRetryResponse)
++async def retry_qrcode(
++    product_id: int,
++    database: Annotated[Database, Depends(get_database)],
++    qrcode_service: Annotated[QRCodeService, Depends(get_qrcode_service)],
++) -> QRCodeRetryResponse:
++    """Manually retry deterministic generation without changing product state."""
++
++    product = await _load_product(database, product_id)
++    result = await _generate_with_audit(database, qrcode_service, product)
++    await _record_qrcode_outcome(
++        database,
++        product,
++        action="qrcode_generation_recovered",
++        result="success",
++    )
++    return QRCodeRetryResponse(status="ready", cache_hit=result.cache_hit)
++
++
++@router.post(
++    "/{product_id}/pdf",
++    response_model=PDFUploadResponse,
++    status_code=status.HTTP_201_CREATED,
++)
++async def upload_pdf_endpoint(
++    product_id: int,
++    actor_id: Annotated[int, Form(gt=0)],
++    file: Annotated[UploadFile, File()],
++    database: Annotated[Database, Depends(get_database)],
++    storage: Annotated[StorageService, Depends(get_storage_service)],
++) -> PDFUploadResponse:
++    """Validate outside the lock, then serialize current-version mutation."""
++
++    request_id = uuid4()
++    try:
++        validated = await storage.receive_and_validate(file)
++    except UploadRejected as error:
++        await record_upload_rejection(
++            database,
++            product_id=product_id,
++            actor_id=actor_id,
++            reason=error.code,
++            stage=error.stage,
++            request_id=request_id,
++        )
++        raise
++    version = await upload_pdf(
++        database,
++        storage,
++        product_id=product_id,
++        actor_id=actor_id,
++        upload=validated,
++        request_id=request_id,
++    )
++    return PDFUploadResponse(
++        version_id=version.id,
++        version_no=version.version_no,
++        sha256=version.sha256,
++        size_bytes=version.size_bytes,
++        original_filename=version.original_filename,
++    )
+diff --git a/src/product_pdf_qr/domains/product/service.py b/src/product_pdf_qr/domains/product/service.py
+new file mode 100644
+index 0000000..9dd65bb
+--- /dev/null
++++ b/src/product_pdf_qr/domains/product/service.py
+@@ -0,0 +1,125 @@
++"""Product creation, code normalization, and public-token generation."""
++
++from __future__ import annotations
++
++import base64
++import re
++import secrets
++from dataclasses import dataclass
++from typing import cast
++from uuid import UUID
++
++from psycopg.errors import UniqueViolation
++
++from product_pdf_qr.database import Database
++from product_pdf_qr.domains.audit import AuditEvent, append_event
++from product_pdf_qr.errors import AppError
++
++PRODUCT_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$", re.ASCII)
++NORMALIZED_PRODUCT_CODE_PATTERN = re.compile(r"^[A-Z0-9_-]{1,64}$", re.ASCII)
++PUBLIC_TOKEN_BYTES = 16
++PUBLIC_TOKEN_LENGTH = 26
++TOKEN_RETRY_LIMIT = 5
++
++
++@dataclass(frozen=True, slots=True)
++class Product:
++    """A product projection returned by the product domain."""
++
++    id: int
++    code: str
++    public_token: str
++    status: str
++    current_version_id: int | None
++
++
++def normalize_product_code(raw_code: str) -> str:
++    """Validate one product-code input and return its canonical uppercase form."""
++
++    stripped = raw_code.strip()
++    if PRODUCT_CODE_PATTERN.fullmatch(stripped) is None:
++        raise AppError(
++            "invalid_product_code",
++            "产品编码须为 1-64 位英文字母、数字、横线或下划线。",
++            422,
++        )
++    return stripped.upper()
++
++
++def is_normalized_product_code(code: str) -> bool:
++    """Return whether a stored code satisfies the canonical contract."""
++
++    return NORMALIZED_PRODUCT_CODE_PATTERN.fullmatch(code) is not None
++
++
++def generate_public_token() -> str:
++    """Generate an unpadded Base32 token with exactly 128 bits of CSPRNG entropy."""
++
++    token = base64.b32encode(secrets.token_bytes(PUBLIC_TOKEN_BYTES)).decode("ascii").rstrip("=")
++    if len(token) != PUBLIC_TOKEN_LENGTH:
++        raise RuntimeError("Unexpected public token length")
++    return token
++
++
++def _product_from_row(row: dict[str, object]) -> Product:
++    return Product(
++        id=cast(int, row["id"]),
++        code=str(row["code"]),
++        public_token=str(row["public_token"]),
++        status=str(row["status"]),
++        current_version_id=(
++            cast(int, row["current_version_id"]) if row["current_version_id"] is not None else None
++        ),
++    )
++
++
++async def create_product(
++    database: Database,
++    raw_code: str,
++    *,
++    request_id: UUID | None = None,
++) -> Product:
++    """Atomically create a product and its success audit event."""
++
++    code = normalize_product_code(raw_code)
++    for _attempt in range(TOKEN_RETRY_LIMIT):
++        token = generate_public_token()
++        try:
++            async with database.connection() as connection:
++                async with connection.transaction():
++                    cursor = await connection.execute(
++                        """
++                        INSERT INTO products (
++                            code,
++                            public_token,
++                            created_at,
++                            updated_at
++                        ) VALUES (%s, %s, now(), now())
++                        RETURNING id, code, public_token, status, current_version_id
++                        """,
++                        (code, token),
++                    )
++                    row = await cursor.fetchone()
++                    if row is None:
++                        raise RuntimeError("Product insert returned no row")
++                    product = _product_from_row(row)
++                    await append_event(
++                        connection,
++                        AuditEvent(
++                            action="product_create",
++                            result="success",
++                            target_type="product",
++                            target_id=product.id,
++                            product_code=product.code,
++                            request_id=request_id,
++                        ),
++                    )
++            return product
++        except UniqueViolation as error:
++            constraint_name = error.diag.constraint_name
++            if constraint_name == "products_code_key":
++                raise AppError("duplicate_product_code", "产品编码已存在。", 409) from error
++            if constraint_name == "products_public_token_key":
++                continue
++            raise
++    raise AppError("token_generation_failed", "无法生成公开标识, 请重试。", 503)
+diff --git a/src/product_pdf_qr/domains/public/__init__.py b/src/product_pdf_qr/domains/public/__init__.py
+index fbe93f2..52473a2 100644
+--- a/src/product_pdf_qr/domains/public/__init__.py
++++ b/src/product_pdf_qr/domains/public/__init__.py
+@@ -1 +1,9 @@
+-"""Public-access domain skeleton."""
++"""Public-access domain."""
++
++from product_pdf_qr.domains.public.service import (
++    PublicDocument,
++    PublicMissLimiter,
++    resolve_public_document,
++)
++
++__all__ = ["PublicDocument", "PublicMissLimiter", "resolve_public_document"]
+diff --git a/src/product_pdf_qr/domains/public/router.py b/src/product_pdf_qr/domains/public/router.py
+new file mode 100644
+index 0000000..9709816
+--- /dev/null
++++ b/src/product_pdf_qr/domains/public/router.py
+@@ -0,0 +1,110 @@
++"""Uniform-200 public scan endpoint."""
++
++from __future__ import annotations
++
++from collections.abc import Iterator
++from typing import Annotated
++from urllib.parse import quote
++from uuid import uuid4
++
++from fastapi import APIRouter, Depends, Request
++from fastapi.responses import HTMLResponse, StreamingResponse
++
++from product_pdf_qr.database import Database
++from product_pdf_qr.dependencies import (
++    get_database,
++    get_public_miss_limiter,
++    get_storage_service,
++)
++from product_pdf_qr.domains.audit import AuditEvent, append_independent_event
++from product_pdf_qr.domains.public.service import PublicMissLimiter, resolve_public_document
++from product_pdf_qr.domains.storage import StorageService
++
++router = APIRouter(tags=["public"])
++
++NO_STORE_HEADERS = {
++    "Cache-Control": "no-store",
++    "Pragma": "no-cache",
++    "X-Content-Type-Options": "nosniff",
++}
++
++STATUS_MESSAGES = {
++    "missing": "资料链接无效",
++    "disabled": "该产品资料已停用",
++    "unuploaded": "资料暂未上传",
++}
++
++
++def _status_page(message: str) -> HTMLResponse:
++    body = (
++        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
++        '<meta name="viewport" content="width=device-width,initial-scale=1">'
++        "<title>产品资料</title></head><body><main><p>"
++        f"{message}"
++        "</p></main></body></html>"
++    )
++    return HTMLResponse(body, status_code=200, headers=NO_STORE_HEADERS)
++
++
++def _stream_file(path: object) -> Iterator[bytes]:
++    from pathlib import Path
++
++    with Path(str(path)).open("rb") as stream:
++        while chunk := stream.read(1024 * 1024):
++            yield chunk
++
++
++@router.get("/p/{public_token:path}", response_model=None)
++async def public_scan(
++    public_token: str,
++    request: Request,
++    database: Annotated[Database, Depends(get_database)],
++    storage: Annotated[StorageService, Depends(get_storage_service)],
++    limiter: Annotated[PublicMissLimiter, Depends(get_public_miss_limiter)],
++) -> HTMLResponse | StreamingResponse:
++    """Return all business states as 200, except a separate abuse-limit response."""
++
++    source = request.client.host if request.client is not None else "unknown"
++    if await limiter.is_limited(source):
++        return HTMLResponse(
++            '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
++            "<title>产品资料</title></head><body><main><p>"
++            "请求过于频繁, 请稍后再试。"
++            "</p></main></body></html>",
++            status_code=429,
++            headers={**NO_STORE_HEADERS, "Retry-After": "600"},
++        )
++
++    document = await resolve_public_document(database, storage, public_token)
++    if document.state == "missing":
++        newly_limited = await limiter.register_miss(source)
++        if newly_limited:
++            await append_independent_event(
++                database,
++                AuditEvent(
++                    action="public_token_probe",
++                    result="failure",
++                    actor_type="anonymous",
++                    request_id=uuid4(),
++                    detail={"miss_limit": limiter.limit},
++                ),
++            )
++        return _status_page(STATUS_MESSAGES["missing"])
++    if document.state == "disabled":
++        return _status_page(STATUS_MESSAGES["disabled"])
++    if document.state == "unuploaded":
++        return _status_page(STATUS_MESSAGES["unuploaded"])
++    if document.path is None or document.original_filename is None or document.size_bytes is None:
++        raise RuntimeError("Available public document lacks file metadata")
++    encoded_filename = quote(document.original_filename, safe="")
++    headers = {
++        **NO_STORE_HEADERS,
++        "Content-Disposition": f"inline; filename*=UTF-8''{encoded_filename}",
++        "Content-Length": str(document.size_bytes),
++    }
++    return StreamingResponse(
++        _stream_file(document.path),
++        status_code=200,
++        media_type="application/pdf",
++        headers=headers,
++    )
+diff --git a/src/product_pdf_qr/domains/public/service.py b/src/product_pdf_qr/domains/public/service.py
+new file mode 100644
+index 0000000..4d9a934
+--- /dev/null
++++ b/src/product_pdf_qr/domains/public/service.py
+@@ -0,0 +1,112 @@
++"""Public-token state resolution and miss-only enumeration limiting."""
++
++from __future__ import annotations
++
++import asyncio
++import time
++from collections import defaultdict, deque
++from collections.abc import Callable
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Literal, cast
++
++from product_pdf_qr.database import Database
++from product_pdf_qr.domains.storage import StorageService
++
++PublicState = Literal["missing", "disabled", "unuploaded", "available"]
++
++
++@dataclass(frozen=True, slots=True)
++class PublicDocument:
++    """The public state projection, with file data only for the available state."""
++
++    state: PublicState
++    path: Path | None = None
++    original_filename: str | None = None
++    size_bytes: int | None = None
++
++
++class PublicMissLimiter:
++    """Track only missing-token probes so valid shared-IP scans are not penalized."""
++
++    def __init__(
++        self,
++        limit: int,
++        window_seconds: int,
++        *,
++        clock: Callable[[], float] = time.monotonic,
++    ) -> None:
++        self.limit = limit
++        self.window_seconds = window_seconds
++        self._clock = clock
++        self._misses: dict[str, deque[float]] = defaultdict(deque)
++        self._lock = asyncio.Lock()
++
++    async def is_limited(self, source: str) -> bool:
++        """Return whether the source already exceeded the active miss window."""
++
++        async with self._lock:
++            misses = self._active_misses(source)
++            return len(misses) >= self.limit
++
++    async def register_miss(self, source: str) -> bool:
++        """Record one miss and return whether this miss reaches the threshold."""
++
++        async with self._lock:
++            misses = self._active_misses(source)
++            was_limited = len(misses) >= self.limit
++            misses.append(self._clock())
++            return not was_limited and len(misses) >= self.limit
++
++    def _active_misses(self, source: str) -> deque[float]:
++        now = self._clock()
++        cutoff = now - self.window_seconds
++        misses = self._misses[source]
++        while misses and misses[0] <= cutoff:
++            misses.popleft()
++        return misses
++
++
++async def resolve_public_document(
++    database: Database,
++    storage: StorageService,
++    public_token: str,
++) -> PublicDocument:
++    """Resolve all four public states with disabled checked before current version."""
++
++    async with database.connection() as connection:
++        cursor = await connection.execute(
++            """
++            SELECT
++                p.status,
++                p.current_version_id,
++                v.original_filename,
++                f.storage_path,
++                f.size_bytes
++            FROM products AS p
++            LEFT JOIN pdf_versions AS v
++              ON v.product_id = p.id
++             AND v.id = p.current_version_id
++            LEFT JOIN pdf_files AS f ON f.id = v.pdf_file_id
++            WHERE p.public_token = %s
++            """,
++            (public_token,),
++        )
++        row = await cursor.fetchone()
++    if row is None:
++        return PublicDocument("missing")
++    if str(row["status"]) == "disabled":
++        return PublicDocument("disabled")
++    if row["current_version_id"] is None:
++        return PublicDocument("unuploaded")
++    if row["storage_path"] is None or row["original_filename"] is None:
++        raise RuntimeError("Current PDF metadata cannot be resolved")
++    path = storage.resolve_formal_path(str(row["storage_path"]))
++    if not path.is_file():
++        raise RuntimeError("Current PDF file is missing")
++    return PublicDocument(
++        "available",
++        path=path,
++        original_filename=str(row["original_filename"]),
++        size_bytes=cast(int, row["size_bytes"]),
++    )
+diff --git a/src/product_pdf_qr/domains/qrcode/__init__.py b/src/product_pdf_qr/domains/qrcode/__init__.py
+index e46c80b..9e07522 100644
+--- a/src/product_pdf_qr/domains/qrcode/__init__.py
++++ b/src/product_pdf_qr/domains/qrcode/__init__.py
+@@ -1 +1,9 @@
+-"""QR-code domain skeleton."""
++"""QR-code domain."""
++
++from product_pdf_qr.domains.qrcode.service import (
++    QRCodeGenerationError,
++    QRCodeResult,
++    QRCodeService,
++)
++
++__all__ = ["QRCodeGenerationError", "QRCodeResult", "QRCodeService"]
+diff --git a/src/product_pdf_qr/domains/qrcode/router.py b/src/product_pdf_qr/domains/qrcode/router.py
+new file mode 100644
+index 0000000..056fa4f
+--- /dev/null
++++ b/src/product_pdf_qr/domains/qrcode/router.py
+@@ -0,0 +1,62 @@
++"""Read-only QR generation failure reconciliation."""
++
++from __future__ import annotations
++
++from typing import Annotated, cast
++
++from fastapi import APIRouter, Depends
++from pydantic import BaseModel
++
++from product_pdf_qr.database import Database
++from product_pdf_qr.dependencies import get_database, get_qrcode_service
++from product_pdf_qr.domains.qrcode import QRCodeService
++
++router = APIRouter(prefix="/api/qrcode", tags=["qrcode"])
++
++
++class QRCodeFailureResponse(BaseModel):
++    """One product whose last observed generation failure has no cache artifact."""
++
++    product_id: int
++    product_code: str
++    reason: str | None
++
++
++@router.get("/failures", response_model=list[QRCodeFailureResponse])
++async def report_qrcode_failures(
++    database: Annotated[Database, Depends(get_database)],
++    qrcode_service: Annotated[QRCodeService, Depends(get_qrcode_service)],
++) -> list[QRCodeFailureResponse]:
++    """List generation failures without creating, changing, or deleting any QR image."""
++
++    async with database.connection() as connection:
++        cursor = await connection.execute(
++            """
++            SELECT DISTINCT ON (target_id)
++                target_id,
++                product_code,
++                detail
++            FROM audit_events
++            WHERE action = 'qrcode_generation_failure'
++              AND target_type = 'product'
++              AND target_id IS NOT NULL
++              AND product_code IS NOT NULL
++            ORDER BY target_id, occurred_at DESC, id DESC
++            """
++        )
++        rows = await cursor.fetchall()
++    failures: list[QRCodeFailureResponse] = []
++    for row in rows:
++        product_code = str(row["product_code"])
++        if (qrcode_service.cache_root / f"{product_code}.png").is_file():
++            continue
++        detail = row["detail"]
++        reason = str(detail.get("reason")) if isinstance(detail, dict) else None
++        failures.append(
++            QRCodeFailureResponse(
++                product_id=cast(int, row["target_id"]),
++                product_code=product_code,
++                reason=reason,
++            )
++        )
++    return failures
+diff --git a/src/product_pdf_qr/domains/qrcode/service.py b/src/product_pdf_qr/domains/qrcode/service.py
+new file mode 100644
+index 0000000..e5d82e7
+--- /dev/null
++++ b/src/product_pdf_qr/domains/qrcode/service.py
+@@ -0,0 +1,154 @@
++"""Deterministic QR generation and best-effort derived caching."""
++
++from __future__ import annotations
++
++import asyncio
++import io
++import logging
++import os
++import tempfile
++from dataclasses import dataclass
++from pathlib import Path
++
++import segno
++from PIL import Image, ImageDraw
++
++from product_pdf_qr.domains.product import is_normalized_product_code
++from product_pdf_qr.errors import AppError
++
++logger = logging.getLogger(__name__)
++
++QR_IMAGE_SIZE = 1024
++QR_BORDER_MODULES = 4
++
++
++class QRCodeGenerationError(AppError):
++    """A QR image cannot be safely generated for the requested product."""
++
++    def __init__(self, message: str = "二维码生成失败。") -> None:
++        super().__init__("qrcode_generation_failed", message, 422)
++
++
++@dataclass(frozen=True, slots=True)
++class QRCodeResult:
++    """A QR response, including non-fatal cache write information."""
++
++    image_bytes: bytes
++    cache_hit: bool
++    cache_error: str | None = None
++
++
++class QRCodeService:
++    """Generate 1024px H-level PNGs and cache them outside business transactions."""
++
++    def __init__(self, storage_root: Path, public_base_url: str) -> None:
++        self.cache_root = storage_root / "qrcodes"
++        self.public_base_url = public_base_url.rstrip("/")
++        self._cache_locks: dict[str, asyncio.Lock] = {}
++        self._cache_locks_guard = asyncio.Lock()
++
++    def public_url(self, public_token: str) -> str:
++        """Build the only payload permitted in a QR code."""
++
++        return f"{self.public_base_url}/p/{public_token}"
++
++    def generate(self, code: str, public_token: str) -> bytes:
++        """Generate deterministic PNG bytes with no ancillary metadata."""
++
++        if not is_normalized_product_code(code):
++            raise QRCodeGenerationError("产品编码不符合二维码文件名契约。")
++        payload = self.public_url(public_token)
++        try:
++            symbol = segno.make(
++                payload,
++                error="h",
++                encoding="utf-8",
++                micro=False,
++                boost_error=False,
++            )
++            matrix = tuple(tuple(bool(module) for module in row) for row in symbol.matrix)
++            if not matrix or any(len(row) != len(matrix) for row in matrix):
++                raise RuntimeError("QR matrix is not square")
++            module_count = len(matrix) + (2 * QR_BORDER_MODULES)
++            image = Image.new("1", (QR_IMAGE_SIZE, QR_IMAGE_SIZE), color=1)
++            draw = ImageDraw.Draw(image)
++            for row_index, row in enumerate(matrix):
++                for column_index, is_dark in enumerate(row):
++                    if not is_dark:
++                        continue
++                    x0 = ((column_index + QR_BORDER_MODULES) * QR_IMAGE_SIZE) // module_count
++                    y0 = ((row_index + QR_BORDER_MODULES) * QR_IMAGE_SIZE) // module_count
++                    x1 = (
++                        ((column_index + QR_BORDER_MODULES + 1) * QR_IMAGE_SIZE) // module_count
++                    ) - 1
++                    y1 = (((row_index + QR_BORDER_MODULES + 1) * QR_IMAGE_SIZE) // module_count) - 1
++                    draw.rectangle((x0, y0, x1, y1), fill=0)
++            output = io.BytesIO()
++            image.save(output, format="PNG", optimize=False, compress_level=9)
++            return output.getvalue()
++        except QRCodeGenerationError:
++            raise
++        except Exception as error:
++            raise QRCodeGenerationError() from error
++
++    async def get_or_generate(self, code: str, public_token: str) -> QRCodeResult:
++        """Return cached bytes or generate immediately and attempt an atomic cache write."""
++
++        cache_path = self.cache_root / f"{code}.png"
++        try:
++            cached = await asyncio.to_thread(cache_path.read_bytes)
++        except FileNotFoundError:
++            cached = None
++        except OSError:
++            cached = None
++        if cached is not None:
++            return QRCodeResult(cached, cache_hit=True)
++
++        image_bytes = self.generate(code, public_token)
++        lock = await self._cache_lock(code)
++        async with lock:
++            try:
++                cached = await asyncio.to_thread(cache_path.read_bytes)
++            except (FileNotFoundError, OSError):
++                cached = None
++            if cached is not None:
++                return QRCodeResult(cached, cache_hit=True)
++            try:
++                await asyncio.to_thread(
++                    self._write_cache_without_overwrite,
++                    cache_path,
++                    image_bytes,
++                )
++            except OSError as error:
++                logger.warning("QR cache write failed", extra={"product_code": code})
++                return QRCodeResult(
++                    image_bytes,
++                    cache_hit=False,
++                    cache_error=type(error).__name__,
++                )
++        return QRCodeResult(image_bytes, cache_hit=False)
++
++    async def _cache_lock(self, code: str) -> asyncio.Lock:
++        async with self._cache_locks_guard:
++            return self._cache_locks.setdefault(code, asyncio.Lock())
++
++    def _write_cache_without_overwrite(self, target: Path, image_bytes: bytes) -> None:
++        target.parent.mkdir(parents=True, exist_ok=True)
++        file_descriptor, temporary_name = tempfile.mkstemp(
++            prefix=f".{target.stem}-",
++            suffix=".tmp",
++            dir=target.parent,
++        )
++        temporary_path = Path(temporary_name)
++        try:
++            with os.fdopen(file_descriptor, "wb") as output:
++                output.write(image_bytes)
++                output.flush()
++                os.fsync(output.fileno())
++            if target.exists():
++                temporary_path.unlink(missing_ok=True)
++                return
++            os.rename(temporary_path, target)
++        except BaseException:
++            temporary_path.unlink(missing_ok=True)
++            raise
+diff --git a/src/product_pdf_qr/domains/storage/__init__.py b/src/product_pdf_qr/domains/storage/__init__.py
+index 3f9d719..9282b91 100644
+--- a/src/product_pdf_qr/domains/storage/__init__.py
++++ b/src/product_pdf_qr/domains/storage/__init__.py
+@@ -1 +1,19 @@
+-"""File-storage domain skeleton."""
++"""Content-addressed PDF storage domain."""
++
++from product_pdf_qr.domains.storage.service import (
++    OrphanFile,
++    PublishCancelled,
++    PublishedFile,
++    StorageService,
++    UploadRejected,
++    ValidatedUpload,
++)
++
++__all__ = [
++    "OrphanFile",
++    "PublishCancelled",
++    "PublishedFile",
++    "StorageService",
++    "UploadRejected",
++    "ValidatedUpload",
++]
+diff --git a/src/product_pdf_qr/domains/storage/router.py b/src/product_pdf_qr/domains/storage/router.py
+new file mode 100644
+index 0000000..9abb371
+--- /dev/null
++++ b/src/product_pdf_qr/domains/storage/router.py
+@@ -0,0 +1,43 @@
++"""Read-only formal-storage reconciliation."""
++
++from __future__ import annotations
++
++from typing import Annotated
++
++from fastapi import APIRouter, Depends
++from pydantic import BaseModel
++
++from product_pdf_qr.database import Database
++from product_pdf_qr.dependencies import get_database, get_storage_service
++from product_pdf_qr.domains.storage import StorageService
++
++router = APIRouter(prefix="/api/storage", tags=["storage"])
++
++
++class OrphanFileResponse(BaseModel):
++    """One read-only orphan report row."""
++
++    storage_path: str
++    size_bytes: int
++    modified_at_ns: int
++
++
++@router.get("/orphans", response_model=list[OrphanFileResponse])
++async def report_orphan_files(
++    database: Annotated[Database, Depends(get_database)],
++    storage: Annotated[StorageService, Depends(get_storage_service)],
++) -> list[OrphanFileResponse]:
++    """List unreferenced files without changing either storage or the database."""
++
++    async with database.connection() as connection:
++        cursor = await connection.execute("SELECT storage_path FROM pdf_files")
++        rows = await cursor.fetchall()
++    referenced_paths = {str(row["storage_path"]) for row in rows}
++    return [
++        OrphanFileResponse(
++            storage_path=orphan.storage_path,
++            size_bytes=orphan.size_bytes,
++            modified_at_ns=orphan.modified_at_ns,
++        )
++        for orphan in storage.find_orphans(referenced_paths)
++    ]
+diff --git a/src/product_pdf_qr/domains/storage/service.py b/src/product_pdf_qr/domains/storage/service.py
+new file mode 100644
+index 0000000..0b9fcd6
+--- /dev/null
++++ b/src/product_pdf_qr/domains/storage/service.py
+@@ -0,0 +1,402 @@
++"""Isolated PDF validation and content-addressed storage."""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import logging
++import multiprocessing
++import os
++import re
++import resource
++
++# A fixed /bin/ps invocation reads this worker's own Darwin virtual size.
++import subprocess  # nosec B404
++import sys
++import tempfile
++from collections.abc import Callable
++from dataclasses import dataclass
++from multiprocessing.connection import Connection
++from pathlib import Path
++from typing import Literal
++
++from fastapi import UploadFile
++from pypdf import PdfReader
++
++from product_pdf_qr.config import (
++    DEFAULT_PDF_VALIDATION_CPU_SECONDS,
++    DEFAULT_PDF_VALIDATION_MEMORY_BYTES,
++    DEFAULT_PDF_VALIDATION_TIMEOUT_SECONDS,
++)
++from product_pdf_qr.errors import AppError
++
++logger = logging.getLogger(__name__)
++
++PDF_MIME_TYPE = "application/pdf"
++PDF_MAGIC = b"%PDF-"
++STREAM_CHUNK_BYTES = 1024 * 1024
++PDF_VALIDATION_POLL_SECONDS = 0.01
++STORAGE_PATH_PATTERN = re.compile(
++    r"^[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{64}\.pdf$",
++    re.ASCII,
++)
++PDFValidationStatus = Literal["valid", "invalid", "resource_limit"]
++PDFParser = Callable[[str], PDFValidationStatus]
++
++
++def _set_pdf_worker_limits(cpu_seconds: int, memory_bytes: int) -> None:
++    """Apply hard process ceilings before parsing untrusted PDF structures."""
++
++    resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))
++    if sys.platform == "darwin":
++        # dyld reserves hundreds of GiB of sparse virtual address space before
++        # this worker starts. Limit additional address-space growth to the same
++        # configured budget used as the absolute RLIMIT_AS ceiling on Linux.
++        current_vsize_bytes = (
++            int(
++                subprocess.check_output(  # nosec B603
++                    ["/bin/ps", "-o", "vsz=", "-p", str(os.getpid())],
++                    text=True,
++                ).strip()
++            )
++            * 1024
++        )
++        address_space_limit = current_vsize_bytes + memory_bytes
++        resource.setrlimit(
++            resource.RLIMIT_AS,
++            (address_space_limit, address_space_limit),
++        )
++        return
++    resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
++
++
++def _parse_pdf(path: str) -> PDFValidationStatus:
++    """Parse one existing file without network, database, or write access."""
++
++    try:
++        reader = PdfReader(path, strict=True)
++        len(reader.pages)
++    except MemoryError:
++        return "resource_limit"
++    except Exception:
++        return "invalid"
++    return "valid"
++
++
++def _pdf_validation_worker(
++    path: str,
++    result_connection: Connection,
++    cpu_seconds: int,
++    memory_bytes: int,
++    parser: PDFParser,
++) -> None:
++    """Apply resource ceilings, run the parser, and report a bounded status."""
++
++    status: PDFValidationStatus
++    try:
++        _set_pdf_worker_limits(cpu_seconds, memory_bytes)
++        status = parser(path)
++    except MemoryError:
++        status = "resource_limit"
++    except (OSError, ValueError):
++        status = "resource_limit"
++    except Exception:
++        status = "invalid"
++    try:
++        result_connection.send(status)
++    except (BrokenPipeError, EOFError, OSError):
++        pass
++    finally:
++        result_connection.close()
++
++
++class UploadRejected(AppError):
++    """A safe upload rejection tagged with its validation stage."""
++
++    def __init__(self, code: str, message: str, stage: str, status_code: int = 422) -> None:
++        super().__init__(code, message, status_code)
++        self.stage = stage
++
++
++@dataclass(slots=True)
++class ValidatedUpload:
++    """A validated temporary file which has not entered formal storage."""
++
++    temporary_path: Path
++    original_filename: str
++    size_bytes: int
++    sha256: str
++
++    def discard(self) -> None:
++        """Remove the temporary file if it is still present."""
++
++        try:
++            self.temporary_path.unlink(missing_ok=True)
++        except OSError:
++            logger.exception("Temporary upload cleanup failed")
++
++
++@dataclass(frozen=True, slots=True)
++class PublishedFile:
++    """The formal content-addressed location of a validated PDF."""
++
++    storage_path: str
++    absolute_path: Path
++    moved: bool
++
++
++class PublishCancelled(asyncio.CancelledError):
++    """Cancellation observed after the atomic publication outcome was known."""
++
++    def __init__(self, published: PublishedFile) -> None:
++        super().__init__()
++        self.published = published
++
++
++@dataclass(frozen=True, slots=True)
++class OrphanFile:
++    """One formal PDF which has no corresponding database reference."""
++
++    storage_path: str
++    size_bytes: int
++    modified_at_ns: int
++
++
++class StorageService:
++    """Own the temporary and formal directories on one filesystem."""
++
++    def __init__(
++        self,
++        root: Path,
++        max_pdf_bytes: int,
++        *,
++        pdf_validation_timeout_seconds: float = DEFAULT_PDF_VALIDATION_TIMEOUT_SECONDS,
++        pdf_validation_cpu_seconds: int = DEFAULT_PDF_VALIDATION_CPU_SECONDS,
++        pdf_validation_memory_bytes: int = DEFAULT_PDF_VALIDATION_MEMORY_BYTES,
++        pdf_parser: PDFParser = _parse_pdf,
++    ) -> None:
++        self.root = root
++        self.temporary_root = root / "temporary"
++        self.files_root = root / "files"
++        self.max_pdf_bytes = max_pdf_bytes
++        self.pdf_validation_timeout_seconds = pdf_validation_timeout_seconds
++        self.pdf_validation_cpu_seconds = pdf_validation_cpu_seconds
++        self.pdf_validation_memory_bytes = pdf_validation_memory_bytes
++        self.pdf_parser = pdf_parser
++        self._publish_locks: dict[str, asyncio.Lock] = {}
++        self._publish_locks_guard = asyncio.Lock()
++
++    def prepare(self) -> None:
++        """Create both directories below one configured storage root."""
++
++        self.temporary_root.mkdir(parents=True, exist_ok=True)
++        self.files_root.mkdir(parents=True, exist_ok=True)
++        if self.temporary_root.stat().st_dev != self.files_root.stat().st_dev:
++            raise RuntimeError("Temporary and formal storage must share one filesystem")
++
++    async def receive_and_validate(self, upload: UploadFile) -> ValidatedUpload:
++        """Stream to isolation, enforce limits, then validate content and hash it."""
++
++        self.prepare()
++        original_filename = upload.filename or ""
++        file_descriptor, temporary_name = tempfile.mkstemp(
++            prefix="upload-",
++            suffix=".part",
++            dir=self.temporary_root,
++        )
++        temporary_path = Path(temporary_name)
++        size_bytes = 0
++        digest = hashlib.sha256()
++        output = os.fdopen(file_descriptor, "wb")
++        validation_succeeded = False
++        try:
++            while True:
++                chunk = await upload.read(STREAM_CHUNK_BYTES)
++                if not chunk:
++                    break
++                size_bytes += len(chunk)
++                if size_bytes > self.max_pdf_bytes:
++                    raise UploadRejected(
++                        "pdf_too_large",
++                        "PDF 文件不得超过 50 MB。",
++                        "size",
++                        413,
++                    )
++                digest.update(chunk)
++                await asyncio.to_thread(output.write, chunk)
++            await asyncio.to_thread(output.flush)
++            await asyncio.to_thread(os.fsync, output.fileno())
++            output.close()
++            self._validate_metadata(original_filename, upload.content_type)
++            await self._validate_pdf_content(temporary_path, size_bytes)
++            validation_succeeded = True
++            return ValidatedUpload(
++                temporary_path=temporary_path,
++                original_filename=original_filename,
++                size_bytes=size_bytes,
++                sha256=digest.hexdigest(),
++            )
++        finally:
++            if not output.closed:
++                output.close()
++            if not validation_succeeded:
++                temporary_path.unlink(missing_ok=True)
++
++    @staticmethod
++    def _validate_metadata(filename: str, content_type: str | None) -> None:
++        if Path(filename).suffix.lower() != ".pdf":
++            raise UploadRejected(
++                "invalid_pdf_extension",
++                "仅允许上传 .pdf 文件。",
++                "extension",
++            )
++        declared_type = (content_type or "").split(";", 1)[0].strip().lower()
++        if declared_type != PDF_MIME_TYPE:
++            raise UploadRejected(
++                "invalid_pdf_mime",
++                "文件声明类型必须为 application/pdf。",
++                "mime",
++            )
++
++    async def _validate_pdf_content(self, path: Path, size_bytes: int) -> None:
++        if size_bytes == 0:
++            raise UploadRejected("empty_pdf", "PDF 文件不能为空。", "size")
++        with path.open("rb") as stream:
++            if stream.read(len(PDF_MAGIC)) != PDF_MAGIC:
++                raise UploadRejected(
++                    "invalid_pdf_signature",
++                    "文件内容不是有效的 PDF。",
++                    "signature",
++                )
++        context = multiprocessing.get_context("spawn")
++        result_reader, result_writer = context.Pipe(duplex=False)
++        process = context.Process(
++            target=_pdf_validation_worker,
++            args=(
++                str(path),
++                result_writer,
++                self.pdf_validation_cpu_seconds,
++                self.pdf_validation_memory_bytes,
++                self.pdf_parser,
++            ),
++            daemon=True,
++        )
++        process_started = False
++        timed_out = False
++        try:
++            process.start()
++            process_started = True
++            result_writer.close()
++            loop = asyncio.get_running_loop()
++            deadline = loop.time() + self.pdf_validation_timeout_seconds
++            while process.is_alive():
++                if loop.time() >= deadline:
++                    timed_out = True
++                    process.kill()
++                    break
++                await asyncio.sleep(PDF_VALIDATION_POLL_SECONDS)
++            await asyncio.to_thread(process.join)
++            if timed_out:
++                raise UploadRejected(
++                    "pdf_validation_timeout",
++                    "PDF 结构校验超时。",
++                    "structure_timeout",
++                )
++            status: PDFValidationStatus | None = None
++            if result_reader.poll():
++                try:
++                    status = result_reader.recv()
++                except EOFError:
++                    status = None
++            if status == "valid":
++                return
++            if status == "resource_limit" or (
++                status is None and process.exitcode is not None and process.exitcode < 0
++            ):
++                raise UploadRejected(
++                    "pdf_validation_resource_limit",
++                    "PDF 结构校验超过资源限制。",
++                    "structure_resource",
++                )
++            raise UploadRejected(
++                "invalid_pdf_structure",
++                "PDF 结构无法解析。",
++                "structure",
++            )
++        finally:
++            if process_started and process.is_alive():
++                process.kill()
++                await asyncio.to_thread(process.join)
++            elif process_started and process.exitcode is None:
++                await asyncio.to_thread(process.join)
++            result_reader.close()
++            result_writer.close()
++
++    async def publish(self, upload: ValidatedUpload) -> PublishedFile:
++        """Atomically rename one file into storage without overwriting existing content."""
++
++        lock = await self._publish_lock(upload.sha256)
++        async with lock:
++            publication = asyncio.create_task(asyncio.to_thread(self._publish_sync, upload))
++            try:
++                return await asyncio.shield(publication)
++            except asyncio.CancelledError as error:
++                try:
++                    published = await publication
++                except Exception:
++                    raise error from None
++                raise PublishCancelled(published) from error
++
++    def _publish_sync(self, upload: ValidatedUpload) -> PublishedFile:
++        """Complete one indivisible publication attempt in a worker thread."""
++
++        relative = self.relative_path_for_hash(upload.sha256)
++        target = self.files_root / relative
++        target.parent.mkdir(parents=True, exist_ok=True)
++        if target.exists():
++            upload.discard()
++            return PublishedFile(relative, target, moved=False)
++        os.rename(upload.temporary_path, target)
++        return PublishedFile(relative, target, moved=True)
++
++    async def _publish_lock(self, sha256: str) -> asyncio.Lock:
++        async with self._publish_locks_guard:
++            return self._publish_locks.setdefault(sha256, asyncio.Lock())
++
++    @staticmethod
++    def relative_path_for_hash(sha256: str) -> str:
++        """Derive a path using only a validated SHA-256 digest."""
++
++        if re.fullmatch(r"[0-9a-f]{64}", sha256, re.ASCII) is None:
++            raise ValueError("Invalid SHA-256 digest")
++        return f"{sha256[:2]}/{sha256[2:4]}/{sha256}.pdf"
++
++    def resolve_formal_path(self, storage_path: str) -> Path:
++        """Resolve a database path and prove that it stays under the file root."""
++
++        if STORAGE_PATH_PATTERN.fullmatch(storage_path) is None:
++            raise RuntimeError("Unsafe storage path")
++        root = self.files_root.resolve()
++        resolved = (root / storage_path).resolve()
++        if not resolved.is_relative_to(root):
++            raise RuntimeError("Storage path escaped the configured root")
++        return resolved
++
++    def find_orphans(self, referenced_paths: set[str]) -> list[OrphanFile]:
++        """Return a read-only snapshot of unreferenced formal files."""
++
++        self.prepare()
++        orphans: list[OrphanFile] = []
++        for path in sorted(self.files_root.rglob("*.pdf")):
++            relative = path.relative_to(self.files_root).as_posix()
++            if relative in referenced_paths:
++                continue
++            stat = path.stat()
++            orphans.append(
++                OrphanFile(
++                    storage_path=relative,
++                    size_bytes=stat.st_size,
++                    modified_at_ns=stat.st_mtime_ns,
++                )
++            )
++        return orphans
+diff --git a/src/product_pdf_qr/domains/version/__init__.py b/src/product_pdf_qr/domains/version/__init__.py
+index 1b801cc..33dd0b3 100644
+--- a/src/product_pdf_qr/domains/version/__init__.py
++++ b/src/product_pdf_qr/domains/version/__init__.py
+@@ -1 +1,15 @@
+-"""PDF-version domain skeleton."""
++"""Append-only PDF version domain."""
++
++from product_pdf_qr.domains.version.service import (
++    DuplicateCurrentPDF,
++    PDFVersion,
++    record_upload_rejection,
++    upload_pdf,
++)
++
++__all__ = [
++    "DuplicateCurrentPDF",
++    "PDFVersion",
++    "record_upload_rejection",
++    "upload_pdf",
++]
+diff --git a/src/product_pdf_qr/domains/version/service.py b/src/product_pdf_qr/domains/version/service.py
+new file mode 100644
+index 0000000..ceece42
+--- /dev/null
++++ b/src/product_pdf_qr/domains/version/service.py
+@@ -0,0 +1,311 @@
++"""Serialized PDF upload and append-only version management."""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++from dataclasses import dataclass
++from typing import cast
++from uuid import UUID
++
++from product_pdf_qr.database import Database
++from product_pdf_qr.domains.audit import AuditEvent, append_event, append_independent_event
++from product_pdf_qr.domains.storage import (
++    PublishCancelled,
++    PublishedFile,
++    StorageService,
++    ValidatedUpload,
++)
++from product_pdf_qr.errors import AppError
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass(frozen=True, slots=True)
++class PDFVersion:
++    """The version created by one successful upload."""
++
++    id: int
++    product_id: int
++    version_no: int
++    pdf_file_id: int
++    sha256: str
++    size_bytes: int
++    storage_path: str
++    original_filename: str
++
++
++class DuplicateCurrentPDF(AppError):
++    """The candidate is byte-identical to the locked current version."""
++
++    def __init__(self) -> None:
++        super().__init__("duplicate_current_pdf", "与当前文件相同", 409)
++
++
++def _upload_rejection_event(
++    *,
++    product_id: int,
++    actor_id: int,
++    product_code: str | None,
++    request_id: UUID | None,
++    reason: str,
++    sha256: str,
++    published: PublishedFile | None,
++) -> AuditEvent:
++    detail: dict[str, object] = {
++        "reason": reason,
++        "stage": "locked_transaction",
++        "sha256": sha256,
++    }
++    if published is not None and published.moved:
++        detail["moved_file_sha256"] = sha256
++    return AuditEvent(
++        action="pdf_upload_rejected",
++        result="failure",
++        actor_type="admin",
++        actor_id=actor_id,
++        target_type="product",
++        target_id=product_id,
++        product_code=product_code,
++        request_id=request_id,
++        detail=detail,
++    )
++
++
++async def _append_shielded_rejection(database: Database, event: AuditEvent) -> None:
++    """Wait for an independent rejection audit even while propagating cancellation."""
++
++    audit_task = asyncio.create_task(append_independent_event(database, event))
++    try:
++        await asyncio.shield(audit_task)
++    except asyncio.CancelledError:
++        await audit_task
++
++
++async def record_upload_rejection(
++    database: Database,
++    *,
++    product_id: int,
++    actor_id: int,
++    reason: str,
++    stage: str,
++    request_id: UUID | None,
++) -> bool:
++    """Record a pre-transaction validation rejection on an independent connection."""
++
++    return await append_independent_event(
++        database,
++        AuditEvent(
++            action="pdf_upload_rejected",
++            result="failure",
++            actor_type="admin",
++            actor_id=actor_id,
++            target_type="product",
++            target_id=product_id,
++            request_id=request_id,
++            detail={"reason": reason, "stage": stage},
++        ),
++    )
++
++
++async def upload_pdf(
++    database: Database,
++    storage: StorageService,
++    *,
++    product_id: int,
++    actor_id: int,
++    upload: ValidatedUpload,
++    request_id: UUID | None = None,
++) -> PDFVersion:
++    """Lock, re-read current content, publish, append, repoint, and commit."""
++
++    published: PublishedFile | None = None
++    product_code: str | None = None
++    try:
++        async with database.connection() as connection:
++            async with connection.transaction():
++                product_cursor = await connection.execute(
++                    """
++                    SELECT id, code, current_version_id
++                    FROM products
++                    WHERE id = %s
++                    FOR UPDATE
++                    """,
++                    (product_id,),
++                )
++                product_row = await product_cursor.fetchone()
++                if product_row is None:
++                    raise AppError("product_not_found", "产品不存在。", 404)
++                product_code = str(product_row["code"])
++
++                actor_cursor = await connection.execute(
++                    "SELECT id FROM admins WHERE id = %s",
++                    (actor_id,),
++                )
++                if await actor_cursor.fetchone() is None:
++                    raise AppError("upload_actor_not_found", "上传操作者不存在。", 422)
++
++                current_version_id = product_row["current_version_id"]
++                if current_version_id is not None:
++                    current_cursor = await connection.execute(
++                        """
++                        SELECT f.size_bytes, f.sha256
++                        FROM pdf_versions AS v
++                        JOIN pdf_files AS f ON f.id = v.pdf_file_id
++                        WHERE v.product_id = %s AND v.id = %s
++                        """,
++                        (product_id, current_version_id),
++                    )
++                    current_row = await current_cursor.fetchone()
++                    if current_row is None:
++                        raise RuntimeError("Current version pointer cannot be resolved")
++                    if (
++                        cast(int, current_row["size_bytes"]) == upload.size_bytes
++                        and str(current_row["sha256"]) == upload.sha256
++                    ):
++                        raise DuplicateCurrentPDF()
++
++                version_cursor = await connection.execute(
++                    """
++                    SELECT COALESCE(MAX(version_no), 0) + 1 AS next_version_no
++                    FROM pdf_versions
++                    WHERE product_id = %s
++                    """,
++                    (product_id,),
++                )
++                version_row = await version_cursor.fetchone()
++                if version_row is None:
++                    raise RuntimeError("Version number query returned no row")
++                next_version_no = cast(int, version_row["next_version_no"])
++
++                published = await storage.publish(upload)
++
++                file_cursor = await connection.execute(
++                    """
++                    INSERT INTO pdf_files (
++                        sha256,
++                        size_bytes,
++                        storage_path,
++                        created_at
++                    ) VALUES (%s, %s, %s, now())
++                    ON CONFLICT (sha256) DO NOTHING
++                    RETURNING id, size_bytes, storage_path
++                    """,
++                    (upload.sha256, upload.size_bytes, published.storage_path),
++                )
++                file_row = await file_cursor.fetchone()
++                if file_row is None:
++                    existing_cursor = await connection.execute(
++                        """
++                        SELECT id, size_bytes, storage_path
++                        FROM pdf_files
++                        WHERE sha256 = %s
++                        """,
++                        (upload.sha256,),
++                    )
++                    file_row = await existing_cursor.fetchone()
++                if file_row is None:
++                    raise RuntimeError("Content-addressed file row cannot be resolved")
++                if (
++                    cast(int, file_row["size_bytes"]) != upload.size_bytes
++                    or str(file_row["storage_path"]) != published.storage_path
++                ):
++                    raise RuntimeError("Content-addressed file metadata conflict")
++                pdf_file_id = cast(int, file_row["id"])
++
++                inserted_version = await connection.execute(
++                    """
++                    INSERT INTO pdf_versions (
++                        product_id,
++                        pdf_file_id,
++                        version_no,
++                        original_filename,
++                        uploaded_by,
++                        uploaded_at
++                    ) VALUES (%s, %s, %s, %s, %s, now())
++                    RETURNING id
++                    """,
++                    (
++                        product_id,
++                        pdf_file_id,
++                        next_version_no,
++                        upload.original_filename,
++                        actor_id,
++                    ),
++                )
++                inserted_row = await inserted_version.fetchone()
++                if inserted_row is None:
++                    raise RuntimeError("Version insert returned no row")
++                version_id = cast(int, inserted_row["id"])
++
++                await connection.execute(
++                    """
++                    UPDATE products
++                    SET current_version_id = %s, updated_at = now()
++                    WHERE id = %s
++                    """,
++                    (version_id, product_id),
++                )
++                await append_event(
++                    connection,
++                    AuditEvent(
++                        action="pdf_upload",
++                        result="success",
++                        actor_type="admin",
++                        actor_id=actor_id,
++                        target_type="version",
++                        target_id=version_id,
++                        product_code=product_code,
++                        request_id=request_id,
++                        detail={
++                            "version_no": next_version_no,
++                            "sha256": upload.sha256,
++                            "size_bytes": upload.size_bytes,
++                        },
++                    ),
++                )
++        return PDFVersion(
++            id=version_id,
++            product_id=product_id,
++            version_no=next_version_no,
++            pdf_file_id=pdf_file_id,
++            sha256=upload.sha256,
++            size_bytes=upload.size_bytes,
++            storage_path=published.storage_path,
++            original_filename=upload.original_filename,
++        )
++    except asyncio.CancelledError as error:
++        if isinstance(error, PublishCancelled):
++            published = error.published
++        await _append_shielded_rejection(
++            database,
++            _upload_rejection_event(
++                product_id=product_id,
++                actor_id=actor_id,
++                product_code=product_code,
++                request_id=request_id,
++                reason="upload_cancelled",
++                sha256=upload.sha256,
++                published=published,
++            ),
++        )
++        raise
++    except Exception as error:
++        await append_independent_event(
++            database,
++            _upload_rejection_event(
++                product_id=product_id,
++                actor_id=actor_id,
++                product_code=product_code,
++                request_id=request_id,
++                reason=error.code if isinstance(error, AppError) else "upload_transaction_failed",
++                sha256=upload.sha256,
++                published=published,
++            ),
++        )
++        if isinstance(error, AppError):
++            raise
++        logger.exception("PDF upload transaction failed")
++        raise AppError("pdf_upload_failed", "PDF 上传失败, 请重试。", 500) from error
++    finally:
++        upload.discard()
+diff --git a/src/product_pdf_qr/main.py b/src/product_pdf_qr/main.py
+index 3e1ca72..b79d759 100644
+--- a/src/product_pdf_qr/main.py
++++ b/src/product_pdf_qr/main.py
+@@ -9,16 +9,43 @@ from fastapi.responses import JSONResponse
+ 
+ from product_pdf_qr.config import get_settings
+ from product_pdf_qr.database import Database
++from product_pdf_qr.domains.product.router import router as product_router
++from product_pdf_qr.domains.public import PublicMissLimiter
++from product_pdf_qr.domains.public.router import router as public_router
++from product_pdf_qr.domains.qrcode import QRCodeService
++from product_pdf_qr.domains.qrcode.router import router as qrcode_router
++from product_pdf_qr.domains.storage import StorageService
++from product_pdf_qr.domains.storage.router import router as storage_router
+ from product_pdf_qr.errors import register_exception_handlers
++from product_pdf_qr.upload_limit import UploadRequestLimitMiddleware
+ 
+ 
+ @asynccontextmanager
+ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+     """Start and stop infrastructure owned by the application process."""
+ 
+-    database = Database(get_settings())
++    settings = get_settings()
++    database = Database(settings)
++    storage_service = StorageService(
++        settings.storage_root,
++        settings.max_pdf_bytes,
++        pdf_validation_timeout_seconds=settings.pdf_validation_timeout_seconds,
++        pdf_validation_cpu_seconds=settings.pdf_validation_cpu_seconds,
++        pdf_validation_memory_bytes=settings.pdf_validation_memory_bytes,
++    )
++    storage_service.prepare()
+     await database.open()
+     app.state.database = database
++    app.state.settings = settings
++    app.state.storage_service = storage_service
++    app.state.qrcode_service = QRCodeService(
++        settings.storage_root,
++        str(settings.public_base_url),
++    )
++    app.state.public_miss_limiter = PublicMissLimiter(
++        settings.public_miss_limit,
++        settings.public_miss_window_seconds,
++    )
+     try:
+         yield
+     finally:
+@@ -26,14 +53,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+ 
+ 
+ def create_app() -> FastAPI:
+-    """Create the infrastructure-only Phase 1-A application."""
++    """Create the Phase 1-B local-only business-loop application."""
+ 
+     application = FastAPI(
+         title="Product PDF QR",
+         version="0.1.0",
+         lifespan=lifespan,
+     )
++    application.add_middleware(UploadRequestLimitMiddleware)
+     register_exception_handlers(application)
++    application.include_router(product_router)
++    application.include_router(qrcode_router)
++    application.include_router(storage_router)
++    application.include_router(public_router)
+ 
+     @application.get("/health/live", include_in_schema=False)
+     async def liveness() -> dict[str, str]:
+diff --git a/src/product_pdf_qr/upload_limit.py b/src/product_pdf_qr/upload_limit.py
+new file mode 100644
+index 0000000..39e9aaf
+--- /dev/null
++++ b/src/product_pdf_qr/upload_limit.py
+@@ -0,0 +1,187 @@
++"""ASGI-level request limits applied before multipart file materialization."""
++
++from __future__ import annotations
++
++import logging
++import re
++from typing import cast
++from uuid import UUID, uuid4
++
++from starlette.responses import JSONResponse
++from starlette.types import ASGIApp, Message, Receive, Scope, Send
++
++from product_pdf_qr.config import get_settings
++from product_pdf_qr.database import Database
++from product_pdf_qr.domains.audit import AuditEvent, append_independent_event
++
++logger = logging.getLogger(__name__)
++
++MULTIPART_OVERHEAD_BYTES = 64 * 1024
++PDF_UPLOAD_PATH = re.compile(
++    r"^/api/products/(?P<product_id>[^/]+)/pdf$",
++    re.ASCII,
++)
++
++
++class UploadRequestLimitMiddleware:
++    """Bound PDF multipart requests before Starlette creates an UploadFile."""
++
++    def __init__(
++        self,
++        app: ASGIApp,
++        *,
++        max_pdf_bytes: int | None = None,
++        multipart_overhead_bytes: int = MULTIPART_OVERHEAD_BYTES,
++    ) -> None:
++        self.app = app
++        self.configured_max_pdf_bytes = max_pdf_bytes
++        self.multipart_overhead_bytes = multipart_overhead_bytes
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if not self._is_pdf_upload(scope):
++            await self.app(scope, receive, send)
++            return
++
++        max_pdf_bytes = self.configured_max_pdf_bytes
++        if max_pdf_bytes is None:
++            max_pdf_bytes = get_settings().max_pdf_bytes
++        max_request_bytes = max_pdf_bytes + self.multipart_overhead_bytes
++        content_length = self._content_length(scope)
++        if content_length is not None and content_length > max_request_bytes:
++            request_id = uuid4()
++            await self._audit_rejection(
++                scope,
++                request_id=request_id,
++                detail={
++                    "reason": "content_length_exceeded",
++                    "stage": "pre_parser_size",
++                    "declared_content_length": content_length,
++                    "declared_request_body_verified": False,
++                    "complete_pdf_byte_length_known": False,
++                },
++            )
++            await self._reject(scope, receive, send, request_id=request_id)
++            return
++
++        received_bytes = 0
++        too_large = False
++
++        async def limited_receive() -> Message:
++            nonlocal received_bytes, too_large
++            if too_large:
++                return {"type": "http.disconnect"}
++            message = await receive()
++            if message["type"] == "http.request":
++                received_bytes += len(message.get("body", b""))
++                if received_bytes > max_request_bytes:
++                    too_large = True
++                    return {"type": "http.disconnect"}
++            return message
++
++        async def tracked_send(message: Message) -> None:
++            if too_large:
++                return
++            await send(message)
++
++        try:
++            await self.app(scope, limited_receive, tracked_send)
++        except Exception:
++            if not too_large:
++                raise
++        if too_large:
++            request_id = uuid4()
++            await self._audit_rejection(
++                scope,
++                request_id=request_id,
++                detail={
++                    "reason": "chunked_stream_exceeded",
++                    "stage": "pre_parser_size",
++                    "received_bytes_before_abort": received_bytes,
++                    "complete_pdf_byte_length_known": False,
++                },
++            )
++            await self._reject(scope, receive, send, request_id=request_id)
++
++    @staticmethod
++    def _is_pdf_upload(scope: Scope) -> bool:
++        return (
++            scope["type"] == "http"
++            and scope.get("method") == "POST"
++            and PDF_UPLOAD_PATH.fullmatch(scope.get("path", "")) is not None
++        )
++
++    @staticmethod
++    def _content_length(scope: Scope) -> int | None:
++        for name, value in scope.get("headers", []):
++            if name.lower() != b"content-length":
++                continue
++            try:
++                parsed = int(value)
++            except ValueError:
++                return None
++            return parsed if parsed >= 0 else None
++        return None
++
++    @staticmethod
++    async def _audit_rejection(
++        scope: Scope,
++        *,
++        request_id: UUID,
++        detail: dict[str, object],
++    ) -> None:
++        match = PDF_UPLOAD_PATH.fullmatch(scope.get("path", ""))
++        product_id: int | None = None
++        if match is not None:
++            try:
++                candidate = int(match.group("product_id"))
++            except ValueError:
++                candidate = 0
++            if candidate > 0:
++                product_id = candidate
++        try:
++            database = cast(Database, scope["app"].state.database)
++            written = await append_independent_event(
++                database,
++                AuditEvent(
++                    action="pdf_upload_rejected",
++                    result="failure",
++                    actor_type="anonymous",
++                    target_type="product",
++                    target_id=product_id,
++                    request_id=request_id,
++                    detail=detail,
++                ),
++            )
++            if not written:
++                logger.error(
++                    "Pre-parser upload rejection audit was not persisted",
++                    extra={"request_id": str(request_id)},
++                )
++        except Exception:
++            logger.exception(
++                "Pre-parser upload rejection audit failed",
++                extra={"request_id": str(request_id)},
++            )
++
++    @staticmethod
++    async def _reject(
++        scope: Scope,
++        receive: Receive,
++        send: Send,
++        *,
++        request_id: UUID,
++    ) -> None:
++        response = JSONResponse(
++            status_code=413,
++            content={
++                "error": {
++                    "code": "pdf_too_large",
++                    "message": "PDF 文件不得超过 50 MB。",
++                }
++            },
++            headers={
++                "Connection": "close",
++                "X-Request-ID": str(request_id),
++            },
++        )
++        await response(scope, receive, send)
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..38bb211
+--- /dev/null
++++ b/tests/__init__.py
+@@ -0,0 +1 @@
++"""Test package."""
+diff --git a/tests/integration/__init__.py b/tests/integration/__init__.py
+new file mode 100644
+index 0000000..70da13d
+--- /dev/null
++++ b/tests/integration/__init__.py
+@@ -0,0 +1 @@
++"""Integration test package."""
+diff --git a/tests/integration/test_business_loop.py b/tests/integration/test_business_loop.py
+new file mode 100644
+index 0000000..ff74760
+--- /dev/null
++++ b/tests/integration/test_business_loop.py
+@@ -0,0 +1,543 @@
++"""PostgreSQL-backed Phase 1-B API and concurrency acceptance tests."""
++
++from __future__ import annotations
++
++import asyncio
++import io
++import os
++from collections.abc import AsyncIterator, Iterator
++from contextlib import contextmanager
++from pathlib import Path
++from typing import cast
++
++import httpx
++import psycopg
++import pytest
++from alembic import command
++from alembic.config import Config
++from pypdf import PdfWriter
++
++from product_pdf_qr.config import get_settings
++from product_pdf_qr.main import create_app, lifespan
++
++pytestmark = [pytest.mark.integration, pytest.mark.anyio]
++
++
++def required_environment(name: str) -> str:
++    value = os.environ.get(name)
++    if value is None:
++        pytest.fail(f"{name} is required for integration tests")
++    return value
++
++
++@contextmanager
++def migration_environment(url: str) -> Iterator[None]:
++    previous = os.environ.get("DATABASE_URL")
++    os.environ["DATABASE_URL"] = url
++    try:
++        yield
++    finally:
++        if previous is None:
++            os.environ.pop("DATABASE_URL", None)
++        else:
++            os.environ["DATABASE_URL"] = previous
++
++
++@pytest.fixture
++def clean_business_database() -> int:
++    migration_url = required_environment("TEST_MIGRATION_DATABASE_URL")
++    runtime_url = required_environment("TEST_DATABASE_URL")
++    with migration_environment(migration_url):
++        command.upgrade(Config("alembic.ini"), "head")
++    migration_psycopg_url = migration_url.replace(
++        "postgresql+psycopg://",
++        "postgresql://",
++    )
++    with psycopg.connect(migration_psycopg_url, autocommit=True) as connection:
++        connection.execute(
++            """
++            TRUNCATE TABLE
++                audit_events,
++                admin_sessions,
++                pdf_versions,
++                pdf_files,
++                products,
++                admins
++            RESTART IDENTITY CASCADE
++            """
++        )
++    with psycopg.connect(runtime_url) as connection:
++        row = connection.execute(
++            """
++            INSERT INTO admins (
++                username,
++                password_hash,
++                password_updated_at,
++                created_at
++            ) VALUES ('phase1b-synthetic-admin', 'authentication-not-in-phase1b', now(), now())
++            RETURNING id
++            """
++        ).fetchone()
++        connection.commit()
++    assert row is not None
++    return int(row[0])
++
++
++def synthetic_pdf(width: int) -> bytes:
++    output = io.BytesIO()
++    writer = PdfWriter()
++    writer.add_blank_page(width=width, height=72)
++    writer.write(output)
++    return output.getvalue()
++
++
++async def create_product(client: httpx.AsyncClient, code: str) -> dict[str, object]:
++    response = await client.post("/api/products", json={"code": code})
++    assert response.status_code == 201, response.text
++    result = response.json()
++    assert isinstance(result, dict)
++    return result
++
++
++async def upload(
++    client: httpx.AsyncClient,
++    product_id: int,
++    actor_id: int,
++    content: bytes,
++    filename: str,
++) -> httpx.Response:
++    return await client.post(
++        f"/api/products/{product_id}/pdf",
++        data={"actor_id": str(actor_id)},
++        files={"file": (filename, content, "application/pdf")},
++    )
++
++
++class ChunkedRequestBody(httpx.AsyncByteStream):
++    """Track how many chunks the live ASGI stack consumes."""
++
++    def __init__(self, chunks: list[bytes]) -> None:
++        self.chunks = chunks
++        self.yielded_chunks = 0
++
++    async def __aiter__(self) -> AsyncIterator[bytes]:
++        for chunk in self.chunks:
++            self.yielded_chunks += 1
++            yield chunk
++
++
++def oversized_multipart_body() -> bytes:
++    return (
++        b"--integration-boundary\r\n"
++        b'Content-Disposition: form-data; name="actor_id"\r\n\r\n'
++        b"1\r\n"
++        b"--integration-boundary\r\n"
++        b'Content-Disposition: form-data; name="file"; filename="large.pdf"\r\n'
++        b"Content-Type: application/pdf\r\n\r\n"
++        + (b"x" * (80 * 1024))
++        + b"\r\n--integration-boundary--\r\n"
++    )
++
++
++async def simulate_locked_restore(
++    runtime_url: str,
++    product_id: int,
++    version_id: int,
++) -> None:
++    """Model the Phase 2 restore writer without exposing a management endpoint."""
++
++    async with await psycopg.AsyncConnection.connect(runtime_url) as connection:
++        async with connection.transaction():
++            locked = await connection.execute(
++                """
++                SELECT id
++                FROM products
++                WHERE id = %s
++                FOR UPDATE
++                """,
++                (product_id,),
++            )
++            assert await locked.fetchone() == (product_id,)
++            target = await connection.execute(
++                """
++                SELECT id
++                FROM pdf_versions
++                WHERE product_id = %s AND id = %s
++                """,
++                (product_id, version_id),
++            )
++            assert await target.fetchone() == (version_id,)
++            await connection.execute(
++                """
++                UPDATE products
++                SET current_version_id = %s, updated_at = now()
++                WHERE id = %s
++                """,
++                (version_id, product_id),
++            )
++
++
++@pytest.mark.e2e
++async def test_minimum_business_loop_and_four_public_states(
++    clean_business_database: int,
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    actor_id = clean_business_database
++    runtime_url = required_environment("TEST_DATABASE_URL")
++    monkeypatch.setenv("DATABASE_URL", runtime_url)
++    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path))
++    monkeypatch.setenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
++    get_settings.cache_clear()
++    app = create_app()
++    first_pdf = synthetic_pdf(72)
++    second_pdf = synthetic_pdf(144)
++
++    try:
++        async with lifespan(app):
++            transport = httpx.ASGITransport(app=app)
++            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++                created = await create_product(client, " a001_1 ")
++                product_id = cast(int, created["id"])
++                token = str(created["public_token"])
++                assert created["code"] == "A001_1"
++                assert created["status"] == "active"
++                assert created["current_version_id"] is None
++                assert created["qrcode_status"] == "ready"
++
++                qrcode = await client.get(str(created["qrcode_url"]))
++                assert qrcode.status_code == 200
++                assert qrcode.content.startswith(b"\x89PNG\r\n\x1a\n")
++                assert qrcode.headers["content-disposition"] == 'attachment; filename="A001_1.png"'
++
++                unuploaded = await client.get(f"/p/{token}")
++                assert unuploaded.status_code == 200
++                assert "资料暂未上传" in unuploaded.text
++                assert unuploaded.headers["cache-control"] == "no-store"
++
++                uploaded_v1 = await upload(
++                    client,
++                    product_id,
++                    actor_id,
++                    first_pdf,
++                    "../../first.pdf",
++                )
++                assert uploaded_v1.status_code == 201, uploaded_v1.text
++                assert uploaded_v1.json()["version_no"] == 1
++                public_v1 = await client.get(f"/p/{token}")
++                assert public_v1.status_code == 200
++                assert public_v1.content == first_pdf
++                assert public_v1.headers["content-type"] == "application/pdf"
++                assert public_v1.headers["cache-control"] == "no-store"
++
++                uploaded_v2 = await upload(
++                    client,
++                    product_id,
++                    actor_id,
++                    second_pdf,
++                    "second.pdf",
++                )
++                assert uploaded_v2.status_code == 201
++                assert uploaded_v2.json()["version_no"] == 2
++                assert (await client.get(f"/p/{token}")).content == second_pdf
++
++                uploaded_old_content = await upload(
++                    client,
++                    product_id,
++                    actor_id,
++                    first_pdf,
++                    "first-again.pdf",
++                )
++                assert uploaded_old_content.status_code == 201
++                assert uploaded_old_content.json()["version_no"] == 3
++                assert (await client.get(f"/p/{token}")).content == first_pdf
++
++                duplicate_current = await upload(
++                    client,
++                    product_id,
++                    actor_id,
++                    first_pdf,
++                    "duplicate.pdf",
++                )
++                assert duplicate_current.status_code == 409
++                assert duplicate_current.json()["error"]["message"] == "与当前文件相同"
++
++                invalid_pdf = await upload(
++                    client,
++                    product_id,
++                    actor_id,
++                    b"not a pdf",
++                    "fake.pdf",
++                )
++                assert invalid_pdf.status_code == 422
++
++                missing = await client.get("/p/not-base32")
++                malformed = await client.get("/p/invalid/token")
++                assert missing.status_code == malformed.status_code == 200
++                assert "资料链接无效" in missing.text
++                assert "not-base32" not in missing.text
++
++                with psycopg.connect(runtime_url) as connection:
++                    connection.execute(
++                        "UPDATE products SET status = 'disabled', updated_at = now() WHERE id = %s",
++                        (product_id,),
++                    )
++                    connection.commit()
++                disabled = await client.get(f"/p/{token}")
++                assert disabled.status_code == 200
++                assert "该产品资料已停用" in disabled.text
++                assert "资料暂未上传" not in disabled.text
++                assert "A001_1" not in disabled.text
++
++        with psycopg.connect(runtime_url) as connection:
++            version_count = connection.execute(
++                "SELECT count(*) FROM pdf_versions WHERE product_id = %s",
++                (product_id,),
++            ).fetchone()
++            file_count = connection.execute("SELECT count(*) FROM pdf_files").fetchone()
++            actions = {
++                str(row[0])
++                for row in connection.execute(
++                    "SELECT action FROM audit_events ORDER BY id"
++                ).fetchall()
++            }
++        assert version_count == (3,)
++        assert file_count == (2,)
++        assert {"product_create", "pdf_upload", "pdf_upload_rejected"}.issubset(actions)
++    finally:
++        get_settings.cache_clear()
++
++
++@pytest.mark.e2e
++async def test_pre_parser_size_rejections_commit_independent_audits(
++    clean_business_database: int,
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    runtime_url = required_environment("TEST_DATABASE_URL")
++    monkeypatch.setenv("DATABASE_URL", runtime_url)
++    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path))
++    monkeypatch.setenv("MAX_PDF_BYTES", "8")
++    get_settings.cache_clear()
++    app = create_app()
++    declared_body = ChunkedRequestBody([b"must-not-be-read"])
++    complete_chunked_body = oversized_multipart_body()
++    chunks = [
++        complete_chunked_body[index : index + (16 * 1024)]
++        for index in range(0, len(complete_chunked_body), 16 * 1024)
++    ]
++    chunked_body = ChunkedRequestBody(chunks)
++
++    try:
++        async with lifespan(app):
++            transport = httpx.ASGITransport(app=app)
++            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++                declared = await client.post(
++                    "/api/products/5/pdf",
++                    content=declared_body,
++                    headers={
++                        "Content-Length": "70000",
++                        "Content-Type": "multipart/form-data; boundary=integration-boundary",
++                    },
++                )
++                chunked = await client.post(
++                    "/api/products/5/pdf",
++                    content=chunked_body,
++                    headers={"Content-Type": "multipart/form-data; boundary=integration-boundary"},
++                )
++
++        assert declared.status_code == chunked.status_code == 413
++        assert declared_body.yielded_chunks == 0
++        assert 0 < chunked_body.yielded_chunks < len(chunked_body.chunks)
++        received_chunked_bytes = sum(
++            len(chunk) for chunk in chunked_body.chunks[: chunked_body.yielded_chunks]
++        )
++        with psycopg.connect(runtime_url) as connection:
++            rows = connection.execute(
++                """
++                SELECT actor_type, actor_id, target_type, target_id, request_id, detail
++                FROM audit_events
++                WHERE action = 'pdf_upload_rejected'
++                ORDER BY id
++                """
++            ).fetchall()
++        assert len(rows) == 2
++        assert {str(row[0]) for row in rows} == {"anonymous"}
++        assert {row[1] for row in rows} == {None}
++        assert {str(row[2]) for row in rows} == {"product"}
++        assert {int(row[3]) for row in rows} == {5}
++        assert str(rows[0][4]) == declared.headers["x-request-id"]
++        assert str(rows[1][4]) == chunked.headers["x-request-id"]
++        assert rows[0][5] == {
++            "reason": "content_length_exceeded",
++            "stage": "pre_parser_size",
++            "declared_content_length": 70000,
++            "declared_request_body_verified": False,
++            "complete_pdf_byte_length_known": False,
++        }
++        assert rows[1][5] == {
++            "reason": "chunked_stream_exceeded",
++            "stage": "pre_parser_size",
++            "received_bytes_before_abort": received_chunked_bytes,
++            "complete_pdf_byte_length_known": False,
++        }
++    finally:
++        get_settings.cache_clear()
++
++
++@pytest.mark.e2e
++async def test_concurrent_identical_uploads_create_only_one_version(
++    clean_business_database: int,
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    actor_id = clean_business_database
++    runtime_url = required_environment("TEST_DATABASE_URL")
++    monkeypatch.setenv("DATABASE_URL", runtime_url)
++    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path))
++    monkeypatch.setenv("DB_POOL_MAX_SIZE", "10")
++    get_settings.cache_clear()
++    app = create_app()
++    content = synthetic_pdf(72)
++
++    try:
++        async with lifespan(app):
++            transport = httpx.ASGITransport(app=app)
++            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++                create_responses = await asyncio.gather(
++                    *[
++                        client.post("/api/products", json={"code": "CONCURRENT"})
++                        for _index in range(6)
++                    ]
++                )
++                assert [response.status_code for response in create_responses].count(201) == 1
++                assert [response.status_code for response in create_responses].count(409) == 5
++                created_response = next(
++                    response for response in create_responses if response.status_code == 201
++                )
++                created = created_response.json()
++                assert isinstance(created, dict)
++                product_id = cast(int, created["id"])
++                responses = await asyncio.gather(
++                    *[
++                        upload(
++                            client,
++                            product_id,
++                            actor_id,
++                            content,
++                            f"same-{index}.pdf",
++                        )
++                        for index in range(8)
++                    ]
++                )
++
++                different = await create_product(client, "DIFFERENT-CONTENT")
++                different_product_id = cast(int, different["id"])
++                different_responses = await asyncio.gather(
++                    upload(
++                        client,
++                        different_product_id,
++                        actor_id,
++                        synthetic_pdf(100),
++                        "different-a.pdf",
++                    ),
++                    upload(
++                        client,
++                        different_product_id,
++                        actor_id,
++                        synthetic_pdf(200),
++                        "different-b.pdf",
++                    ),
++                )
++                assert [response.status_code for response in different_responses] == [201, 201]
++
++                parallel_a = await create_product(client, "PARALLEL-A")
++                parallel_b = await create_product(client, "PARALLEL-B")
++                parallel_responses = await asyncio.gather(
++                    upload(
++                        client,
++                        cast(int, parallel_a["id"]),
++                        actor_id,
++                        synthetic_pdf(300),
++                        "parallel-a.pdf",
++                    ),
++                    upload(
++                        client,
++                        cast(int, parallel_b["id"]),
++                        actor_id,
++                        synthetic_pdf(400),
++                        "parallel-b.pdf",
++                    ),
++                )
++                assert [response.status_code for response in parallel_responses] == [201, 201]
++
++                restore_race = await create_product(client, "RESTORE-RACE")
++                restore_product_id = cast(int, restore_race["id"])
++                restore_v1 = await upload(
++                    client,
++                    restore_product_id,
++                    actor_id,
++                    synthetic_pdf(500),
++                    "restore-v1.pdf",
++                )
++                restore_v2 = await upload(
++                    client,
++                    restore_product_id,
++                    actor_id,
++                    synthetic_pdf(600),
++                    "restore-v2.pdf",
++                )
++                assert restore_v1.status_code == restore_v2.status_code == 201
++                restore_v1_id = cast(int, restore_v1.json()["version_id"])
++                restore_v3, _ = await asyncio.gather(
++                    upload(
++                        client,
++                        restore_product_id,
++                        actor_id,
++                        synthetic_pdf(700),
++                        "restore-v3.pdf",
++                    ),
++                    simulate_locked_restore(
++                        runtime_url,
++                        restore_product_id,
++                        restore_v1_id,
++                    ),
++                )
++                assert restore_v3.status_code == 201
++                restore_v3_id = cast(int, restore_v3.json()["version_id"])
++
++        assert [response.status_code for response in responses].count(201) == 1
++        assert [response.status_code for response in responses].count(409) == 7
++        with psycopg.connect(runtime_url) as connection:
++            assert connection.execute(
++                "SELECT count(*) FROM pdf_versions WHERE product_id = %s",
++                (product_id,),
++            ).fetchone() == (1,)
++            assert connection.execute(
++                "SELECT count(*) FROM pdf_versions WHERE product_id = %s",
++                (different_product_id,),
++            ).fetchone() == (2,)
++            current = connection.execute(
++                "SELECT current_version_id FROM products WHERE id = %s",
++                (product_id,),
++            ).fetchone()
++            restore_current = connection.execute(
++                """
++                SELECT p.current_version_id, v.product_id
++                FROM products AS p
++                JOIN pdf_versions AS v ON v.id = p.current_version_id
++                WHERE p.id = %s
++                """,
++                (restore_product_id,),
++            ).fetchone()
++            restore_version_count = connection.execute(
++                "SELECT count(*) FROM pdf_versions WHERE product_id = %s",
++                (restore_product_id,),
++            ).fetchone()
++        assert current is not None and current[0] is not None
++        assert restore_version_count == (3,)
++        assert restore_current is not None
++        assert restore_current[0] in {restore_v1_id, restore_v3_id}
++        assert restore_current[1] == restore_product_id
++    finally:
++        get_settings.cache_clear()
+diff --git a/tests/unit/__init__.py b/tests/unit/__init__.py
+new file mode 100644
+index 0000000..46e0b2c
+--- /dev/null
++++ b/tests/unit/__init__.py
+@@ -0,0 +1 @@
++"""Unit test package."""
+diff --git a/tests/unit/test_api_contract.py b/tests/unit/test_api_contract.py
+new file mode 100644
+index 0000000..88acb9d
+--- /dev/null
++++ b/tests/unit/test_api_contract.py
+@@ -0,0 +1,25 @@
++"""Phase 1-B OpenAPI surface contract."""
++
++from __future__ import annotations
++
++from product_pdf_qr.main import create_app
++
++
++def test_business_loop_routes_are_present_and_out_of_scope_routes_absent() -> None:
++    schema = create_app().openapi()
++    paths = schema["paths"]
++
++    assert "/api/products" in paths
++    assert "/api/products/{product_id}/pdf" in paths
++    assert "/api/products/{product_id}/qrcode" in paths
++    assert "/api/products/{product_id}/qrcode/retry" in paths
++    assert "/api/storage/orphans" in paths
++    assert "/api/qrcode/failures" in paths
++    assert "/p/{public_token}" in paths
++
++    serialized = str(schema).lower()
++    assert "/login" not in serialized
++    assert "/import" not in serialized
++    assert "/delete" not in serialized
++    assert "/restore" not in serialized
++    assert "/disable" not in serialized
+diff --git a/tests/unit/test_business_services.py b/tests/unit/test_business_services.py
+new file mode 100644
+index 0000000..bac9f0d
+--- /dev/null
++++ b/tests/unit/test_business_services.py
+@@ -0,0 +1,469 @@
++"""Database-facing business services with deterministic scripted connections."""
++
++from __future__ import annotations
++
++import asyncio
++import threading
++from collections.abc import AsyncIterator, Sequence
++from contextlib import asynccontextmanager
++from pathlib import Path
++from types import SimpleNamespace
++from typing import cast
++
++import pytest
++from psycopg.types.json import Jsonb
++
++from product_pdf_qr.database import Connection, Database
++from product_pdf_qr.domains.audit import AuditEvent, append_event, append_independent_event
++from product_pdf_qr.domains.product import create_product
++from product_pdf_qr.domains.public import resolve_public_document
++from product_pdf_qr.domains.storage import PublishedFile, StorageService, ValidatedUpload
++from product_pdf_qr.domains.version import DuplicateCurrentPDF, upload_pdf
++from product_pdf_qr.errors import AppError
++
++
++class ScriptedCursor:
++    def __init__(
++        self,
++        row: dict[str, object] | None = None,
++        rows: list[dict[str, object]] | None = None,
++    ) -> None:
++        self.row = row
++        self.rows = rows or []
++
++    async def fetchone(self) -> dict[str, object] | None:
++        return self.row
++
++    async def fetchall(self) -> list[dict[str, object]]:
++        return self.rows
++
++
++class ScriptedConnection:
++    def __init__(
++        self,
++        results: Sequence[dict[str, object] | list[dict[str, object]] | None],
++        *,
++        commit_error: Exception | None = None,
++        execute_error: Exception | None = None,
++    ) -> None:
++        self.results = list(results)
++        self.commit_error = commit_error
++        self.execute_error = execute_error
++        self.queries: list[str] = []
++        self.parameters: list[object] = []
++
++    async def execute(self, query: str, params: object = None) -> ScriptedCursor:
++        self.queries.append(" ".join(query.split()))
++        self.parameters.append(params)
++        if self.execute_error is not None:
++            raise self.execute_error
++        result = self.results.pop(0) if self.results else None
++        if isinstance(result, list):
++            return ScriptedCursor(rows=result)
++        return ScriptedCursor(row=result)
++
++    @asynccontextmanager
++    async def transaction(self) -> AsyncIterator[None]:
++        try:
++            yield
++        except BaseException:
++            raise
++        else:
++            if self.commit_error is not None:
++                raise self.commit_error
++
++
++class ScriptedDatabase:
++    def __init__(self, *connections: ScriptedConnection) -> None:
++        self.connections = list(connections)
++
++    @asynccontextmanager
++    async def connection(self) -> AsyncIterator[ScriptedConnection]:
++        if not self.connections:
++            raise RuntimeError("No scripted connection remains")
++        yield self.connections.pop(0)
++
++
++def as_database(database: ScriptedDatabase) -> Database:
++    return cast(Database, database)
++
++
++def as_connection(connection: ScriptedConnection) -> Connection:
++    return cast(Connection, connection)
++
++
++@pytest.mark.anyio
++async def test_append_event_and_independent_failure_handling() -> None:
++    connection = ScriptedConnection([None])
++    event = AuditEvent(
++        action="product_create",
++        result="success",
++        target_type="product",
++        target_id=7,
++        product_code="A001",
++        detail={"safe": True},
++    )
++
++    await append_event(as_connection(connection), event)
++
++    assert "INSERT INTO audit_events" in connection.queries[0]
++    assert "A001" in cast(tuple[object, ...], connection.parameters[0])
++
++    failing = ScriptedDatabase(
++        ScriptedConnection([], execute_error=RuntimeError("synthetic audit failure"))
++    )
++    assert not await append_independent_event(as_database(failing), event)
++
++
++@pytest.mark.anyio
++async def test_create_product_commits_audit_with_normalized_code() -> None:
++    connection = ScriptedConnection(
++        [
++            {
++                "id": 7,
++                "code": "A001",
++                "public_token": "A" * 26,
++                "status": "active",
++                "current_version_id": None,
++            },
++            None,
++        ]
++    )
++
++    product = await create_product(as_database(ScriptedDatabase(connection)), " a001 ")
++
++    assert product.code == "A001"
++    assert product.current_version_id is None
++    assert "INSERT INTO products" in connection.queries[0]
++    assert "INSERT INTO audit_events" in connection.queries[1]
++
++
++@pytest.mark.anyio
++async def test_create_product_rejects_duplicate_code(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    class SyntheticUniqueViolation(Exception):
++        def __init__(self) -> None:
++            self.diag = SimpleNamespace(constraint_name="products_code_key")
++
++    connection = ScriptedConnection([], execute_error=SyntheticUniqueViolation())
++    monkeypatch.setattr(
++        "product_pdf_qr.domains.product.service.UniqueViolation",
++        SyntheticUniqueViolation,
++    )
++
++    with pytest.raises(AppError) as captured:
++        await create_product(as_database(ScriptedDatabase(connection)), "A001")
++
++    assert captured.value.code == "duplicate_product_code"
++    assert captured.value.status_code == 409
++
++
++def validated_upload(tmp_path: Path, content: bytes = b"%PDF-synthetic") -> ValidatedUpload:
++    path = tmp_path / "candidate.part"
++    path.write_bytes(content)
++    return ValidatedUpload(
++        temporary_path=path,
++        original_filename="../../original.pdf",
++        size_bytes=len(content),
++        sha256="a" * 64,
++    )
++
++
++@pytest.mark.anyio
++async def test_upload_appends_version_moves_pointer_and_audits(tmp_path: Path) -> None:
++    storage = StorageService(tmp_path / "storage", max_pdf_bytes=1024)
++    upload = validated_upload(tmp_path)
++    connection = ScriptedConnection(
++        [
++            {"id": 5, "code": "A001", "current_version_id": None},
++            {"id": 9},
++            {"next_version_no": 1},
++            {
++                "id": 11,
++                "size_bytes": upload.size_bytes,
++                "storage_path": "aa/aa/" + "a" * 64 + ".pdf",
++            },
++            {"id": 13},
++            None,
++            None,
++        ]
++    )
++
++    version = await upload_pdf(
++        as_database(ScriptedDatabase(connection)),
++        storage,
++        product_id=5,
++        actor_id=9,
++        upload=upload,
++    )
++
++    assert version.id == 13
++    assert version.version_no == 1
++    assert version.original_filename == "../../original.pdf"
++    assert (storage.files_root / version.storage_path).read_bytes() == b"%PDF-synthetic"
++    assert "FOR UPDATE" in connection.queries[0]
++    assert "SELECT COALESCE(MAX(version_no)" in connection.queries[2]
++    assert "UPDATE products" in connection.queries[5]
++    assert "INSERT INTO audit_events" in connection.queries[6]
++
++
++@pytest.mark.anyio
++async def test_locked_current_duplicate_is_rejected_without_storage_side_effect(
++    tmp_path: Path,
++) -> None:
++    upload = validated_upload(tmp_path)
++    business = ScriptedConnection(
++        [
++            {"id": 5, "code": "A001", "current_version_id": 12},
++            {"id": 9},
++            {"size_bytes": upload.size_bytes, "sha256": upload.sha256},
++        ]
++    )
++    rejection_audit = ScriptedConnection([None])
++    database = ScriptedDatabase(business, rejection_audit)
++    storage = StorageService(tmp_path / "storage", max_pdf_bytes=1024)
++
++    with pytest.raises(DuplicateCurrentPDF):
++        await upload_pdf(
++            as_database(database),
++            storage,
++            product_id=5,
++            actor_id=9,
++            upload=upload,
++        )
++
++    assert not upload.temporary_path.exists()
++    assert not storage.files_root.exists()
++    assert "FOR UPDATE" in business.queries[0]
++    assert "JOIN pdf_files" in business.queries[2]
++    assert "pdf_upload_rejected" in cast(tuple[object, ...], rejection_audit.parameters[0])
++
++
++@pytest.mark.anyio
++async def test_commit_failure_leaves_traceable_orphan_not_database_result(
++    tmp_path: Path,
++) -> None:
++    storage = StorageService(tmp_path / "storage", max_pdf_bytes=1024)
++    upload = validated_upload(tmp_path)
++    relative = "aa/aa/" + "a" * 64 + ".pdf"
++    business = ScriptedConnection(
++        [
++            {"id": 5, "code": "A001", "current_version_id": None},
++            {"id": 9},
++            {"next_version_no": 1},
++            {"id": 11, "size_bytes": upload.size_bytes, "storage_path": relative},
++            {"id": 13},
++            None,
++            None,
++        ],
++        commit_error=RuntimeError("synthetic commit failure"),
++    )
++    rejection_audit = ScriptedConnection([None])
++
++    with pytest.raises(AppError) as captured:
++        await upload_pdf(
++            as_database(ScriptedDatabase(business, rejection_audit)),
++            storage,
++            product_id=5,
++            actor_id=9,
++            upload=upload,
++        )
++
++    assert captured.value.code == "pdf_upload_failed"
++    assert (storage.files_root / relative).is_file()
++    audit_parameters = cast(tuple[object, ...], rejection_audit.parameters[0])
++    audit_detail = cast(Jsonb, audit_parameters[-1]).obj
++    assert isinstance(audit_detail, dict)
++    assert audit_detail["moved_file_sha256"] == upload.sha256
++
++
++@pytest.mark.anyio
++async def test_cancellation_before_publish_cleans_candidate_and_is_audited(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    storage = StorageService(tmp_path / "storage", max_pdf_bytes=1024)
++    candidate = validated_upload(tmp_path)
++    business = ScriptedConnection(
++        [
++            {"id": 5, "code": "A001", "current_version_id": None},
++            {"id": 9},
++            {"next_version_no": 1},
++        ]
++    )
++    rejection_audit = ScriptedConnection([None])
++    entered_publish = asyncio.Event()
++
++    async def block_before_publish(_upload: ValidatedUpload) -> None:
++        entered_publish.set()
++        await asyncio.Event().wait()
++
++    monkeypatch.setattr(storage, "publish", block_before_publish)
++    task = asyncio.create_task(
++        upload_pdf(
++            as_database(ScriptedDatabase(business, rejection_audit)),
++            storage,
++            product_id=5,
++            actor_id=9,
++            upload=candidate,
++        )
++    )
++    await entered_publish.wait()
++    task.cancel()
++
++    with pytest.raises(asyncio.CancelledError):
++        await task
++
++    assert not candidate.temporary_path.exists()
++    assert list(storage.files_root.rglob("*.pdf")) == []
++    assert not any("INSERT INTO pdf_versions" in query for query in business.queries)
++    audit_detail = cast(Jsonb, cast(tuple[object, ...], rejection_audit.parameters[0])[-1]).obj
++    assert isinstance(audit_detail, dict)
++    assert audit_detail["reason"] == "upload_cancelled"
++    assert "moved_file_sha256" not in audit_detail
++
++
++@pytest.mark.anyio
++async def test_cancellation_after_publish_leaves_audited_orphan(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    storage = StorageService(tmp_path / "storage", max_pdf_bytes=1024)
++    storage.prepare()
++    candidate = validated_upload(tmp_path)
++    business = ScriptedConnection(
++        [
++            {"id": 5, "code": "A001", "current_version_id": None},
++            {"id": 9},
++            {"next_version_no": 1},
++        ]
++    )
++    rejection_audit = ScriptedConnection([None])
++    database = as_database(ScriptedDatabase(business, rejection_audit))
++    publication_finished = asyncio.Event()
++    release_publication = threading.Event()
++    loop = asyncio.get_running_loop()
++    original_publish_sync = storage._publish_sync
++
++    def controlled_publish(upload: ValidatedUpload) -> PublishedFile:
++        published = original_publish_sync(upload)
++        loop.call_soon_threadsafe(publication_finished.set)
++        if not release_publication.wait(timeout=2):
++            raise RuntimeError("test did not release publication")
++        return published
++
++    monkeypatch.setattr(storage, "_publish_sync", controlled_publish)
++    task = asyncio.create_task(
++        upload_pdf(
++            database,
++            storage,
++            product_id=5,
++            actor_id=9,
++            upload=candidate,
++        )
++    )
++    await asyncio.wait_for(publication_finished.wait(), timeout=2)
++    task.cancel()
++    release_publication.set()
++
++    with pytest.raises(asyncio.CancelledError):
++        await task
++
++    orphan = storage.files_root / storage.relative_path_for_hash(candidate.sha256)
++    assert not candidate.temporary_path.exists()
++    assert orphan.read_bytes() == b"%PDF-synthetic"
++    assert not any("INSERT INTO pdf_versions" in query for query in business.queries)
++    audit_detail = cast(Jsonb, cast(tuple[object, ...], rejection_audit.parameters[0])[-1]).obj
++    assert isinstance(audit_detail, dict)
++    assert audit_detail["reason"] == "upload_cancelled"
++    assert audit_detail["moved_file_sha256"] == candidate.sha256
++
++
++@pytest.mark.anyio
++async def test_existing_historical_content_reuses_file_and_creates_version(
++    tmp_path: Path,
++) -> None:
++    storage = StorageService(tmp_path / "storage", max_pdf_bytes=1024)
++    upload = validated_upload(tmp_path)
++    storage.prepare()
++    relative = storage.relative_path_for_hash(upload.sha256)
++    target = storage.files_root / relative
++    target.parent.mkdir(parents=True)
++    target.write_bytes(b"%PDF-synthetic")
++    before_mtime = target.stat().st_mtime_ns
++    connection = ScriptedConnection(
++        [
++            {"id": 5, "code": "A001", "current_version_id": 20},
++            {"id": 9},
++            {"size_bytes": 999, "sha256": "b" * 64},
++            {"next_version_no": 3},
++            None,
++            {"id": 11, "size_bytes": upload.size_bytes, "storage_path": relative},
++            {"id": 21},
++            None,
++            None,
++        ]
++    )
++
++    version = await upload_pdf(
++        as_database(ScriptedDatabase(connection)),
++        storage,
++        product_id=5,
++        actor_id=9,
++        upload=upload,
++    )
++
++    assert version.version_no == 3
++    assert target.stat().st_mtime_ns == before_mtime
++    assert "ON CONFLICT (sha256) DO NOTHING" in connection.queries[4]
++    assert "SELECT id, size_bytes, storage_path" in connection.queries[5]
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize(
++    ("row", "expected"),
++    [
++        (None, "missing"),
++        ({"status": "disabled", "current_version_id": None}, "disabled"),
++        ({"status": "active", "current_version_id": None}, "unuploaded"),
++    ],
++)
++async def test_public_state_ordering(
++    tmp_path: Path,
++    row: dict[str, object] | None,
++    expected: str,
++) -> None:
++    database = ScriptedDatabase(ScriptedConnection([row]))
++    storage = StorageService(tmp_path, max_pdf_bytes=1024)
++
++    document = await resolve_public_document(as_database(database), storage, "A" * 26)
++
++    assert document.state == expected
++
++
++@pytest.mark.anyio
++async def test_public_available_resolves_bounded_formal_file(tmp_path: Path) -> None:
++    storage = StorageService(tmp_path, max_pdf_bytes=1024)
++    storage.prepare()
++    relative = storage.relative_path_for_hash("c" * 64)
++    path = storage.files_root / relative
++    path.parent.mkdir(parents=True)
++    path.write_bytes(b"%PDF-public")
++    row = {
++        "status": "active",
++        "current_version_id": 3,
++        "original_filename": "资料.pdf",
++        "storage_path": relative,
++        "size_bytes": path.stat().st_size,
++    }
++
++    document = await resolve_public_document(
++        as_database(ScriptedDatabase(ScriptedConnection([row]))),
++        storage,
++        "A" * 26,
++    )
++
++    assert document.state == "available"
++    assert document.path == path.resolve()
++    assert document.original_filename == "资料.pdf"
+diff --git a/tests/unit/test_config.py b/tests/unit/test_config.py
+index 4028aca..30ea795 100644
+--- a/tests/unit/test_config.py
++++ b/tests/unit/test_config.py
+@@ -16,6 +16,10 @@ def test_settings_are_local_by_default() -> None:
+     assert settings.app_bind_host == "127.0.0.1"
+     assert settings.app_port == 8000
+     assert settings.storage_root == Path("storage/local")
++    assert settings.max_pdf_bytes == 50 * 1024 * 1024
++    assert settings.pdf_validation_timeout_seconds == 5
++    assert settings.pdf_validation_cpu_seconds == 3
++    assert settings.pdf_validation_memory_bytes == 512 * 1024 * 1024
+ 
+ 
+ def test_settings_reject_invalid_pool_bounds() -> None:
+diff --git a/tests/unit/test_management_handlers.py b/tests/unit/test_management_handlers.py
+new file mode 100644
+index 0000000..17c8880
+--- /dev/null
++++ b/tests/unit/test_management_handlers.py
+@@ -0,0 +1,293 @@
++"""Direct management-handler tests for business and compensation responses."""
++
++from __future__ import annotations
++
++import io
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Never
++
++import pytest
++from fastapi import UploadFile
++from psycopg.types.json import Jsonb
++from pypdf import PdfWriter
++from starlette.datastructures import Headers
++
++from product_pdf_qr.dependencies import (
++    get_database,
++    get_public_miss_limiter,
++    get_qrcode_service,
++    get_runtime_settings,
++    get_storage_service,
++)
++from product_pdf_qr.domains.product.router import (
++    ProductCreateRequest,
++    create_product_endpoint,
++    download_qrcode,
++    retry_qrcode,
++    upload_pdf_endpoint,
++)
++from product_pdf_qr.domains.public import PublicMissLimiter
++from product_pdf_qr.domains.qrcode import QRCodeService
++from product_pdf_qr.domains.qrcode.router import report_qrcode_failures
++from product_pdf_qr.domains.storage import StorageService, UploadRejected
++from product_pdf_qr.domains.storage.router import report_orphan_files
++from product_pdf_qr.errors import AppError
++from tests.unit.test_business_services import (
++    ScriptedConnection,
++    ScriptedCursor,
++    ScriptedDatabase,
++    as_database,
++)
++
++
++def product_row() -> dict[str, object]:
++    return {
++        "id": 5,
++        "code": "A001",
++        "public_token": "A" * 26,
++        "status": "active",
++        "current_version_id": None,
++    }
++
++
++def synthetic_upload() -> UploadFile:
++    output = io.BytesIO()
++    writer = PdfWriter()
++    writer.add_blank_page(width=72, height=72)
++    writer.write(output)
++    return UploadFile(
++        file=io.BytesIO(output.getvalue()),
++        filename="../../safe-storage.pdf",
++        headers=Headers({"content-type": "application/pdf"}),
++    )
++
++
++@pytest.mark.anyio
++async def test_create_download_and_retry_qrcode_handlers(tmp_path: Path) -> None:
++    qrcode_service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
++    create_database = as_database(ScriptedDatabase(ScriptedConnection([product_row(), None])))
++
++    created = await create_product_endpoint(
++        ProductCreateRequest(code=" a001 "),
++        create_database,
++        qrcode_service,
++    )
++
++    assert created.code == "A001"
++    assert created.public_url.endswith("/p/" + ("A" * 26))
++    assert created.qrcode_status == "ready"
++
++    download_database = as_database(ScriptedDatabase(ScriptedConnection([product_row()])))
++    response = await download_qrcode(5, download_database, qrcode_service)
++    assert response.media_type == "image/png"
++    assert response.headers["content-disposition"] == 'attachment; filename="A001.png"'
++
++    retry_database = as_database(
++        ScriptedDatabase(
++            ScriptedConnection([product_row()]),
++            ScriptedConnection([None]),
++        )
++    )
++    retried = await retry_qrcode(5, retry_database, qrcode_service)
++    assert retried.status == "ready"
++    assert retried.cache_hit
++
++
++@pytest.mark.anyio
++async def test_create_survives_qrcode_generation_failure(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    qrcode_service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
++
++    def fail_generate(_code: str, _token: str) -> bytes:
++        from product_pdf_qr.domains.qrcode import QRCodeGenerationError
++
++        raise QRCodeGenerationError("synthetic generation failure")
++
++    monkeypatch.setattr(qrcode_service, "generate", fail_generate)
++    database = as_database(
++        ScriptedDatabase(
++            ScriptedConnection([product_row(), None]),
++            ScriptedConnection([None]),
++        )
++    )
++
++    created = await create_product_endpoint(
++        ProductCreateRequest(code="A001"),
++        database,
++        qrcode_service,
++    )
++
++    assert created.id == 5
++    assert created.qrcode_status == "generation_failed"
++    assert not (qrcode_service.cache_root / "A001.png").exists()
++
++
++@pytest.mark.anyio
++async def test_upload_handler_validates_then_creates_version(tmp_path: Path) -> None:
++    storage = StorageService(tmp_path / "storage", max_pdf_bytes=1024 * 1024)
++
++    # The exact writer length is environment-stable but the scripted metadata must
++    # be derived from the validated bytes, so handle this endpoint with a connection
++    # that fills file metadata after validation.
++    class DynamicConnection(ScriptedConnection):
++        async def execute(self, query: str, params: object = None) -> ScriptedCursor:
++            normalized = " ".join(query.split())
++            self.queries.append(normalized)
++            self.parameters.append(params)
++            if "FROM products" in normalized and "FOR UPDATE" in normalized:
++                return ScriptedCursor({"id": 5, "code": "A001", "current_version_id": None})
++            if "FROM admins" in normalized:
++                return ScriptedCursor({"id": 9})
++            if "MAX(version_no)" in normalized:
++                return ScriptedCursor({"next_version_no": 1})
++            if "INSERT INTO pdf_files" in normalized:
++                values = params
++                assert isinstance(values, tuple)
++                return ScriptedCursor(
++                    {
++                        "id": 11,
++                        "size_bytes": values[1],
++                        "storage_path": values[2],
++                    }
++                )
++            if "INSERT INTO pdf_versions" in normalized:
++                return ScriptedCursor({"id": 13})
++            return ScriptedCursor()
++
++    connection = DynamicConnection([])
++    database = as_database(ScriptedDatabase(connection))
++
++    uploaded = await upload_pdf_endpoint(
++        5,
++        9,
++        synthetic_upload(),
++        database,
++        storage,
++    )
++
++    assert uploaded.version_id == 13
++    assert uploaded.version_no == 1
++    assert uploaded.original_filename == "../../safe-storage.pdf"
++    assert list(storage.files_root.rglob("*.pdf"))
++
++
++@pytest.mark.anyio
++async def test_upload_validation_rejection_is_audited(tmp_path: Path) -> None:
++    storage = StorageService(tmp_path, max_pdf_bytes=1024)
++    audit_connection = ScriptedConnection([None])
++    database = as_database(ScriptedDatabase(audit_connection))
++    invalid = UploadFile(
++        file=io.BytesIO(b"not-pdf"),
++        filename="bad.pdf",
++        headers=Headers({"content-type": "application/pdf"}),
++    )
++
++    with pytest.raises(UploadRejected):
++        await upload_pdf_endpoint(5, 9, invalid, database, storage)
++
++    audit_parameters = audit_connection.parameters[0]
++    assert isinstance(audit_parameters, tuple)
++    audit_detail = audit_parameters[-1]
++    assert isinstance(audit_detail, Jsonb)
++    assert audit_detail.obj == {"reason": "invalid_pdf_signature", "stage": "signature"}
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize(
++    ("code", "stage"),
++    [
++        ("pdf_validation_timeout", "structure_timeout"),
++        ("pdf_validation_resource_limit", "structure_resource"),
++    ],
++)
++async def test_parser_limit_rejection_reason_is_audited(
++    code: str,
++    stage: str,
++) -> None:
++    class ParserRejectingStorage(StorageService):
++        async def receive_and_validate(self, _upload: UploadFile) -> Never:
++            raise UploadRejected(code, "PDF 结构校验失败。", stage)
++
++    audit_connection = ScriptedConnection([None])
++    database = as_database(ScriptedDatabase(audit_connection))
++
++    with pytest.raises(UploadRejected):
++        await upload_pdf_endpoint(
++            5,
++            9,
++            synthetic_upload(),
++            database,
++            ParserRejectingStorage(Path("unused"), max_pdf_bytes=1024),
++        )
++
++    audit_parameters = audit_connection.parameters[0]
++    assert isinstance(audit_parameters, tuple)
++    audit_detail = audit_parameters[-1]
++    assert isinstance(audit_detail, Jsonb)
++    assert audit_detail.obj == {"reason": code, "stage": stage}
++
++
++@pytest.mark.anyio
++async def test_product_lookup_missing_is_safe(tmp_path: Path) -> None:
++    database = as_database(ScriptedDatabase(ScriptedConnection([None])))
++
++    with pytest.raises(AppError) as captured:
++        await download_qrcode(
++            999,
++            database,
++            QRCodeService(tmp_path, "http://127.0.0.1:8000"),
++        )
++
++    assert captured.value.code == "product_not_found"
++
++
++@pytest.mark.anyio
++async def test_specialized_read_only_reports(tmp_path: Path) -> None:
++    qrcode_service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
++    failure_rows = [
++        {
++            "target_id": 5,
++            "product_code": "A001",
++            "detail": {"reason": "synthetic"},
++        }
++    ]
++    failures = await report_qrcode_failures(
++        as_database(ScriptedDatabase(ScriptedConnection([failure_rows]))),
++        qrcode_service,
++    )
++    assert failures[0].product_code == "A001"
++    assert failures[0].reason == "synthetic"
++
++    storage = StorageService(tmp_path / "storage", max_pdf_bytes=1024)
++    storage.prepare()
++    relative = storage.relative_path_for_hash("e" * 64)
++    orphan = storage.files_root / relative
++    orphan.parent.mkdir(parents=True)
++    orphan.write_bytes(b"orphan")
++    report = await report_orphan_files(
++        as_database(ScriptedDatabase(ScriptedConnection([[]]))),
++        storage,
++    )
++    assert [item.storage_path for item in report] == [relative]
++    assert orphan.is_file()
++
++
++def test_dependency_accessors_return_application_state() -> None:
++    values = {
++        "database": object(),
++        "settings": object(),
++        "storage_service": object(),
++        "qrcode_service": object(),
++        "public_miss_limiter": PublicMissLimiter(1, 1),
++    }
++    app = SimpleNamespace(state=SimpleNamespace(**values))
++    request = SimpleNamespace(app=app)
++
++    assert get_database(request) is values["database"]  # type: ignore[arg-type]
++    assert get_runtime_settings(request) is values["settings"]  # type: ignore[arg-type]
++    assert get_storage_service(request) is values["storage_service"]  # type: ignore[arg-type]
++    assert get_qrcode_service(request) is values["qrcode_service"]  # type: ignore[arg-type]
++    assert get_public_miss_limiter(request) is values["public_miss_limiter"]  # type: ignore[arg-type]
+diff --git a/tests/unit/test_product_domain.py b/tests/unit/test_product_domain.py
+new file mode 100644
+index 0000000..817b57d
+--- /dev/null
++++ b/tests/unit/test_product_domain.py
+@@ -0,0 +1,88 @@
++"""Product-code and public-token contract tests."""
++
++from __future__ import annotations
++
++import base64
++
++import pytest
++
++from product_pdf_qr.domains.product import (
++    generate_public_token,
++    is_normalized_product_code,
++    normalize_product_code,
++)
++from product_pdf_qr.errors import AppError
++
++
++@pytest.mark.parametrize(
++    ("raw", "normalized"),
++    [
++        (" a001_1 ", "A001_1"),
++        ("a", "A"),
++        ("Z" * 64, "Z" * 64),
++        ("abc-123_DEF", "ABC-123_DEF"),
++    ],
++)
++def test_normalize_product_code_accepts_contract_boundaries(
++    raw: str,
++    normalized: str,
++) -> None:
++    assert normalize_product_code(raw) == normalized
++    assert is_normalized_product_code(normalized)
++
++
++@pytest.mark.parametrize(
++    "raw",
++    [
++        "",
++        "   ",
++        "中",
++        "A 1",
++        "A/B",
++        "A.B",
++        "A#B",
++        "A%B",
++        "A" * 65,
++        "é",
++    ],
++)
++def test_normalize_product_code_rejects_invalid_input(raw: str) -> None:
++    with pytest.raises(AppError) as captured:
++        normalize_product_code(raw)
++
++    assert captured.value.code == "invalid_product_code"
++    assert captured.value.status_code == 422
++
++
++def test_normalized_contract_rejects_lowercase_and_whitespace() -> None:
++    assert not is_normalized_product_code("a001")
++    assert not is_normalized_product_code(" A001")
++
++
++def test_public_token_uses_16_csprng_bytes(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    calls: list[int] = []
++
++    def fake_token_bytes(length: int) -> bytes:
++        calls.append(length)
++        return bytes(range(length))
++
++    monkeypatch.setattr(
++        "product_pdf_qr.domains.product.service.secrets.token_bytes",
++        fake_token_bytes,
++    )
++
++    token = generate_public_token()
++
++    assert calls == [16]
++    assert len(token) == 26
++    assert token == base64.b32encode(bytes(range(16))).decode("ascii").rstrip("=")
++    assert set(token) <= set("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
++
++
++def test_public_tokens_are_not_constant() -> None:
++    tokens = {generate_public_token() for _ in range(256)}
++
++    assert len(tokens) == 256
++    assert all(len(token) == 26 for token in tokens)
+diff --git a/tests/unit/test_public_api.py b/tests/unit/test_public_api.py
+new file mode 100644
+index 0000000..196ed85
+--- /dev/null
++++ b/tests/unit/test_public_api.py
+@@ -0,0 +1,134 @@
++"""Public HTTP contract: four 200 states, no-store, streaming, and miss limiting."""
++
++from __future__ import annotations
++
++from collections.abc import AsyncIterator
++from contextlib import asynccontextmanager
++from pathlib import Path
++from typing import cast
++
++import httpx
++import pytest
++from fastapi import FastAPI
++
++from product_pdf_qr.database import Database
++from product_pdf_qr.domains.public import PublicMissLimiter
++from product_pdf_qr.domains.storage import StorageService
++from product_pdf_qr.main import create_app
++
++
++class Cursor:
++    def __init__(self, row: dict[str, object] | None) -> None:
++        self.row = row
++
++    async def fetchone(self) -> dict[str, object] | None:
++        return self.row
++
++
++class Connection:
++    def __init__(self, row: dict[str, object] | None) -> None:
++        self.row = row
++
++    async def execute(self, _query: str, _params: object = None) -> Cursor:
++        return Cursor(self.row)
++
++    @asynccontextmanager
++    async def transaction(self) -> AsyncIterator[None]:
++        yield
++
++
++class RepeatingDatabase:
++    def __init__(self, row: dict[str, object] | None) -> None:
++        self.row = row
++
++    @asynccontextmanager
++    async def connection(self) -> AsyncIterator[Connection]:
++        yield Connection(self.row)
++
++
++def configured_app(
++    tmp_path: Path,
++    row: dict[str, object] | None,
++    *,
++    miss_limit: int = 20,
++) -> tuple[FastAPI, StorageService]:
++    app = create_app()
++    storage = StorageService(tmp_path, max_pdf_bytes=1024)
++    storage.prepare()
++    app.state.database = cast(Database, RepeatingDatabase(row))
++    app.state.storage_service = storage
++    app.state.public_miss_limiter = PublicMissLimiter(miss_limit, 600)
++    return app, storage
++
++
++@pytest.mark.anyio
++@pytest.mark.api
++@pytest.mark.parametrize(
++    ("row", "message"),
++    [
++        (None, "资料链接无效"),
++        ({"status": "disabled", "current_version_id": None}, "该产品资料已停用"),
++        ({"status": "active", "current_version_id": None}, "资料暂未上传"),
++    ],
++)
++async def test_prompt_states_are_uniform_200_no_store(
++    tmp_path: Path,
++    row: dict[str, object] | None,
++    message: str,
++) -> None:
++    app, _storage = configured_app(tmp_path, row)
++    transport = httpx.ASGITransport(app=app)
++
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.get("/p/not-a-base32-token")
++
++    assert response.status_code == 200
++    assert response.headers["cache-control"] == "no-store"
++    assert response.headers["pragma"] == "no-cache"
++    assert response.headers["x-content-type-options"] == "nosniff"
++    assert message in response.text
++    assert "A001" not in response.text
++    assert "not-a-base32-token" not in response.text
++
++
++@pytest.mark.anyio
++@pytest.mark.api
++async def test_available_state_streams_pdf_inline_without_caching(tmp_path: Path) -> None:
++    relative = StorageService.relative_path_for_hash("d" * 64)
++    row = {
++        "status": "active",
++        "current_version_id": 7,
++        "original_filename": "合成 资料.pdf",
++        "storage_path": relative,
++        "size_bytes": 13,
++    }
++    app, storage = configured_app(tmp_path, row)
++    path = storage.files_root / relative
++    path.parent.mkdir(parents=True)
++    path.write_bytes(b"%PDF-public!")
++    transport = httpx.ASGITransport(app=app)
++
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.get("/p/" + ("A" * 26))
++
++    assert response.status_code == 200
++    assert response.content == b"%PDF-public!"
++    assert response.headers["content-type"] == "application/pdf"
++    assert response.headers["cache-control"] == "no-store"
++    assert response.headers["content-disposition"].startswith("inline; filename*=UTF-8''")
++
++
++@pytest.mark.anyio
++@pytest.mark.api
++async def test_missing_token_threshold_audits_then_returns_429(tmp_path: Path) -> None:
++    app, _storage = configured_app(tmp_path, None, miss_limit=1)
++    transport = httpx.ASGITransport(app=app)
++
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        first = await client.get("/p/missing")
++        limited = await client.get("/p/another")
++
++    assert first.status_code == 200
++    assert limited.status_code == 429
++    assert limited.headers["retry-after"] == "600"
++    assert limited.headers["cache-control"] == "no-store"
+diff --git a/tests/unit/test_public_domain.py b/tests/unit/test_public_domain.py
+new file mode 100644
+index 0000000..6508bbc
+--- /dev/null
++++ b/tests/unit/test_public_domain.py
+@@ -0,0 +1,43 @@
++"""Public-state ordering and missing-token limiter tests."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from product_pdf_qr.domains.public import PublicMissLimiter
++
++
++@pytest.mark.anyio
++async def test_miss_limiter_triggers_at_threshold_and_expires() -> None:
++    now = 100.0
++
++    def clock() -> float:
++        return now
++
++    limiter = PublicMissLimiter(limit=2, window_seconds=10, clock=clock)
++
++    assert not await limiter.is_limited("client")
++    assert not await limiter.register_miss("client")
++    assert await limiter.register_miss("client")
++    assert await limiter.is_limited("client")
++
++    now = 111.0
++    assert not await limiter.is_limited("client")
++
++
++@pytest.mark.anyio
++async def test_valid_activity_does_not_enter_miss_limiter() -> None:
++    limiter = PublicMissLimiter(limit=1, window_seconds=600)
++
++    for _ in range(1_000):
++        assert not await limiter.is_limited("shared-ip")
++
++
++def test_repository_has_no_orphan_cleanup_implementation() -> None:
++    source_root = Path(__file__).parents[2] / "src" / "product_pdf_qr"
++    source = "\n".join(path.read_text() for path in source_root.rglob("*.py"))
++
++    assert "delete_orphan" not in source
++    assert "cleanup_orphan" not in source
+diff --git a/tests/unit/test_qrcode_domain.py b/tests/unit/test_qrcode_domain.py
+new file mode 100644
+index 0000000..58536ae
+--- /dev/null
++++ b/tests/unit/test_qrcode_domain.py
+@@ -0,0 +1,110 @@
++"""QR specification, determinism, cache, and failure-compensation tests."""
++
++from __future__ import annotations
++
++import io
++import struct
++from pathlib import Path
++
++import pytest
++import segno
++from PIL import Image
++
++from product_pdf_qr.domains.qrcode import QRCodeGenerationError, QRCodeService
++
++TOKEN = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
++
++
++def png_chunks(image_bytes: bytes) -> list[str]:
++    position = 8
++    chunks: list[str] = []
++    while position < len(image_bytes):
++        length = struct.unpack(">I", image_bytes[position : position + 4])[0]
++        chunks.append(image_bytes[position + 4 : position + 8].decode("ascii"))
++        position += length + 12
++    return chunks
++
++
++def test_qrcode_is_deterministic_1024_png_without_metadata(tmp_path: Path) -> None:
++    service = QRCodeService(tmp_path, "http://127.0.0.1:8000/")
++
++    first = service.generate("A001", TOKEN)
++    second = service.generate("A001", TOKEN)
++
++    assert first == second
++    assert first.startswith(b"\x89PNG\r\n\x1a\n")
++    image = Image.open(io.BytesIO(first))
++    assert image.size == (1024, 1024)
++    assert image.info == {}
++    assert png_chunks(first) == ["IHDR", "IDAT", "IEND"]
++    assert service.public_url(TOKEN) == f"http://127.0.0.1:8000/p/{TOKEN}"
++    assert b"A001" not in first
++
++
++def test_rendered_modules_match_h_level_utf8_public_url(tmp_path: Path) -> None:
++    service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
++    payload = service.public_url(TOKEN)
++    image = Image.open(io.BytesIO(service.generate("A001", TOKEN)))
++    symbol = segno.make(
++        payload,
++        error="h",
++        encoding="utf-8",
++        micro=False,
++        boost_error=False,
++    )
++    matrix = tuple(tuple(bool(module) for module in row) for row in symbol.matrix)
++    module_count = len(matrix) + 8
++    pixels = image.load()
++    assert pixels is not None
++
++    for row_index, row in enumerate(matrix):
++        for column_index, expected_dark in enumerate(row):
++            x = ((column_index + 4) * 1024 + 512) // module_count
++            y = ((row_index + 4) * 1024 + 512) // module_count
++            assert (pixels[x, y] == 0) is expected_dark
++    for border_index in range(4):
++        coordinate = (border_index * 1024 + 512) // module_count
++        assert pixels[coordinate, coordinate] != 0
++
++
++@pytest.mark.anyio
++async def test_cache_miss_generates_and_next_request_hits(tmp_path: Path) -> None:
++    service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
++
++    first = await service.get_or_generate("A001", TOKEN)
++    second = await service.get_or_generate("A001", TOKEN)
++
++    assert not first.cache_hit
++    assert first.cache_error is None
++    assert second.cache_hit
++    assert second.image_bytes == first.image_bytes
++    assert (service.cache_root / "A001.png").read_bytes() == first.image_bytes
++
++
++@pytest.mark.anyio
++async def test_cache_write_failure_returns_memory_image(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
++
++    def fail_cache(_target: Path, _image_bytes: bytes) -> None:
++        raise OSError("synthetic disk failure")
++
++    monkeypatch.setattr(service, "_write_cache_without_overwrite", fail_cache)
++
++    result = await service.get_or_generate("A001", TOKEN)
++
++    assert result.image_bytes.startswith(b"\x89PNG")
++    assert not result.cache_hit
++    assert result.cache_error == "OSError"
++    assert not (service.cache_root / "A001.png").exists()
++
++
++def test_invalid_stored_code_never_generates_placeholder(tmp_path: Path) -> None:
++    service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
++
++    with pytest.raises(QRCodeGenerationError):
++        service.generate("../A001", TOKEN)
++
++    assert list(tmp_path.rglob("*.png")) == []
+diff --git a/tests/unit/test_storage_domain.py b/tests/unit/test_storage_domain.py
+new file mode 100644
+index 0000000..f273be2
+--- /dev/null
++++ b/tests/unit/test_storage_domain.py
+@@ -0,0 +1,291 @@
++"""PDF isolation, validation, publication, and reconciliation tests."""
++
++from __future__ import annotations
++
++import io
++import multiprocessing
++import resource
++import subprocess
++import sys
++import time
++from pathlib import Path
++from typing import Literal
++
++import pytest
++from fastapi import UploadFile
++from pypdf import PdfWriter
++from starlette.datastructures import Headers
++
++from product_pdf_qr.domains.storage import StorageService, UploadRejected
++from product_pdf_qr.domains.storage.service import _parse_pdf, _set_pdf_worker_limits
++
++
++def synthetic_pdf() -> bytes:
++    output = io.BytesIO()
++    writer = PdfWriter()
++    writer.add_blank_page(width=72, height=72)
++    writer.write(output)
++    return output.getvalue()
++
++
++def slow_pdf_parser(_path: str) -> Literal["valid", "invalid", "resource_limit"]:
++    """Simulate a compact input that traps its structural parser."""
++
++    time.sleep(30)
++    return "valid"
++
++
++def memory_exhausting_pdf_parser(
++    _path: str,
++) -> Literal["valid", "invalid", "resource_limit"]:
++    """Simulate the parser's deterministic response to exhausted address space."""
++
++    raise MemoryError
++
++
++def upload_file(
++    content: bytes,
++    *,
++    filename: str = "synthetic.pdf",
++    content_type: str = "application/pdf",
++) -> UploadFile:
++    return UploadFile(
++        file=io.BytesIO(content),
++        filename=filename,
++        headers=Headers({"content-type": content_type}),
++    )
++
++
++def test_pdf_parser_accepts_normal_and_rejects_damaged_structure(tmp_path: Path) -> None:
++    normal = tmp_path / "normal.pdf"
++    damaged = tmp_path / "damaged.pdf"
++    normal.write_bytes(synthetic_pdf())
++    damaged.write_bytes(b"%PDF-not-a-structure")
++
++    assert _parse_pdf(str(normal)) == "valid"
++    assert _parse_pdf(str(damaged)) == "invalid"
++
++
++def test_worker_limits_set_cpu_and_linux_address_space(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    limits: list[tuple[int, tuple[int, int]]] = []
++    monkeypatch.setattr(sys, "platform", "linux")
++    monkeypatch.setattr(
++        resource,
++        "setrlimit",
++        lambda resource_id, values: limits.append((resource_id, values)),
++    )
++
++    _set_pdf_worker_limits(3, 512)
++
++    assert limits == [
++        (resource.RLIMIT_CPU, (3, 4)),
++        (resource.RLIMIT_AS, (512, 512)),
++    ]
++
++
++def test_worker_limits_allow_only_configured_growth_on_darwin(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    limits: list[tuple[int, tuple[int, int]]] = []
++    monkeypatch.setattr(sys, "platform", "darwin")
++    monkeypatch.setattr(
++        subprocess,
++        "check_output",
++        lambda *_args, **_kwargs: "1000\n",
++    )
++    monkeypatch.setattr(
++        resource,
++        "setrlimit",
++        lambda resource_id, values: limits.append((resource_id, values)),
++    )
++
++    _set_pdf_worker_limits(3, 512)
++
++    assert limits == [
++        (resource.RLIMIT_CPU, (3, 4)),
++        (
++            resource.RLIMIT_AS,
++            (1000 * 1024 + 512, 1000 * 1024 + 512),
++        ),
++    ]
++
++
++class InterruptedUpload(UploadFile):
++    """Synthetic client disconnect after one partial chunk."""
++
++    def __init__(self) -> None:
++        super().__init__(
++            file=io.BytesIO(b"unused"),
++            filename="interrupted.pdf",
++            headers=Headers({"content-type": "application/pdf"}),
++        )
++        self.read_count = 0
++
++    async def read(self, size: int = -1) -> bytes:
++        self.read_count += 1
++        if self.read_count == 1:
++            return b"%PDF-partial"
++        raise ConnectionError("synthetic upload interruption")
++
++
++@pytest.mark.anyio
++async def test_valid_pdf_isolated_hashed_and_path_ignores_filename(tmp_path: Path) -> None:
++    storage = StorageService(tmp_path, max_pdf_bytes=1024 * 1024)
++
++    validated = await storage.receive_and_validate(
++        upload_file(synthetic_pdf(), filename="../../unsafe.pdf")
++    )
++
++    assert validated.temporary_path.parent == storage.temporary_root
++    assert validated.original_filename == "../../unsafe.pdf"
++    assert len(validated.sha256) == 64
++    assert validated.size_bytes > 0
++    assert ".." not in storage.relative_path_for_hash(validated.sha256)
++    validated.discard()
++    assert not validated.temporary_path.exists()
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize(
++    ("content", "filename", "content_type", "code", "stage"),
++    [
++        (b"", "empty.pdf", "application/pdf", "empty_pdf", "size"),
++        (b"%PDF-bad", "wrong.txt", "application/pdf", "invalid_pdf_extension", "extension"),
++        (b"%PDF-bad", "wrong.pdf", "text/plain", "invalid_pdf_mime", "mime"),
++        (b"not-pdf", "wrong.pdf", "application/pdf", "invalid_pdf_signature", "signature"),
++        (
++            b"%PDF-not-a-structure",
++            "broken.pdf",
++            "application/pdf",
++            "invalid_pdf_structure",
++            "structure",
++        ),
++    ],
++)
++async def test_pdf_validation_rejections_leave_no_temporary_file(
++    tmp_path: Path,
++    content: bytes,
++    filename: str,
++    content_type: str,
++    code: str,
++    stage: str,
++) -> None:
++    storage = StorageService(tmp_path, max_pdf_bytes=1024 * 1024)
++
++    with pytest.raises(UploadRejected) as captured:
++        await storage.receive_and_validate(
++            upload_file(content, filename=filename, content_type=content_type)
++        )
++
++    assert captured.value.code == code
++    assert captured.value.stage == stage
++    assert list(storage.temporary_root.iterdir()) == []
++
++
++@pytest.mark.anyio
++async def test_size_limit_stops_receive_and_removes_partial_file(tmp_path: Path) -> None:
++    storage = StorageService(tmp_path, max_pdf_bytes=8)
++
++    with pytest.raises(UploadRejected) as captured:
++        await storage.receive_and_validate(upload_file(b"x" * 9))
++
++    assert captured.value.code == "pdf_too_large"
++    assert captured.value.status_code == 413
++    assert list(storage.temporary_root.iterdir()) == []
++
++
++@pytest.mark.anyio
++async def test_interrupted_receive_removes_partial_file(tmp_path: Path) -> None:
++    storage = StorageService(tmp_path, max_pdf_bytes=1024)
++
++    with pytest.raises(ConnectionError):
++        await storage.receive_and_validate(InterruptedUpload())
++
++    assert list(storage.temporary_root.iterdir()) == []
++    assert list(storage.files_root.rglob("*.pdf")) == []
++
++
++@pytest.mark.anyio
++async def test_slow_pdf_parser_is_killed_and_reaped_at_wall_clock_limit(
++    tmp_path: Path,
++) -> None:
++    children_before = {child.pid for child in multiprocessing.active_children()}
++    storage = StorageService(
++        tmp_path,
++        max_pdf_bytes=1024 * 1024,
++        pdf_validation_timeout_seconds=0.1,
++        pdf_parser=slow_pdf_parser,
++    )
++
++    started = time.monotonic()
++    with pytest.raises(UploadRejected) as captured:
++        await storage.receive_and_validate(upload_file(synthetic_pdf()))
++    elapsed = time.monotonic() - started
++
++    assert captured.value.code == "pdf_validation_timeout"
++    assert captured.value.stage == "structure_timeout"
++    assert elapsed < 2
++    assert {child.pid for child in multiprocessing.active_children()} == children_before
++    assert list(storage.temporary_root.iterdir()) == []
++
++
++@pytest.mark.anyio
++async def test_pdf_parser_memory_exhaustion_is_a_distinct_rejection(tmp_path: Path) -> None:
++    storage = StorageService(
++        tmp_path,
++        max_pdf_bytes=1024 * 1024,
++        pdf_parser=memory_exhausting_pdf_parser,
++    )
++
++    with pytest.raises(UploadRejected) as captured:
++        await storage.receive_and_validate(upload_file(synthetic_pdf()))
++
++    assert captured.value.code == "pdf_validation_resource_limit"
++    assert captured.value.stage == "structure_resource"
++    assert list(storage.temporary_root.iterdir()) == []
++
++
++@pytest.mark.anyio
++async def test_publish_is_atomic_and_never_overwrites_existing_target(tmp_path: Path) -> None:
++    storage = StorageService(tmp_path, max_pdf_bytes=1024 * 1024)
++    first = await storage.receive_and_validate(upload_file(synthetic_pdf()))
++    published = await storage.publish(first)
++    before_bytes = published.absolute_path.read_bytes()
++    before_mtime = published.absolute_path.stat().st_mtime_ns
++
++    second = await storage.receive_and_validate(
++        upload_file(synthetic_pdf(), filename="another.pdf")
++    )
++    reused = await storage.publish(second)
++
++    assert published.moved
++    assert not reused.moved
++    assert reused.storage_path == published.storage_path
++    assert reused.absolute_path.read_bytes() == before_bytes
++    assert reused.absolute_path.stat().st_mtime_ns == before_mtime
++    assert not second.temporary_path.exists()
++
++
++def test_orphan_report_is_read_only_and_path_resolution_is_bounded(tmp_path: Path) -> None:
++    storage = StorageService(tmp_path, max_pdf_bytes=1024)
++    storage.prepare()
++    digest = "a" * 64
++    relative = storage.relative_path_for_hash(digest)
++    path = storage.files_root / relative
++    path.parent.mkdir(parents=True)
++    path.write_bytes(b"synthetic")
++    before = path.stat()
++
++    orphans = storage.find_orphans(set())
++
++    assert [orphan.storage_path for orphan in orphans] == [relative]
++    assert path.read_bytes() == b"synthetic"
++    assert path.stat().st_mtime_ns == before.st_mtime_ns
++    assert storage.find_orphans({relative}) == []
++    assert storage.resolve_formal_path(relative) == path.resolve()
++    with pytest.raises(RuntimeError):
++        storage.resolve_formal_path("../../outside.pdf")
++    with pytest.raises(ValueError):
++        storage.relative_path_for_hash("../unsafe")
+diff --git a/tests/unit/test_upload_limit.py b/tests/unit/test_upload_limit.py
+new file mode 100644
+index 0000000..a9826fe
+--- /dev/null
++++ b/tests/unit/test_upload_limit.py
+@@ -0,0 +1,216 @@
++"""HTTP-level evidence that oversized uploads stop before multipart parsing."""
++
++from __future__ import annotations
++
++from collections.abc import AsyncIterator
++from typing import Annotated, cast
++
++import httpx
++import pytest
++from fastapi import FastAPI, File, Form, Request, UploadFile
++from psycopg.types.json import Jsonb
++
++from product_pdf_qr.upload_limit import UploadRequestLimitMiddleware
++from tests.unit.test_business_services import (
++    ScriptedConnection,
++    ScriptedDatabase,
++    as_database,
++)
++
++
++class CountingBody(httpx.AsyncByteStream):
++    """A request stream that records exactly how much the ASGI app consumed."""
++
++    def __init__(self, chunks: list[bytes]) -> None:
++        self.chunks = chunks
++        self.yielded_chunks = 0
++
++    async def __aiter__(self) -> AsyncIterator[bytes]:
++        for chunk in self.chunks:
++            self.yielded_chunks += 1
++            yield chunk
++
++
++def multipart_body(payload: bytes) -> bytes:
++    return (
++        b"--test-boundary\r\n"
++        b'Content-Disposition: form-data; name="actor_id"\r\n\r\n'
++        b"9\r\n"
++        b"--test-boundary\r\n"
++        b'Content-Disposition: form-data; name="file"; filename="test.pdf"\r\n'
++        b"Content-Type: application/pdf\r\n\r\n" + payload + b"\r\n--test-boundary--\r\n"
++    )
++
++
++def limited_test_app() -> tuple[FastAPI, dict[str, bool], ScriptedConnection]:
++    app = FastAPI()
++    state = {"upload_handler_called": False}
++    audit_connection = ScriptedConnection([None])
++    app.state.database = as_database(ScriptedDatabase(audit_connection))
++    app.add_middleware(
++        UploadRequestLimitMiddleware,
++        max_pdf_bytes=8,
++        multipart_overhead_bytes=64,
++    )
++
++    @app.post("/api/products/{product_id}/pdf")
++    async def consume_upload(
++        product_id: int,
++        actor_id: Annotated[int, Form()],
++        file: Annotated[UploadFile, File()],
++    ) -> dict[str, int]:
++        state["upload_handler_called"] = True
++        return {
++            "product_id": product_id,
++            "actor_id": actor_id,
++            "received": len(await file.read()),
++        }
++
++    @app.post("/unrelated")
++    async def consume_unrelated(request: Request) -> dict[str, int]:
++        return {"received": len(await request.body())}
++
++    return app, state, audit_connection
++
++
++def assert_size_rejection_audit(
++    audit_connection: ScriptedConnection,
++    *,
++    response: httpx.Response,
++    expected_detail: dict[str, object],
++) -> dict[str, object]:
++    assert len(audit_connection.parameters) == 1
++    parameters = audit_connection.parameters[0]
++    assert isinstance(parameters, tuple)
++    assert parameters[0] == "anonymous"
++    assert parameters[1] is None
++    assert parameters[2] == "pdf_upload_rejected"
++    assert parameters[3] == "product"
++    assert parameters[4] == 5
++    assert parameters[6] == "failure"
++    assert str(parameters[7]) == response.headers["x-request-id"]
++    detail = parameters[8]
++    assert isinstance(detail, Jsonb)
++    assert detail.obj == expected_detail
++    assert set(detail.obj).isdisjoint(
++        {
++            "actor_id",
++            "file",
++            "file_content",
++            "form",
++            "headers",
++            "password",
++            "request_body",
++            "server_path",
++            "token",
++        }
++    )
++    assert all("file_size" not in key for key in detail.obj)
++    return cast(dict[str, object], detail.obj)
++
++
++@pytest.mark.anyio
++async def test_content_length_rejection_reads_zero_request_bytes() -> None:
++    complete_body = multipart_body(b"x" * 16)
++    body = CountingBody([complete_body])
++    app, state, audit_connection = limited_test_app()
++    transport = httpx.ASGITransport(app=app)
++
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.post(
++            "/api/products/5/pdf",
++            content=body,
++            headers={
++                "Content-Length": str(len(complete_body)),
++                "Content-Type": "multipart/form-data; boundary=test-boundary",
++            },
++        )
++
++    assert response.status_code == 413
++    assert response.json()["error"]["code"] == "pdf_too_large"
++    assert body.yielded_chunks == 0
++    assert not state["upload_handler_called"]
++    assert_size_rejection_audit(
++        audit_connection,
++        response=response,
++        expected_detail={
++            "reason": "content_length_exceeded",
++            "stage": "pre_parser_size",
++            "declared_content_length": len(complete_body),
++            "declared_request_body_verified": False,
++            "complete_pdf_byte_length_known": False,
++        },
++    )
++
++
++@pytest.mark.anyio
++async def test_chunked_rejection_stops_before_consuming_complete_body() -> None:
++    complete_body = multipart_body(b"x" * 64)
++    chunks = [complete_body[index : index + 16] for index in range(0, len(complete_body), 16)]
++    body = CountingBody(chunks)
++    app, state, audit_connection = limited_test_app()
++    transport = httpx.ASGITransport(app=app)
++
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.post(
++            "/api/products/5/pdf",
++            content=body,
++            headers={"Content-Type": "multipart/form-data; boundary=test-boundary"},
++        )
++
++    assert response.status_code == 413
++    assert response.json()["error"]["code"] == "pdf_too_large"
++    assert body.yielded_chunks > 0
++    assert body.yielded_chunks < len(body.chunks)
++    assert not state["upload_handler_called"]
++    received_bytes = sum(len(chunk) for chunk in body.chunks[: body.yielded_chunks])
++    assert_size_rejection_audit(
++        audit_connection,
++        response=response,
++        expected_detail={
++            "reason": "chunked_stream_exceeded",
++            "stage": "pre_parser_size",
++            "received_bytes_before_abort": received_bytes,
++            "complete_pdf_byte_length_known": False,
++        },
++    )
++
++
++@pytest.mark.anyio
++async def test_upload_limit_does_not_apply_to_other_endpoints() -> None:
++    body = CountingBody([b"x" * 32])
++    app, _state, audit_connection = limited_test_app()
++    transport = httpx.ASGITransport(app=app)
++
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.post("/unrelated", content=body)
++
++    assert response.status_code == 200
++    assert response.json() == {"received": 32}
++    assert body.yielded_chunks == 1
++    assert audit_connection.parameters == []
++
++
++@pytest.mark.anyio
++async def test_audit_failure_is_logged_without_blocking_early_413(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    body = CountingBody([b"must-not-be-read"])
++    app, _state, _audit_connection = limited_test_app()
++    app.state.database = as_database(
++        ScriptedDatabase(
++            ScriptedConnection([], execute_error=RuntimeError("synthetic audit failure"))
++        )
++    )
++    transport = httpx.ASGITransport(app=app)
++
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.post(
++            "/api/products/5/pdf",
++            content=body,
++            headers={"Content-Length": "1000"},
++        )
++
++    assert response.status_code == 413
++    assert body.yielded_chunks == 0
++    assert "Pre-parser upload rejection audit was not persisted" in caplog.text
+diff --git a/uv.lock b/uv.lock
+index c5c7cc3..e03568b 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -500,6 +500,23 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/f1/d9/7fb5aa316bc299258e68c73ba3bddbc499654a07f151cba08f6153988714/pathspec-1.1.1-py3-none-any.whl", hash = "sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189", size = 57328, upload-time = "2026-04-27T01:46:07.06Z" },
+ ]
+ 
++[[package]]
++name = "pillow"
++version = "12.3.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/1c/3d/bb7fca845737cf9d7dbde16ed1843984665ff2e0a518f5db43e77ec540b9/pillow-12.3.0.tar.gz", hash = "sha256:3b8182a766685eaa002637e28b4ec8d6b18819a0c71f579bf0dbaa5830297cce", size = 47025035, upload-time = "2026-07-01T11:56:38.965Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/37/bf/fb3ebff8ddcb76aac5a01389251bbbb9519922a9b520d8247c1ca864a25d/pillow-12.3.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:ba09209fbe443b4acccebe845d8a138b89a8f4fbaeedd44953490b5315d5e965", size = 5345969, upload-time = "2026-07-01T11:54:06.397Z" },
++    { url = "https://files.pythonhosted.org/packages/d8/66/9a386a92561f402389a4fc70c18838bf6d35eb5eb5c6850b4b2dc64f5048/pillow-12.3.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:ffd0c5368496f41b0944be820fcb7a838aa6e623d250b01acf2643939c3f99d7", size = 4780323, upload-time = "2026-07-01T11:54:09.351Z" },
++    { url = "https://files.pythonhosted.org/packages/25/27/ac8f99618ffd3dde21db0f4d4b1d2ab00c0880595bfd17df103f7f39fd0c/pillow-12.3.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d9c7f76c0673154f044e9d78c8655fb4213f6ca31a836df48b40fe5d187717b9", size = 6266838, upload-time = "2026-07-01T11:54:11.71Z" },
++    { url = "https://files.pythonhosted.org/packages/84/21/a35af28dcc61f37ed850a2d64c65c701321dfbf25085e469d5559360cbbf/pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:78cb2c6865a35ab8ff8b75fd122f6033b92a62c82801110e48ddd6c936a45d91", size = 6940830, upload-time = "2026-07-01T11:54:13.732Z" },
++    { url = "https://files.pythonhosted.org/packages/eb/51/8b08617af3ad95e33ce6d7dd2c99ed6c8298f7fb131636303956be022e25/pillow-12.3.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:e491916b378fba47242221bb9ead245211b70d504f495d105d17b14a24b4907c", size = 6344383, upload-time = "2026-07-01T11:54:15.756Z" },
++    { url = "https://files.pythonhosted.org/packages/1d/72/cf78ac9780bb93c28328f408973845a309d4d145041665f734572ced1b52/pillow-12.3.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:0dd2064cbc55aaec028ef5fbb60fa47bb6c3e7918e07ff17935284b227a9d2df", size = 7052934, upload-time = "2026-07-01T11:54:17.721Z" },
++    { url = "https://files.pythonhosted.org/packages/20/20/25e0f4dc178a6bc0696793720055519a0de89e7661dae886992decbd2f81/pillow-12.3.0-cp312-cp312-win32.whl", hash = "sha256:dbce0b29841537a2fa4a214c2bbf14de3587c9680caa9b4e217568472490b28f", size = 6472684, upload-time = "2026-07-01T11:54:19.839Z" },
++    { url = "https://files.pythonhosted.org/packages/45/89/da2f7971a317f83d807fdd4065c0af40208e59e692cc43d315a71a0e96d1/pillow-12.3.0-cp312-cp312-win_amd64.whl", hash = "sha256:a2b55dd6b2a4c4b7d87ffa56bdb33fdc5fdb9a462173861a7bc097f17d91cb09", size = 7227137, upload-time = "2026-07-01T11:54:22.025Z" },
++    { url = "https://files.pythonhosted.org/packages/de/47/4845a0a6c0dbf1db8456bd9fc791f13c5ced7ced20606d08a0aacfd25b49/pillow-12.3.0-cp312-cp312-win_arm64.whl", hash = "sha256:331b624368d4f1d069149002f25f44bc61c8919ce8ddb3c45bdad8f6e2d89510", size = 2568267, upload-time = "2026-07-01T11:54:24.051Z" },
++]
++
+ [[package]]
+ name = "pip"
+ version = "26.2"
+@@ -581,8 +598,12 @@ dependencies = [
+     { name = "alembic" },
+     { name = "fastapi" },
+     { name = "jinja2" },
++    { name = "pillow" },
+     { name = "psycopg", extra = ["binary", "pool"] },
+     { name = "pydantic-settings" },
++    { name = "pypdf" },
++    { name = "python-multipart" },
++    { name = "segno" },
+     { name = "sqlalchemy" },
+     { name = "uvicorn" },
+ ]
+@@ -604,8 +625,12 @@ requires-dist = [
+     { name = "alembic", specifier = "==1.18.5" },
+     { name = "fastapi", specifier = "==0.141.1" },
+     { name = "jinja2", specifier = "==3.1.6" },
++    { name = "pillow", specifier = "==12.3.0" },
+     { name = "psycopg", extras = ["binary", "pool"], specifier = "==3.3.4" },
+     { name = "pydantic-settings", specifier = "==2.14.2" },
++    { name = "pypdf", specifier = "==6.14.2" },
++    { name = "python-multipart", specifier = "==0.0.32" },
++    { name = "segno", specifier = "==1.6.6" },
+     { name = "sqlalchemy", specifier = "==2.0.51" },
+     { name = "uvicorn", specifier = "==0.52.0" },
+ ]
+@@ -762,6 +787,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/10/bd/c038d7cc38edc1aa5bf91ab8068b63d4308c66c4c8bb3cbba7dfbc049f9c/pyparsing-3.3.2-py3-none-any.whl", hash = "sha256:850ba148bd908d7e2411587e247a1e4f0327839c40e2e5e6d05a007ecc69911d", size = 122781, upload-time = "2026-01-21T03:57:55.912Z" },
+ ]
+ 
++[[package]]
++name = "pypdf"
++version = "6.14.2"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/03/72/7dfd5ff1c9c37de97a731701f51af091325f123d9d4270361c9c69e4431f/pypdf-6.14.2.tar.gz", hash = "sha256:7873f502fe4385e79539b21d872392dc0c4e3714327c15881cbc7fbfd1f95b25", size = 6491182, upload-time = "2026-06-23T14:18:30.859Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/49/e6/136aa8993a2ae7214e0b0ef2edaa0d2e08d1d4e4982635b08a835ff31ec8/pypdf-6.14.2-py3-none-any.whl", hash = "sha256:3f07891af76dc002657e04993ab9b4de81de29f9013b9761d0b7968bff12e946", size = 349514, upload-time = "2026-06-23T14:18:28.867Z" },
++]
++
+ [[package]]
+ name = "pyproject-hooks"
+ version = "1.2.0"
+@@ -810,6 +844,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
+ ]
+ 
++[[package]]
++name = "python-multipart"
++version = "0.0.32"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/5b/42/55c32bb9b12693c092ad250a0e82edb5b31ddeda6eb772de5f308b3804ad/python_multipart-0.0.32.tar.gz", hash = "sha256:be54b7f3fa167bb83e4fcd936b887b708f4e57fe75911c02aebf53efaf8d938e", size = 46881, upload-time = "2026-06-04T16:18:58.647Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/e1/04/e8135ebd1ad02c56ec633277529b2602ff99ff634be76cdba5744cf554fd/python_multipart-0.0.32-py3-none-any.whl", hash = "sha256:ff6d3f776f16878c894e52e107296ffc890e913c611b1a4ec6c44e2821fe2e23", size = 30042, upload-time = "2026-06-04T16:18:57.319Z" },
++]
++
+ [[package]]
+ name = "pyyaml"
+ version = "6.0.3"
+@@ -881,6 +924,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/cb/46/240ea004bf6dc4feb40e9832f2205a476a47dd5b8a3f8211a5fc5f95e20e/ruff-0.16.1-py3-none-win_arm64.whl", hash = "sha256:dbaadaac38c70239f056d306b7476f246b0bf000fa6b3876402acbf5b227eaf8", size = 11309414, upload-time = "2026-07-30T19:36:58.79Z" },
+ ]
+ 
++[[package]]
++name = "segno"
++version = "1.6.6"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/1c/2e/b396f750c53f570055bf5a9fc1ace09bed2dff013c73b7afec5702a581ba/segno-1.6.6.tar.gz", hash = "sha256:e60933afc4b52137d323a4434c8340e0ce1e58cec71439e46680d4db188f11b3", size = 1628586, upload-time = "2025-03-12T22:12:53.324Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/d6/02/12c73fd423eb9577b97fc1924966b929eff7074ae6b2e15dd3d30cb9e4ae/segno-1.6.6-py3-none-any.whl", hash = "sha256:28c7d081ed0cf935e0411293a465efd4d500704072cdb039778a2ab8736190c7", size = 76503, upload-time = "2025-03-12T22:12:48.106Z" },
++]
++
+ [[package]]
+ name = "sortedcontainers"
+ version = "2.4.0"
