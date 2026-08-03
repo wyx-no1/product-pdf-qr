@@ -78,7 +78,7 @@ class FakeGitHubData:
         run_id: int | None = None,
     ) -> CIRun:
         self.calls.append("successful_ci_run")
-        assert commit_sha == self.pr.head_sha
+        assert commit_sha == self.ci.commit_sha
         if run_id is not None:
             assert run_id == self.ci.run_id
         return self.ci

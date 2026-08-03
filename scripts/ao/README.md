@@ -6,27 +6,37 @@ packages only `src/` and the runtime Docker stage does not copy `scripts/`.
 
 ## Evidence workflow
 
-The blocking `evidence` job in `.github/workflows/ci.yml` depends on `quality`,
-`database`, and `container`. After all three code jobs succeed, it automatically
-runs:
+`.github/workflows/ci.yml` runs PR-controlled code with read-only permissions and
+non-persistent checkout credentials. After its `quality`, `database`, and
+`container` jobs succeed, the separate `.github/workflows/evidence-publish.yml`
+workflow is triggered by `workflow_run` and automatically runs:
 
 ```bash
 python -m scripts.ao evidence --repo . --pr 123 --ci-run-id 456
 ```
 
-The command fetches the PR branches, verifies that local HEAD is the exact GitHub PR
-head, requires all three code jobs in that run to be
-successful, writes exactly five files under `docs/evidence/pr-123/`, and creates the
-separate `docs: add PR123 review evidence` commit. It then pushes that commit to the
-same PR branch with a normal non-force push. A concurrent PR update makes the push
-fail and leaves the gate indeterminate instead of overwriting newer code.
+The privileged publisher is loaded from and checks out the default branch as
+`trusted/`. It loads Python only from that checkout. The candidate PR checkout is a
+separate `candidate/` data directory; no module, script, action, or hook from it is
+executed with the write token. Both checkouts use `persist-credentials: false`, and
+the write token exists only in the trusted publish step.
 
-Only the `evidence` job has `contents: write`; all other jobs retain read-only
-contents access. Its `GITHUB_TOKEN` push does not trigger another GitHub Actions
-workflow. That platform behavior is only the first loop defense: the generator
-independently inspects the current commit's changed paths and explicitly skips when
-every path is under `docs/evidence/**`. This keeps the workflow finite if the push
-credential is later changed to a PAT or deploy key.
+The command fetches the PR branches, requires the exact completed three-job CI run,
+writes exactly five files under `docs/evidence/pr-123/`, creates a separate
+`docs: add PR123 review evidence` commit, and pushes it normally. A concurrent PR
+update makes the push fail instead of overwriting newer code.
+
+Before publishing a successful `AO / evidence-snapshot` status on the new head, the
+trusted verifier proves that the commit changes exactly those five Evidence files,
+its parent and metadata bind the successful source CI, its three-dot patch matches
+the bound code diff, and the remote PR head is that exact commit. The status
+description names the parent SHA and source run. Failure posts a failure status;
+there is no unconditional green path.
+
+A `GITHUB_TOKEN` PR update may create an approval-required, zero-job run. That record
+is neither success nor test failure and remains indeterminate. The independent
+content-based skip keeps the publisher finite if that run is approved or the
+credential later changes to a PAT or deploy key.
 
 Generation uses `origin/<base>...<code-sha>` and excludes all of
 `docs/evidence/**`. Failure exits nonzero, records an `indeterminate` gate event in
@@ -85,5 +95,6 @@ uv run python -m scripts.ao stale-reclaim \
 ```
 
 Only registered Git worktrees inside the configured temporary root whose names
-match the known Advisor patterns are eligible. A live PID marker prevents an active
-modern workspace from being reported as stale.
+match the known Advisor patterns are eligible. The wrapper PID, Advisor PID, and
+Advisor process group are all checked; any live marker prevents an active modern
+workspace from being reported as stale.

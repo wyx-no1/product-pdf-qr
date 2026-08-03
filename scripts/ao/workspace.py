@@ -630,7 +630,23 @@ def _marker_timestamp(marker: dict[str, object] | None) -> float | None:
 def _marker_pid_active(marker: dict[str, object] | None) -> bool:
     if marker is None:
         return False
-    pid = marker.get("pid")
+    for key in ("pid", "advisor_pid"):
+        if _pid_active(marker.get(key)):
+            return True
+    process_group_id = marker.get("advisor_process_group_id")
+    if not isinstance(process_group_id, int) or process_group_id <= 0:
+        return False
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _pid_active(value: object) -> bool:
+    pid = value
     if not isinstance(pid, int) or pid <= 0:
         return False
     try:

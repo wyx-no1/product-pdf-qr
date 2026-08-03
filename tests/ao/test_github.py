@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from scripts.ao.git import CommandResult, CommandRunner
-from scripts.ao.github import GhGitHubData, GitHubError
+from scripts.ao.github import CIFailedError, CINotRunError, GhGitHubData, GitHubError
 
 SHA = "a" * 40
 
@@ -126,3 +126,53 @@ def test_gh_provider_accepts_current_run_after_required_jobs_complete() -> None:
     assert ci_run.status == "required-jobs-completed"
     assert ci_run.conclusion == "success"
     assert {job.name for job in ci_run.jobs} == {"quality", "database", "container"}
+
+
+def test_action_required_zero_job_run_is_indeterminate_not_failed_or_successful() -> None:
+    runner = StubRunner(
+        [
+            [
+                {
+                    "conclusion": "action_required",
+                    "createdAt": "2026-08-03T12:00:00Z",
+                    "databaseId": 99,
+                    "headSha": SHA,
+                    "status": "completed",
+                    "url": "https://example.invalid/runs/99",
+                }
+            ],
+            {"jobs": []},
+        ]
+    )
+
+    with pytest.raises(CINotRunError, match="not a success or a test failure"):
+        GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
+
+
+def test_executed_failed_run_is_distinct_from_not_run() -> None:
+    jobs = [
+        {
+            "conclusion": "failure" if name == "quality" else "success",
+            "name": name,
+            "url": f"https://example.invalid/jobs/{name}",
+        }
+        for name in ("quality", "database", "container")
+    ]
+    runner = StubRunner(
+        [
+            [
+                {
+                    "conclusion": "failure",
+                    "createdAt": "2026-08-03T12:00:00Z",
+                    "databaseId": 100,
+                    "headSha": SHA,
+                    "status": "completed",
+                    "url": "https://example.invalid/runs/100",
+                }
+            ],
+            {"jobs": jobs},
+        ]
+    )
+
+    with pytest.raises(CIFailedError, match="executed but failed"):
+        GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)

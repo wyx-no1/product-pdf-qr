@@ -46,6 +46,14 @@ class SnapshotResult:
 
 
 @dataclass(frozen=True)
+class VerifiedEvidenceHead:
+    evidence_commit_sha: str
+    code_commit_sha: str
+    ci_run_id: int
+    ci_url: str
+
+
+@dataclass(frozen=True)
 class ChangedFile:
     status: str
     path: str
@@ -378,6 +386,113 @@ def parse_evidence_binding(metadata_path: Path) -> EvidenceBinding:
     )
 
 
+def verify_evidence_head(
+    repository: GitRepository,
+    github: GitHubData,
+    pr_number: int,
+    evidence_sha: str,
+) -> VerifiedEvidenceHead:
+    """Prove a head is an Evidence-only child of an exactly bound successful CI run."""
+    _require_full_sha(evidence_sha, "Evidence commit SHA")
+    head_sha = repository.git("rev-parse", "HEAD").stdout.strip()
+    if head_sha != evidence_sha:
+        raise EvidenceError(
+            f"candidate HEAD {head_sha} does not equal Evidence commit {evidence_sha}"
+        )
+
+    relative = Path("docs") / "evidence" / f"pr-{pr_number}"
+    directory = repository.root / relative
+    if directory.is_symlink() or not directory.is_dir():
+        raise EvidenceError("Evidence directory must be a real directory inside the repository")
+    expected_paths = {str(relative / name) for name in EVIDENCE_FILES}
+    actual_paths = {
+        path
+        for path in repository.git(
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            evidence_sha,
+        ).stdout.splitlines()
+        if path
+    }
+    if actual_paths != expected_paths:
+        raise EvidenceError(
+            "Evidence head must change exactly the five files under "
+            f"{relative}; got {', '.join(sorted(actual_paths)) or 'no paths'}"
+        )
+    for name in EVIDENCE_FILES:
+        path = directory / name
+        if path.is_symlink() or not path.is_file():
+            raise EvidenceError(f"Evidence entry must be a regular file: {path}")
+
+    binding = parse_evidence_binding(directory / "metadata.md")
+    if binding.pr_number != pr_number:
+        raise EvidenceError(
+            f"Evidence metadata binds PR #{binding.pr_number}, not requested PR #{pr_number}"
+        )
+    parent_sha = repository.git("rev-parse", f"{evidence_sha}^").stdout.strip()
+    if parent_sha != binding.code_commit_sha:
+        raise EvidenceError(
+            f"Evidence parent {parent_sha} does not equal bound code commit "
+            f"{binding.code_commit_sha}"
+        )
+
+    pull_request = github.pull_request(pr_number)
+    if (
+        pull_request.number != binding.pr_number
+        or pull_request.source_branch != binding.source_branch
+        or pull_request.target_branch != binding.target_branch
+    ):
+        raise EvidenceError("current PR identity or branches do not match Evidence metadata")
+    if pull_request.head_sha != evidence_sha:
+        raise EvidenceError(
+            f"current PR head {pull_request.head_sha} does not equal Evidence commit {evidence_sha}"
+        )
+    repository.fetch("origin", pull_request.target_branch, pull_request.source_branch)
+    remote_head = repository.git(
+        "rev-parse",
+        f"origin/{pull_request.source_branch}",
+    ).stdout.strip()
+    if remote_head != evidence_sha:
+        raise EvidenceError(
+            f"remote PR branch is {remote_head}, not verified Evidence commit {evidence_sha}"
+        )
+
+    ci_run = github.successful_ci_run(binding.code_commit_sha, binding.ci_run_id)
+    if (
+        ci_run.run_id != binding.ci_run_id
+        or ci_run.commit_sha != binding.code_commit_sha
+        or ci_run.status != "completed"
+        or ci_run.conclusion != "success"
+    ):
+        raise EvidenceError("Evidence metadata does not bind an exact completed successful CI run")
+
+    expected_patch = repository.git(
+        "diff",
+        f"origin/{binding.target_branch}...{binding.code_commit_sha}",
+        "--",
+        ".",
+        EVIDENCE_EXCLUSION,
+    ).stdout
+    actual_patch = (directory / "diff.patch").read_text(encoding="utf-8")
+    if actual_patch != expected_patch:
+        raise EvidenceError("Evidence diff.patch does not match the bound three-dot code diff")
+
+    return VerifiedEvidenceHead(
+        evidence_commit_sha=evidence_sha,
+        code_commit_sha=binding.code_commit_sha,
+        ci_run_id=binding.ci_run_id,
+        ci_url=ci_run.url,
+    )
+
+
+def _require_full_sha(value: str, label: str) -> None:
+    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+        raise EvidenceError(f"{label} must be a full lowercase SHA")
+
+
 def _metadata_value(text: str, label: str) -> str:
     match = re.search(
         rf"^\|\s*{re.escape(label)}\s*\|\s*`?([^|`]+?)`?\s*\|$",
@@ -396,9 +511,14 @@ def _replace_evidence_directory(
 ) -> Path:
     if set(contents) != EVIDENCE_FILES:
         raise EvidenceError("Evidence Snapshot must contain exactly the five required files")
-    parent = repository_root / "docs" / "evidence"
+    docs = repository_root / "docs"
+    parent = docs / "evidence"
+    if docs.is_symlink() or parent.is_symlink():
+        raise EvidenceError("Evidence parent directories must not be symbolic links")
     parent.mkdir(parents=True, exist_ok=True)
     target = parent / f"pr-{pr_number}"
+    if target.is_symlink():
+        raise EvidenceError("Evidence target directory must not be a symbolic link")
     if target.exists():
         existing = {path.name for path in target.iterdir()}
         unexpected = existing - EVIDENCE_FILES

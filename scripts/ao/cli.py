@@ -11,7 +11,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Never
 
-from scripts.ao.evidence import EvidenceGenerator
+from scripts.ao.evidence import EvidenceGenerator, verify_evidence_head
 from scripts.ao.git import GitRepository
 from scripts.ao.github import GhGitHubData
 from scripts.ao.models import EvidenceSkip
@@ -42,6 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="current workflow run whose required code jobs have completed",
     )
+
+    verify_evidence = commands.add_parser(
+        "evidence-verify-head",
+        help="verify an Evidence-only PR head before publishing its status",
+    )
+    verify_evidence.add_argument("--repo", type=Path, required=True)
+    verify_evidence.add_argument("--pr", type=int, required=True)
+    verify_evidence.add_argument("--evidence-sha", required=True)
 
     advisor = commands.add_parser("advisor-run", help="run Advisor in a bound worktree")
     advisor.add_argument("--repo", type=Path, required=True)
@@ -80,6 +88,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments.command == "evidence":
             return _evidence(arguments)
+        if arguments.command == "evidence-verify-head":
+            return _evidence_verify_head(arguments)
         if arguments.command == "advisor-run":
             return _advisor_run(arguments)
         if arguments.command == "advisor-validate":
@@ -152,6 +162,19 @@ def _advisor_run(arguments: argparse.Namespace) -> int:
             arguments.record,
             timeout_seconds=arguments.timeout_seconds,
         )
+
+
+def _evidence_verify_head(arguments: argparse.Namespace) -> int:
+    repository = GitRepository(arguments.repo)
+    github = GhGitHubData(repository.remote_slug())
+    result = verify_evidence_head(
+        repository,
+        github,
+        arguments.pr,
+        arguments.evidence_sha,
+    )
+    _print_json(asdict(result))
+    return 0
 
 
 def _advisor_validate(arguments: argparse.Namespace) -> int:

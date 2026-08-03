@@ -336,6 +336,13 @@ def test_sigkill_releases_kernel_lock_but_leaves_detectable_worktree(
     finally:
         os.close(lock_fd)
 
+    active_stale = detect_stale_worktrees(
+        repository,
+        temp_root=temp_root,
+        older_than_seconds=0,
+    )
+    assert active_stale == ()
+
     os.killpg(child_pid, signal.SIGKILL)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:

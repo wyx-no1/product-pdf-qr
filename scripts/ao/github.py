@@ -25,6 +25,14 @@ class GitHubError(RuntimeError):
     """Required GitHub evidence is missing or not successful."""
 
 
+class CINotRunError(GitHubError):
+    """A CI record exists, but its required jobs did not execute."""
+
+
+class CIFailedError(GitHubError):
+    """CI executed and reached a non-successful conclusion."""
+
+
 class GhGitHubData:
     def __init__(
         self,
@@ -92,14 +100,6 @@ class GhGitHubData:
         if not matching:
             raise GitHubError(f"no {self.workflow} CI run found for code commit {commit_sha}")
         latest = max(matching, key=lambda run: str(run.get("createdAt") or ""))
-        status = _required_str(latest, "status")
-        conclusion = str(latest.get("conclusion") or "")
-        if status != "completed" or conclusion != "success":
-            raise GitHubError(
-                f"CI for code commit {commit_sha} is not successful "
-                f"(status={status}, conclusion={conclusion or 'none'}); "
-                "gate status is indeterminate and Evidence must not be generated"
-            )
         run_id = _required_int(latest, "databaseId")
         return self._validated_run(latest, run_id)
 
@@ -127,17 +127,6 @@ class GhGitHubData:
     ) -> CIRun:
         status = _required_str(data, "status")
         conclusion = str(data.get("conclusion") or "")
-        if not allow_active and (status != "completed" or conclusion != "success"):
-            raise GitHubError(
-                f"CI run {run_id} is not successful "
-                f"(status={status}, conclusion={conclusion or 'none'})"
-            )
-        if allow_active and status not in {"in_progress", "completed"}:
-            raise GitHubError(f"CI run {run_id} is not active or completed (status={status})")
-        if allow_active and status == "completed" and conclusion != "success":
-            raise GitHubError(
-                f"completed CI run {run_id} is not successful (conclusion={conclusion or 'none'})"
-            )
         jobs_value = data.get("jobs")
         if not isinstance(jobs_value, list):
             jobs_raw = self._json(
@@ -161,6 +150,29 @@ class GhGitHubData:
             )
             for job in jobs_data
         )
+        if conclusion == "action_required" or not jobs:
+            raise CINotRunError(
+                f"CI run {run_id} did not execute required jobs "
+                f"(status={status}, conclusion={conclusion or 'none'}, jobs={len(jobs)}); "
+                "this is not a success or a test failure, so gate status is indeterminate"
+            )
+        if not allow_active and status != "completed":
+            raise GitHubError(
+                f"CI run {run_id} is not completed "
+                f"(status={status}, conclusion={conclusion or 'none'}); "
+                "gate status is indeterminate"
+            )
+        if allow_active and status not in {"in_progress", "completed"}:
+            raise GitHubError(
+                f"CI run {run_id} is not active or completed "
+                f"(status={status}, conclusion={conclusion or 'none'}); "
+                "gate status is indeterminate"
+            )
+        if status == "completed" and conclusion != "success":
+            raise CIFailedError(
+                f"CI run {run_id} executed but failed "
+                f"(status={status}, conclusion={conclusion or 'none'})"
+            )
         required_jobs = tuple(job for job in jobs if job.name in REQUIRED_CI_JOBS)
         unsuccessful = [job.name for job in required_jobs if job.conclusion != "success"]
         missing = REQUIRED_CI_JOBS - {job.name for job in required_jobs}

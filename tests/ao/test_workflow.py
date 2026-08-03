@@ -2,21 +2,37 @@ from __future__ import annotations
 
 from pathlib import Path
 
+WORKFLOWS = Path(__file__).resolve().parents[2] / ".github/workflows"
 
-def test_evidence_job_blocks_after_three_code_jobs_with_minimal_write_permission() -> None:
-    workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text(
-        encoding="utf-8"
-    )
-    evidence = workflow.split("\n  evidence:\n", maxsplit=1)[1]
+
+def test_pr_ci_is_read_only_and_does_not_persist_checkout_credentials() -> None:
+    workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
 
     assert "permissions:\n  contents: read\n" in workflow
+    assert "contents: write" not in workflow
+    assert "GH_TOKEN" not in workflow
+    assert "python -m scripts.ao evidence" not in workflow
+    assert workflow.count("uses: actions/checkout@v4") == 3
+    assert workflow.count("persist-credentials: false") == 3
+
+
+def test_trusted_publisher_never_executes_candidate_code_and_verifies_before_green() -> None:
+    workflow = (WORKFLOWS / "evidence-publish.yml").read_text(encoding="utf-8")
+
+    assert "workflow_run:" in workflow
+    assert "github.event.workflow_run.conclusion == 'success'" in workflow
+    assert "permissions:\n  contents: read\n" in workflow
     assert workflow.count("contents: write") == 1
-    assert (
-        "permissions:\n      actions: read\n      contents: write\n      pull-requests: read"
-        in evidence
-    )
-    assert "needs:\n      - quality\n      - database\n      - container" in evidence
-    assert evidence.count("python -m scripts.ao evidence") == 1
-    assert '--ci-run-id "$RUN_ID"' in evidence
-    assert "GITHUB_TOKEN pushes do not start another workflow" in evidence
-    assert "continue-on-error" not in evidence
+    assert "statuses: write" in workflow
+    assert "ref: ${{ github.event.repository.default_branch }}" in workflow
+    assert "path: trusted" in workflow
+    assert "path: candidate" in workflow
+    assert workflow.count("persist-credentials: false") == 2
+    assert "working-directory: trusted" in workflow
+    assert "python -m scripts.ao evidence \\\n              --repo ../candidate" in workflow
+    assert "python -m scripts.ao evidence-verify-head" in workflow
+    verification = workflow.index("python -m scripts.ao evidence-verify-head")
+    green_status = workflow.index('post_status "$evidence_sha" success')
+    assert verification < green_status
+    assert "github.head_ref" not in workflow
+    assert "continue-on-error" not in workflow

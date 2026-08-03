@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from scripts.ao.evidence import (
     EvidenceGenerator,
     SnapshotResult,
     parse_evidence_binding,
+    verify_evidence_head,
 )
 from scripts.ao.git import GitRepository
 from scripts.ao.models import CIRun, EvidenceSkip
@@ -117,6 +119,58 @@ def test_snapshot_is_a_separate_evidence_only_commit(tmp_path: Path) -> None:
         git(fixture.repository, "log", "-1", "--format=%s").stdout.strip()
         == "docs: add PR41 review evidence"
     )
+
+
+def test_trusted_gate_verifies_evidence_only_parent_ci_and_patch(tmp_path: Path) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    github = github_for(fixture.code_sha)
+    repository = GitRepository(fixture.repository)
+    generator = EvidenceGenerator(
+        repository,
+        github,
+        log_path=tmp_path / "events.jsonl",
+        now=lambda: NOW,
+    )
+    snapshot = _snapshot(generator.generate(41))
+    assert snapshot.evidence_commit_sha is not None
+    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
+
+    verified = verify_evidence_head(
+        repository,
+        github,
+        41,
+        snapshot.evidence_commit_sha,
+    )
+
+    assert verified.evidence_commit_sha == snapshot.evidence_commit_sha
+    assert verified.code_commit_sha == fixture.code_sha
+    assert verified.ci_run_id == github.ci.run_id
+    assert verified.ci_url == github.ci.url
+
+
+def test_trusted_gate_refuses_tampered_evidence_patch(tmp_path: Path) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    github = github_for(fixture.code_sha)
+    repository = GitRepository(fixture.repository)
+    snapshot = _snapshot(
+        EvidenceGenerator(
+            repository,
+            github,
+            log_path=tmp_path / "events.jsonl",
+            now=lambda: NOW,
+        ).generate(41)
+    )
+    assert snapshot.evidence_commit_sha is not None
+    patch = fixture.repository / "docs/evidence/pr-41/diff.patch"
+    patch.write_text(patch.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
+    git(fixture.repository, "add", "docs/evidence/pr-41/diff.patch")
+    git(fixture.repository, "commit", "--amend", "--no-edit")
+    tampered_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
+    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
+    github.pr = replace(github.pr, head_sha=tampered_sha)
+
+    with pytest.raises(EvidenceError, match=r"diff\.patch does not match"):
+        verify_evidence_head(repository, github, 41, tampered_sha)
 
 
 def test_second_automatic_invocation_structurally_skips_evidence_only_head(
