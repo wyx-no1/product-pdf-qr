@@ -29,6 +29,15 @@ def test_trusted_publisher_never_executes_candidate_code_and_verifies_before_gre
     assert "path: candidate" in workflow
     assert workflow.count("persist-credentials: false") == 2
     assert "working-directory: trusted" in workflow
+    assert 'actions/runs/${RUN_ID}" --jq .path' in workflow
+    assert "python -m scripts.ao ci-verify-definition" in workflow
+    trust_check = workflow.index("python -m scripts.ao ci-verify-definition")
+    generation = workflow.index("python -m scripts.ao evidence \\")
+    assert trust_check < generation
+    assert "--trusted-repo ." in workflow
+    assert "--candidate-repo ../candidate" in workflow
+    assert '--candidate-sha "$CODE_SHA"' in workflow
+    assert '--source-run-path "$source_workflow_path"' in workflow
     assert "python -m scripts.ao evidence \\\n              --repo ../candidate" in workflow
     assert "python -m scripts.ao evidence-verify-head" in workflow
     verification = workflow.index("python -m scripts.ao evidence-verify-head")

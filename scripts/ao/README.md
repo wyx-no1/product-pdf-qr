@@ -21,6 +21,22 @@ separate `candidate/` data directory; no module, script, action, or hook from it
 executed with the write token. Both checkouts use `persist-credentials: false`, and
 the write token exists only in the trusted publish step.
 
+Before treating a successful source run as CI evidence, the publisher retrieves the
+run's workflow path from GitHub and requires exactly `.github/workflows/ci.yml`. It
+then compares that file's complete Git tree entry at the candidate code SHA with the
+entry in the checked-out default branch: mode `100644`, object type `blob`, and blob
+SHA must all match. Job names and the run conclusion are considered only after this
+definition check. A PR therefore cannot substitute same-named no-op jobs or add a
+different workflow named `CI`.
+
+Changes to `.github/workflows/ci.yml` intentionally fail this automatic check. That
+includes legitimate gate maintenance: a maintainer must review it as a trust-root
+change, generate Evidence manually, verify the latest-head checks, and use the
+repository's explicit human bootstrap/branch-protection override process. The
+publisher does not downgrade the mismatch, create a trusted success status, or
+silently adopt the candidate definition. After the reviewed workflow reaches the
+default branch, later PRs are compared against that new trusted blob.
+
 The command fetches the PR branches, requires the exact completed three-job CI run,
 writes exactly five files under `docs/evidence/pr-123/`, creates a separate
 `docs: add PR123 review evidence` commit, and pushes it normally. A concurrent PR

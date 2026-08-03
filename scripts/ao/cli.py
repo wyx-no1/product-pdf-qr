@@ -15,6 +15,7 @@ from scripts.ao.evidence import EvidenceGenerator, verify_evidence_head
 from scripts.ao.git import GitRepository
 from scripts.ao.github import GhGitHubData
 from scripts.ao.models import EvidenceSkip
+from scripts.ao.trust import verify_ci_workflow_definition
 from scripts.ao.workspace import (
     WorkspaceResolver,
     detect_stale_worktrees,
@@ -32,6 +33,15 @@ class AdvisorInterrupted(RuntimeError):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m scripts.ao")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    verify_ci = commands.add_parser(
+        "ci-verify-definition",
+        help="verify that source CI used the trusted default-branch workflow definition",
+    )
+    verify_ci.add_argument("--trusted-repo", type=Path, required=True)
+    verify_ci.add_argument("--candidate-repo", type=Path, required=True)
+    verify_ci.add_argument("--candidate-sha", required=True)
+    verify_ci.add_argument("--source-run-path", required=True)
 
     evidence = commands.add_parser("evidence", help="generate a bound Evidence Snapshot")
     evidence.add_argument("--repo", type=Path, required=True)
@@ -91,6 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
+        if arguments.command == "ci-verify-definition":
+            return _ci_verify_definition(arguments)
         if arguments.command == "evidence":
             return _evidence(arguments)
         if arguments.command == "evidence-verify-head":
@@ -147,6 +159,17 @@ def _evidence(arguments: argparse.Namespace) -> int:
             "result": "success",
         }
     )
+    return 0
+
+
+def _ci_verify_definition(arguments: argparse.Namespace) -> int:
+    result = verify_ci_workflow_definition(
+        GitRepository(arguments.trusted_repo),
+        GitRepository(arguments.candidate_repo),
+        arguments.candidate_sha,
+        arguments.source_run_path,
+    )
+    _print_json(asdict(result))
     return 0
 
 
