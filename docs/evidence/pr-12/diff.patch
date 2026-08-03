@@ -208,6 +208,53 @@ index 0000000..3c807b9
 +          post_status "$CODE_SHA" success \
 +            "Verified Evidence ${evidence_sha:0:12}; source CI $verified_run"
 +          trap - ERR
+diff --git a/Makefile b/Makefile
+index 1edb20d..f7ab7f4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -15,30 +15,34 @@ build-reproducible:
+ 
+ typecheck:
+ 	mkdir -p reports
+-	$(UV) run mypy
++	$(UV) run mypy --config-file pyproject.toml
+ 
+ lint:
+ 	mkdir -p reports
+-	$(UV) run ruff check --output-format junit --output-file reports/ruff.xml .
+-	$(UV) run ruff format --check .
++	$(UV) run ruff check --config pyproject.toml \
++		--output-format junit --output-file reports/ruff.xml .
++	$(UV) run ruff format --config pyproject.toml --check .
+ 
+ format:
+-	$(UV) run ruff check --fix .
+-	$(UV) run ruff format .
++	$(UV) run ruff check --config pyproject.toml --fix .
++	$(UV) run ruff format --config pyproject.toml .
+ 
+ test:
+ 	mkdir -p reports
+-	$(UV) run pytest --cov --cov-report=term-missing --cov-report=xml:reports/coverage.xml \
++	$(UV) run pytest -c pyproject.toml --cov --cov-config=pyproject.toml \
++		--cov-report=term-missing --cov-report=xml:reports/coverage.xml \
+ 		--junitxml=reports/pytest.xml
+ 
+ test-unit:
+ 	mkdir -p reports
+-	$(UV) run pytest -m "not integration" --cov --cov-report=term-missing \
++	$(UV) run pytest -c pyproject.toml -m "not integration" --cov \
++		--cov-config=pyproject.toml --cov-report=term-missing \
+ 		--cov-report=xml:reports/coverage-unit.xml --junitxml=reports/pytest-unit.xml
+ 
+ test-integration:
+ 	mkdir -p reports
+-	$(UV) run pytest -m integration --junitxml=reports/pytest-integration.xml
++	$(UV) run pytest -c pyproject.toml -m integration \
++		--junitxml=reports/pytest-integration.xml
+ 
+ migration-upgrade:
+ 	DATABASE_URL="$(MIGRATION_DATABASE_URL)" $(UV) run alembic upgrade head
 diff --git a/scripts/__init__.py b/scripts/__init__.py
 new file mode 100644
 index 0000000..2bd3938
@@ -217,10 +264,10 @@ index 0000000..2bd3938
 +"""Repository automation scripts."""
 diff --git a/scripts/ao/README.md b/scripts/ao/README.md
 new file mode 100644
-index 0000000..9ea2325
+index 0000000..501437e
 --- /dev/null
 +++ b/scripts/ao/README.md
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,187 @@
 +# AO Evidence and Advisor workspace tools
 +
 +These repository-local Python 3.12 tools implement the two parts of AO P0-1. They
@@ -256,8 +303,9 @@ index 0000000..9ea2325
 +- `Dockerfile`, `.dockerignore`, `.env.example`, Compose files, all `docker/**`
 +  helpers, `alembic.ini`, and the Alembic environment/template;
 +- absent-or-present markers for auto-discovered override files such as
-+  `.coveragerc`, `pytest.ini`, `mypy.ini`, `ruff.toml`, `setup.cfg`, `tox.ini`,
-+  `uv.toml`, Compose overrides, and Dockerfile-specific ignore files.
++  `.coveragerc`, `.coveragerc.toml`, all root pytest config names, `mypy.ini`,
++  `setup.cfg`, `tox.ini`, `uv.toml`, Compose overrides, and Dockerfile-specific
++  ignore files.
 +
 +Each entry records path, Git mode, object type, and blob SHA; additions, removals,
 +renames, permission changes, and content changes all alter the definition hash. The
@@ -265,6 +313,35 @@ index 0000000..9ea2325
 +The recursive roots cover executable test, AO, workflow/action, and Docker helper
 +code, including newly added files. Product source, migration revisions, and reviewed
 +documents remain the subjects being tested rather than the gate definition.
++Both CI Ruff invocations pass `--config pyproject.toml`, which makes that hashed root
++file the configuration for every analyzed path and disables Ruff's otherwise
++hierarchical closest-config discovery. A candidate `src/ruff.toml`,
++`migrations/.ruff.toml`, or nested `pyproject.toml` therefore cannot weaken lint or
++format without first changing the hashed Makefile command. As defense in depth, the
++definition builder also scans the entire Git tree—not a directory allowlist—for
++every `ruff.toml`, `.ruff.toml`, and `pyproject.toml` basename. An attempted nested
++override is therefore marked `requires-re-review` even though the pinned commands
++make it ineffective. Because this scan is basename-based over the complete candidate
++commit, a matching file added under any future directory is covered automatically.
++
++The other CI tools do not leave the same unbounded closest-config path:
++
++- pytest is invoked from the repository root, whose hashed `pyproject.toml` fixes
++  `testpaths = ["tests"]`; `-c pyproject.toml` pins that config, and its hierarchical
++  `conftest.py` loading is therefore bounded to the hashed root `conftest.py`
++  sentinel and recursive `tests/**` tree. All other pytest 9 root config names are
++  also represented by missing-file sentinels as defense in depth;
++- mypy selects one configuration from the invocation directory rather than one per
++  analyzed file; `--config-file pyproject.toml` pins it, and every supported root
++  candidate (`mypy.ini`, `.mypy.ini`, `pyproject.toml`, and `setup.cfg`) is hashed;
++- coverage likewise selects one root configuration (`.coveragerc`, `setup.cfg`,
++  `tox.ini`, `.coveragerc.toml`, or `pyproject.toml`) for this invocation;
++  `--cov-config=pyproject.toml` pins it and all alternatives are represented by
++  exact entries or missing-file sentinels;
++- `uv sync` runs at the repository root, so its project/config discovery is anchored
++  to the hashed root `pyproject.toml`, `uv.toml`, and `uv.lock`; it does not select a
++  separate project configuration for each installed source file.
++
 +Generation and both verification paths also require this recomputed default-branch
 +hash to equal the hash produced by the separate trusted checkout, preventing a
 +candidate-supplied hash or a changing fetch baseline from becoming the trust anchor.
@@ -2308,26 +2385,32 @@ index 0000000..5ea505d
 +    target_url: str
 diff --git a/scripts/ao/trust.py b/scripts/ao/trust.py
 new file mode 100644
-index 0000000..e09760b
+index 0000000..943c7cb
 --- /dev/null
 +++ b/scripts/ao/trust.py
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,201 @@
 +from __future__ import annotations
 +
 +import hashlib
 +from dataclasses import dataclass
++from pathlib import PurePosixPath
 +
 +from scripts.ao.git import GitRepository
 +
 +TRUSTED_CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 +
 +# These fixed files are direct gate commands/configuration or auto-discovered
-+# configuration that could override the checked-in policy when newly added.
++# configuration that could override the checked-in policy when newly added. Ruff
++# is explicitly pinned to the root pyproject.toml by these hashed Makefile commands,
++# so its otherwise hierarchical per-file configuration discovery is disabled.
 +TRUSTED_CI_EXACT_PATHS = (
 +    ".coveragerc",
++    ".coveragerc.toml",
 +    ".dockerignore",
 +    ".env.example",
 +    ".mypy.ini",
++    ".pytest.ini",
++    ".pytest.toml",
 +    ".python-version",
 +    ".ruff.toml",
 +    "Dockerfile",
@@ -2351,6 +2434,7 @@ index 0000000..e09760b
 +    "mypy.ini",
 +    "pyproject.toml",
 +    "pytest.ini",
++    "pytest.toml",
 +    "ruff.toml",
 +    "setup.cfg",
 +    "setup.py",
@@ -2368,6 +2452,17 @@ index 0000000..e09760b
 +    "docker",
 +    "scripts",
 +    "tests",
++)
++
++# Ruff is structurally pinned to the root pyproject.toml in Makefile. Scan the
++# complete Git tree as defense in depth so an attempted nested closest-config
++# override is still an explicit trust-root change, including in future directories.
++TRUSTED_CI_RECURSIVE_FILE_NAMES = frozenset(
++    {
++        ".ruff.toml",
++        "pyproject.toml",
++        "ruff.toml",
++    }
 +)
 +
 +
@@ -2433,14 +2528,26 @@ index 0000000..e09760b
 +    for path in TRUSTED_CI_EXACT_PATHS:
 +        entry = _single_tree_entry(repository, commit_sha, path)
 +        entries[path] = entry or "missing"
++    all_files = repository.git("ls-tree", "-r", commit_sha, "--", ".").stdout
++    for line in all_files.splitlines():
++        path, value = _parse_tree_entry(line)
++        if PurePosixPath(path).name in TRUSTED_CI_RECURSIVE_FILE_NAMES:
++            _record_entry(entries, path, value)
 +    for root in TRUSTED_CI_TREE_PATHS:
 +        output = repository.git("ls-tree", "-r", commit_sha, "--", root).stdout
 +        for line in output.splitlines():
 +            path, value = _parse_tree_entry(line)
-+            if path in entries:
-+                raise CIWorkflowTrustError(f"trusted CI definition path is duplicated: {path}")
-+            entries[path] = value
++            _record_entry(entries, path, value)
 +    return entries
++
++
++def _record_entry(entries: dict[str, str], path: str, value: str) -> None:
++    existing = entries.get(path)
++    if existing is not None and existing != value:
++        raise CIWorkflowTrustError(
++            f"trusted CI definition path has conflicting Git entries: {path}"
++        )
++    entries[path] = value
 +
 +
 +def _single_tree_entry(
@@ -4143,12 +4250,14 @@ index 0000000..5dbcc85
 +    assert attestation.target_url.endswith("/actions/runs/88")
 diff --git a/tests/ao/test_trust.py b/tests/ao/test_trust.py
 new file mode 100644
-index 0000000..8bdc73c
+index 0000000..e2a2e08
 --- /dev/null
 +++ b/tests/ao/test_trust.py
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,329 @@
 +from __future__ import annotations
 +
++import subprocess
++import sys
 +from pathlib import Path
 +
 +import pytest
@@ -4156,6 +4265,7 @@ index 0000000..8bdc73c
 +from scripts.ao.git import GitRepository
 +from scripts.ao.trust import (
 +    TRUSTED_CI_EXACT_PATHS,
++    TRUSTED_CI_RECURSIVE_FILE_NAMES,
 +    TRUSTED_CI_TREE_PATHS,
 +    TRUSTED_CI_WORKFLOW_PATH,
 +    CIDefinitionComparison,
@@ -4190,12 +4300,22 @@ index 0000000..8bdc73c
 +    )
 +    .replace("docker compose build", "true")
 +)
++PROJECT_ROOT = Path(__file__).resolve().parents[2]
 +
 +
-+def test_matching_gate_definition_is_trusted(tmp_path: Path) -> None:
++@pytest.mark.parametrize(
++    "path",
++    [
++        "src/product_pdf_qr/feature.py",
++        "docs/feature-notes.md",
++    ],
++)
++def test_non_gate_subject_change_remains_trusted(tmp_path: Path, path: str) -> None:
 +    trusted, candidate = _repositories(tmp_path)
-+    (candidate / "feature.txt").write_text("candidate code\n", encoding="utf-8")
-+    candidate_sha = commit_paths(candidate, "feat: candidate code", ["feature.txt"])
++    target = candidate / path
++    target.parent.mkdir(parents=True, exist_ok=True)
++    target.write_text("candidate subject change\n", encoding="utf-8")
++    candidate_sha = commit_paths(candidate, "feat: candidate subject change", [path])
 +
 +    comparison = _compare(trusted, candidate, candidate_sha)
 +
@@ -4246,21 +4366,130 @@ index 0000000..8bdc73c
 +    assert comparison.differing_paths == ()
 +
 +
-+def test_new_auto_discovered_gate_config_requires_re_review(tmp_path: Path) -> None:
++def test_restored_nested_ruff_configuration_becomes_trusted_again(tmp_path: Path) -> None:
 +    trusted, candidate = _repositories(tmp_path)
-+    config = candidate / ".coveragerc"
-+    config.write_text("[report]\nfail_under = 0\n", encoding="utf-8")
++    nested_config = candidate / "src/ruff.toml"
++    nested_config.parent.mkdir(parents=True)
++    nested_config.write_text('[lint]\nignore = ["F401"]\n', encoding="utf-8")
++    commit_paths(candidate, "ci: add nested Ruff override", ["src/ruff.toml"])
++    nested_config.unlink()
++    restored_sha = commit_paths(candidate, "ci: remove nested Ruff override", ["src/ruff.toml"])
++
++    comparison = _compare(trusted, candidate, restored_sha)
++
++    assert comparison.status == "trusted"
++    assert comparison.differing_paths == ()
++
++
++@pytest.mark.parametrize(
++    ("path", "content"),
++    [
++        (".coveragerc", "[report]\nfail_under = 0\n"),
++        (".coveragerc.toml", "[tool.coverage.report]\nfail_under = 0\n"),
++        ("pytest.toml", '[pytest]\naddopts = ["--ignore=tests"]\n'),
++    ],
++)
++def test_new_auto_discovered_gate_config_requires_re_review(
++    tmp_path: Path,
++    path: str,
++    content: str,
++) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    config = candidate / path
++    config.write_text(content, encoding="utf-8")
 +    candidate_sha = commit_paths(
 +        candidate,
-+        "ci: add coverage override",
-+        [".coveragerc"],
++        "ci: add tool override",
++        [path],
 +    )
 +
 +    comparison = _compare(trusted, candidate, candidate_sha)
 +
 +    assert comparison.status == "requires-re-review"
 +    assert comparison.trusted_definition_hash != comparison.candidate_definition_hash
-+    assert comparison.differing_paths == (".coveragerc",)
++    assert comparison.differing_paths == (path,)
++
++
++def test_nested_ruff_config_cannot_weaken_pinned_root_config(tmp_path: Path) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    nested_config = candidate / "src/ruff.toml"
++    nested_config.parent.mkdir(parents=True)
++    nested_config.write_text(
++        '[lint]\nignore = ["F401"]\n[format]\nquote-style = "single"\n',
++        encoding="utf-8",
++    )
++    bad_source = candidate / "src/bad.py"
++    bad_source.write_text("import os\n\nvalue = 'nested single'\n", encoding="utf-8")
++    candidate_sha = commit_paths(
++        candidate,
++        "test: simulate nested Ruff bypass",
++        ["src/ruff.toml", "src/bad.py"],
++    )
++
++    comparison = _compare(trusted, candidate, candidate_sha)
++    assert comparison.status == "requires-re-review"
++    assert comparison.differing_paths == ("src/ruff.toml",)
++    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
++    assert makefile.count("ruff check --config pyproject.toml") == 2
++    assert makefile.count("ruff format --config pyproject.toml") == 2
++
++    ruff = str(Path(sys.executable).with_name("ruff"))
++    discovered_lint = subprocess.run(
++        [ruff, "check", "src/bad.py"],
++        cwd=candidate,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    discovered_format = subprocess.run(
++        [ruff, "format", "--check", "src/bad.py"],
++        cwd=candidate,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    pinned_lint = subprocess.run(
++        [ruff, "check", "--config", "pyproject.toml", "src/bad.py"],
++        cwd=candidate,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    pinned_format = subprocess.run(
++        [ruff, "format", "--config", "pyproject.toml", "--check", "src/bad.py"],
++        cwd=candidate,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++
++    assert discovered_lint.returncode == 0
++    assert discovered_format.returncode == 0
++    assert pinned_lint.returncode == 1
++    assert "F401" in pinned_lint.stdout
++    assert pinned_format.returncode == 1
++
++
++def test_modified_root_ruff_configuration_requires_re_review(tmp_path: Path) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    root_config = candidate / "pyproject.toml"
++    root_config.write_text(
++        root_config.read_text(encoding="utf-8").replace(
++            'select = ["F"]',
++            'ignore = ["F401"]',
++        ),
++        encoding="utf-8",
++    )
++    candidate_sha = commit_paths(
++        candidate,
++        "ci: weaken root Ruff policy",
++        ["pyproject.toml"],
++    )
++
++    comparison = _compare(trusted, candidate, candidate_sha)
++
++    assert comparison.status == "requires-re-review"
++    assert comparison.differing_paths == ("pyproject.toml",)
 +
 +
 +def test_differently_named_candidate_workflow_cannot_spoof_ci_run(tmp_path: Path) -> None:
@@ -4288,6 +4517,10 @@ index 0000000..8bdc73c
 +        "alembic.ini",
 +        "migrations/env.py",
 +        "migrations/script.py.mako",
++        ".coveragerc.toml",
++        ".pytest.ini",
++        ".pytest.toml",
++        "pytest.toml",
 +    }.issubset(TRUSTED_CI_EXACT_PATHS)
 +    assert {
 +        ".github",
@@ -4295,6 +4528,15 @@ index 0000000..8bdc73c
 +        "scripts",
 +        "tests",
 +    }.issubset(TRUSTED_CI_TREE_PATHS)
++    assert TRUSTED_CI_RECURSIVE_FILE_NAMES == {
++        ".ruff.toml",
++        "pyproject.toml",
++        "ruff.toml",
++    }
++    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
++    assert "mypy --config-file pyproject.toml" in makefile
++    assert makefile.count("pytest -c pyproject.toml") == 3
++    assert makefile.count("--cov-config=pyproject.toml") == 2
 +
 +
 +def _compare(
@@ -4318,8 +4560,17 @@ index 0000000..8bdc73c
 +    git(trusted, "config", "user.email", "ao@example.invalid")
 +    files = {
 +        TRUSTED_CI_WORKFLOW_PATH: TRUSTED_CI,
-+        "Makefile": "test-unit:\n\tpytest\n",
-+        "pyproject.toml": "[tool.coverage.report]\nfail_under = 90\n[tool.mypy]\nstrict = true\n",
++        "Makefile": (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8"),
++        "pyproject.toml": (
++            "[tool.coverage.report]\n"
++            "fail_under = 90\n"
++            "[tool.mypy]\n"
++            "strict = true\n"
++            "[tool.ruff.lint]\n"
++            'select = ["F"]\n'
++            "[tool.ruff.format]\n"
++            'quote-style = "double"\n'
++        ),
 +        "uv.lock": "version = 1\n",
 +        "tests/test_gate.py": "def test_gate():\n    assert True\n",
 +    }
