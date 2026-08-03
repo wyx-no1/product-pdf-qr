@@ -1,48 +1,163 @@
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 9f2358e..cdc3b5e 100644
+index 9f2358e..a881d01 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
-@@ -97,3 +97,40 @@ jobs:
-         run: docker compose logs
-       - if: always()
-         run: docker compose down --volumes
+@@ -14,6 +14,8 @@ jobs:
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
+       - uses: astral-sh/setup-uv@v6
+         with:
+           version: "0.12.1"
+@@ -37,6 +39,8 @@ jobs:
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
+       - uses: astral-sh/setup-uv@v6
+         with:
+           version: "0.12.1"
+@@ -66,6 +70,8 @@ jobs:
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
+       - run: cp .env.example .env
+       - run: docker compose build --pull app migrate
+       - name: Verify repeated clean-volume startup ordering
+diff --git a/.github/workflows/evidence-publish.yml b/.github/workflows/evidence-publish.yml
+new file mode 100644
+index 0000000..7d6cacf
+--- /dev/null
++++ b/.github/workflows/evidence-publish.yml
+@@ -0,0 +1,123 @@
++name: Evidence Publish
 +
-+  evidence:
-+    if: github.event_name == 'pull_request'
-+    needs:
-+      - quality
-+      - database
-+      - container
++on:
++  workflow_run:
++    workflows:
++      - CI
++    types:
++      - completed
++
++permissions:
++  contents: read
++
++jobs:
++  publish:
++    if: >-
++      github.event.workflow_run.event == 'pull_request' &&
++      github.event.workflow_run.conclusion == 'success' &&
++      github.event.workflow_run.head_repository.full_name == github.repository &&
++      github.event.workflow_run.pull_requests[0].number > 0
 +    runs-on: ubuntu-latest
++    concurrency:
++      group: evidence-${{ github.event.workflow_run.head_branch }}
++      cancel-in-progress: false
 +    permissions:
 +      actions: read
 +      contents: write
 +      pull-requests: read
++      statuses: write
 +    steps:
-+      - uses: actions/checkout@v4
++      # workflow_run loads this workflow from the default branch. Executable AO
++      # code is checked out from that trusted branch, never from the PR.
++      - name: Check out trusted publisher code
++        uses: actions/checkout@v4
++        with:
++          ref: ${{ github.event.repository.default_branch }}
++          path: trusted
++          persist-credentials: false
++
++      # This checkout is untrusted data. No module, script, action, or hook from
++      # it is executed while the write token is available.
++      - name: Check out candidate data
++        uses: actions/checkout@v4
 +        with:
 +          fetch-depth: 0
-+          ref: ${{ github.head_ref }}
++          ref: ${{ github.event.workflow_run.head_branch }}
++          path: candidate
++          persist-credentials: false
++
 +      - uses: actions/setup-python@v5
 +        with:
 +          python-version: "3.12"
-+      - name: Configure Evidence commit identity
-+        run: |
-+          git config user.name "github-actions[bot]"
-+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-+      - name: Generate and push bound Evidence Snapshot
++
++      - name: Publish and attest Evidence Snapshot
++        working-directory: trusted
 +        env:
++          CODE_SHA: ${{ github.event.workflow_run.head_sha }}
 +          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-+          PR_NUMBER: ${{ github.event.pull_request.number }}
-+          RUN_ID: ${{ github.run_id }}
++          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
++          RUN_ID: ${{ github.event.workflow_run.id }}
++          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 +        run: |
-+          # GITHUB_TOKEN pushes do not start another workflow. The generator also
-+          # structurally skips a HEAD that changes only docs/evidence/**, so a
-+          # future PAT or deploy-key migration cannot create a generation loop.
-+          python -m scripts.ao evidence \
-+            --repo . \
-+            --pr "$PR_NUMBER" \
-+            --ci-run-id "$RUN_ID"
++          set -euo pipefail
++          status_context="AO / evidence-snapshot"
++
++          post_status() {
++            gh api \
++              --method POST \
++              "repos/${GITHUB_REPOSITORY}/statuses/$1" \
++              -f state="$2" \
++              -f context="$status_context" \
++              -f description="$3" \
++              -f target_url="$RUN_URL" >/dev/null
++          }
++
++          record_failure() {
++            current_sha="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
++            current_sha="${current_sha:-$CODE_SHA}"
++            post_status "$current_sha" failure "Evidence publish/verification failed; source CI $RUN_ID"
++            if [[ "$current_sha" != "$CODE_SHA" ]]; then
++              post_status "$CODE_SHA" failure "Evidence child verification failed; source CI $RUN_ID"
++            fi
++          }
++          trap record_failure ERR
++
++          post_status "$CODE_SHA" pending "Publishing Evidence from successful source CI $RUN_ID"
++          gh auth setup-git
++          git -C ../candidate config user.name "github-actions[bot]"
++          git -C ../candidate config user.email "41898282+github-actions[bot]@users.noreply.github.com"
++
++          result="$(
++            python -m scripts.ao evidence \
++              --repo ../candidate \
++              --pr "$PR_NUMBER" \
++              --ci-run-id "$RUN_ID"
++          )"
++          evidence_sha="$(
++            python -c 'import json,sys; data=json.load(sys.stdin); print(data.get("evidence_commit_sha") or data.get("head_sha") or "")' \
++              <<<"$result"
++          )"
++          test -n "$evidence_sha"
++
++          verification="$(
++            python -m scripts.ao evidence-verify-head \
++              --repo ../candidate \
++              --pr "$PR_NUMBER" \
++              --evidence-sha "$evidence_sha"
++          )"
++          verified_parent="$(
++            python -c 'import json,sys; print(json.load(sys.stdin)["code_commit_sha"])' \
++              <<<"$verification"
++          )"
++          verified_run="$(
++            python -c 'import json,sys; print(json.load(sys.stdin)["ci_run_id"])' \
++              <<<"$verification"
++          )"
++
++          # Never copy a parent result blindly. The trusted verifier above proves
++          # the child is Evidence-only and bound to this successful parent run.
++          post_status "$evidence_sha" success \
++            "Evidence-only child of ${verified_parent:0:12}; source CI $verified_run"
++          post_status "$CODE_SHA" success \
++            "Verified Evidence ${evidence_sha:0:12}; source CI $verified_run"
++          trap - ERR
 diff --git a/scripts/__init__.py b/scripts/__init__.py
 new file mode 100644
 index 0000000..2bd3938
@@ -52,10 +167,10 @@ index 0000000..2bd3938
 +"""Repository automation scripts."""
 diff --git a/scripts/ao/README.md b/scripts/ao/README.md
 new file mode 100644
-index 0000000..e308941
+index 0000000..797ca85
 --- /dev/null
 +++ b/scripts/ao/README.md
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,100 @@
 +# AO Evidence and Advisor workspace tools
 +
 +These repository-local Python 3.12 tools implement the two parts of AO P0-1. They
@@ -64,27 +179,37 @@ index 0000000..e308941
 +
 +## Evidence workflow
 +
-+The blocking `evidence` job in `.github/workflows/ci.yml` depends on `quality`,
-+`database`, and `container`. After all three code jobs succeed, it automatically
-+runs:
++`.github/workflows/ci.yml` runs PR-controlled code with read-only permissions and
++non-persistent checkout credentials. After its `quality`, `database`, and
++`container` jobs succeed, the separate `.github/workflows/evidence-publish.yml`
++workflow is triggered by `workflow_run` and automatically runs:
 +
 +```bash
 +python -m scripts.ao evidence --repo . --pr 123 --ci-run-id 456
 +```
 +
-+The command fetches the PR branches, verifies that local HEAD is the exact GitHub PR
-+head, requires all three code jobs in that run to be
-+successful, writes exactly five files under `docs/evidence/pr-123/`, and creates the
-+separate `docs: add PR123 review evidence` commit. It then pushes that commit to the
-+same PR branch with a normal non-force push. A concurrent PR update makes the push
-+fail and leaves the gate indeterminate instead of overwriting newer code.
++The privileged publisher is loaded from and checks out the default branch as
++`trusted/`. It loads Python only from that checkout. The candidate PR checkout is a
++separate `candidate/` data directory; no module, script, action, or hook from it is
++executed with the write token. Both checkouts use `persist-credentials: false`, and
++the write token exists only in the trusted publish step.
 +
-+Only the `evidence` job has `contents: write`; all other jobs retain read-only
-+contents access. Its `GITHUB_TOKEN` push does not trigger another GitHub Actions
-+workflow. That platform behavior is only the first loop defense: the generator
-+independently inspects the current commit's changed paths and explicitly skips when
-+every path is under `docs/evidence/**`. This keeps the workflow finite if the push
-+credential is later changed to a PAT or deploy key.
++The command fetches the PR branches, requires the exact completed three-job CI run,
++writes exactly five files under `docs/evidence/pr-123/`, creates a separate
++`docs: add PR123 review evidence` commit, and pushes it normally. A concurrent PR
++update makes the push fail instead of overwriting newer code.
++
++Before publishing a successful `AO / evidence-snapshot` status on the new head, the
++trusted verifier proves that the commit changes exactly those five Evidence files,
++its parent and metadata bind the successful source CI, its three-dot patch matches
++the bound code diff, and the remote PR head is that exact commit. The status
++description names the parent SHA and source run. Failure posts a failure status;
++there is no unconditional green path.
++
++A `GITHUB_TOKEN` PR update may create an approval-required, zero-job run. That record
++is neither success nor test failure and remains indeterminate. The independent
++content-based skip keeps the publisher finite if that run is approved or the
++credential later changes to a PAT or deploy key.
 +
 +Generation uses `origin/<base>...<code-sha>` and excludes all of
 +`docs/evidence/**`. Failure exits nonzero, records an `indeterminate` gate event in
@@ -143,8 +268,9 @@ index 0000000..e308941
 +```
 +
 +Only registered Git worktrees inside the configured temporary root whose names
-+match the known Advisor patterns are eligible. A live PID marker prevents an active
-+modern workspace from being reported as stale.
++match the known Advisor patterns are eligible. The wrapper PID, Advisor PID, and
++Advisor process group are all checked; any live marker prevents an active modern
++workspace from being reported as stale.
 diff --git a/scripts/ao/__init__.py b/scripts/ao/__init__.py
 new file mode 100644
 index 0000000..7367ef7
@@ -163,10 +289,10 @@ index 0000000..4443fdd
 +raise SystemExit(main())
 diff --git a/scripts/ao/cli.py b/scripts/ao/cli.py
 new file mode 100644
-index 0000000..12c1d19
+index 0000000..34fde5a
 --- /dev/null
 +++ b/scripts/ao/cli.py
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,261 @@
 +from __future__ import annotations
 +
 +import argparse
@@ -180,7 +306,7 @@ index 0000000..12c1d19
 +from types import FrameType
 +from typing import Never
 +
-+from scripts.ao.evidence import EvidenceGenerator
++from scripts.ao.evidence import EvidenceGenerator, verify_evidence_head
 +from scripts.ao.git import GitRepository
 +from scripts.ao.github import GhGitHubData
 +from scripts.ao.models import EvidenceSkip
@@ -211,6 +337,14 @@ index 0000000..12c1d19
 +        type=int,
 +        help="current workflow run whose required code jobs have completed",
 +    )
++
++    verify_evidence = commands.add_parser(
++        "evidence-verify-head",
++        help="verify an Evidence-only PR head before publishing its status",
++    )
++    verify_evidence.add_argument("--repo", type=Path, required=True)
++    verify_evidence.add_argument("--pr", type=int, required=True)
++    verify_evidence.add_argument("--evidence-sha", required=True)
 +
 +    advisor = commands.add_parser("advisor-run", help="run Advisor in a bound worktree")
 +    advisor.add_argument("--repo", type=Path, required=True)
@@ -249,6 +383,8 @@ index 0000000..12c1d19
 +    try:
 +        if arguments.command == "evidence":
 +            return _evidence(arguments)
++        if arguments.command == "evidence-verify-head":
++            return _evidence_verify_head(arguments)
 +        if arguments.command == "advisor-run":
 +            return _advisor_run(arguments)
 +        if arguments.command == "advisor-validate":
@@ -321,6 +457,19 @@ index 0000000..12c1d19
 +            arguments.record,
 +            timeout_seconds=arguments.timeout_seconds,
 +        )
++
++
++def _evidence_verify_head(arguments: argparse.Namespace) -> int:
++    repository = GitRepository(arguments.repo)
++    github = GhGitHubData(repository.remote_slug())
++    result = verify_evidence_head(
++        repository,
++        github,
++        arguments.pr,
++        arguments.evidence_sha,
++    )
++    _print_json(asdict(result))
++    return 0
 +
 +
 +def _advisor_validate(arguments: argparse.Namespace) -> int:
@@ -407,10 +556,10 @@ index 0000000..12c1d19
 +            signal.signal(signum, handler)
 diff --git a/scripts/ao/evidence.py b/scripts/ao/evidence.py
 new file mode 100644
-index 0000000..218c4fd
+index 0000000..eadfe89
 --- /dev/null
 +++ b/scripts/ao/evidence.py
-@@ -0,0 +1,710 @@
+@@ -0,0 +1,830 @@
 +from __future__ import annotations
 +
 +import re
@@ -456,6 +605,14 @@ index 0000000..218c4fd
 +    code_commit_sha: str
 +    ci_run_id: int
 +    evidence_commit_sha: str | None
++
++
++@dataclass(frozen=True)
++class VerifiedEvidenceHead:
++    evidence_commit_sha: str
++    code_commit_sha: str
++    ci_run_id: int
++    ci_url: str
 +
 +
 +@dataclass(frozen=True)
@@ -791,6 +948,113 @@ index 0000000..218c4fd
 +    )
 +
 +
++def verify_evidence_head(
++    repository: GitRepository,
++    github: GitHubData,
++    pr_number: int,
++    evidence_sha: str,
++) -> VerifiedEvidenceHead:
++    """Prove a head is an Evidence-only child of an exactly bound successful CI run."""
++    _require_full_sha(evidence_sha, "Evidence commit SHA")
++    head_sha = repository.git("rev-parse", "HEAD").stdout.strip()
++    if head_sha != evidence_sha:
++        raise EvidenceError(
++            f"candidate HEAD {head_sha} does not equal Evidence commit {evidence_sha}"
++        )
++
++    relative = Path("docs") / "evidence" / f"pr-{pr_number}"
++    directory = repository.root / relative
++    if directory.is_symlink() or not directory.is_dir():
++        raise EvidenceError("Evidence directory must be a real directory inside the repository")
++    expected_paths = {str(relative / name) for name in EVIDENCE_FILES}
++    actual_paths = {
++        path
++        for path in repository.git(
++            "diff-tree",
++            "--root",
++            "--no-commit-id",
++            "--name-only",
++            "-r",
++            evidence_sha,
++        ).stdout.splitlines()
++        if path
++    }
++    if actual_paths != expected_paths:
++        raise EvidenceError(
++            "Evidence head must change exactly the five files under "
++            f"{relative}; got {', '.join(sorted(actual_paths)) or 'no paths'}"
++        )
++    for name in EVIDENCE_FILES:
++        path = directory / name
++        if path.is_symlink() or not path.is_file():
++            raise EvidenceError(f"Evidence entry must be a regular file: {path}")
++
++    binding = parse_evidence_binding(directory / "metadata.md")
++    if binding.pr_number != pr_number:
++        raise EvidenceError(
++            f"Evidence metadata binds PR #{binding.pr_number}, not requested PR #{pr_number}"
++        )
++    parent_sha = repository.git("rev-parse", f"{evidence_sha}^").stdout.strip()
++    if parent_sha != binding.code_commit_sha:
++        raise EvidenceError(
++            f"Evidence parent {parent_sha} does not equal bound code commit "
++            f"{binding.code_commit_sha}"
++        )
++
++    pull_request = github.pull_request(pr_number)
++    if (
++        pull_request.number != binding.pr_number
++        or pull_request.source_branch != binding.source_branch
++        or pull_request.target_branch != binding.target_branch
++    ):
++        raise EvidenceError("current PR identity or branches do not match Evidence metadata")
++    if pull_request.head_sha != evidence_sha:
++        raise EvidenceError(
++            f"current PR head {pull_request.head_sha} does not equal Evidence commit {evidence_sha}"
++        )
++    repository.fetch("origin", pull_request.target_branch, pull_request.source_branch)
++    remote_head = repository.git(
++        "rev-parse",
++        f"origin/{pull_request.source_branch}",
++    ).stdout.strip()
++    if remote_head != evidence_sha:
++        raise EvidenceError(
++            f"remote PR branch is {remote_head}, not verified Evidence commit {evidence_sha}"
++        )
++
++    ci_run = github.successful_ci_run(binding.code_commit_sha, binding.ci_run_id)
++    if (
++        ci_run.run_id != binding.ci_run_id
++        or ci_run.commit_sha != binding.code_commit_sha
++        or ci_run.status != "completed"
++        or ci_run.conclusion != "success"
++    ):
++        raise EvidenceError("Evidence metadata does not bind an exact completed successful CI run")
++
++    expected_patch = repository.git(
++        "diff",
++        f"origin/{binding.target_branch}...{binding.code_commit_sha}",
++        "--",
++        ".",
++        EVIDENCE_EXCLUSION,
++    ).stdout
++    actual_patch = (directory / "diff.patch").read_text(encoding="utf-8")
++    if actual_patch != expected_patch:
++        raise EvidenceError("Evidence diff.patch does not match the bound three-dot code diff")
++
++    return VerifiedEvidenceHead(
++        evidence_commit_sha=evidence_sha,
++        code_commit_sha=binding.code_commit_sha,
++        ci_run_id=binding.ci_run_id,
++        ci_url=ci_run.url,
++    )
++
++
++def _require_full_sha(value: str, label: str) -> None:
++    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
++        raise EvidenceError(f"{label} must be a full lowercase SHA")
++
++
 +def _metadata_value(text: str, label: str) -> str:
 +    match = re.search(
 +        rf"^\|\s*{re.escape(label)}\s*\|\s*`?([^|`]+?)`?\s*\|$",
@@ -809,9 +1073,14 @@ index 0000000..218c4fd
 +) -> Path:
 +    if set(contents) != EVIDENCE_FILES:
 +        raise EvidenceError("Evidence Snapshot must contain exactly the five required files")
-+    parent = repository_root / "docs" / "evidence"
++    docs = repository_root / "docs"
++    parent = docs / "evidence"
++    if docs.is_symlink() or parent.is_symlink():
++        raise EvidenceError("Evidence parent directories must not be symbolic links")
 +    parent.mkdir(parents=True, exist_ok=True)
 +    target = parent / f"pr-{pr_number}"
++    if target.is_symlink():
++        raise EvidenceError("Evidence target directory must not be a symbolic link")
 +    if target.exists():
 +        existing = {path.name for path in target.iterdir()}
 +        unexpected = existing - EVIDENCE_FILES
@@ -1220,10 +1489,10 @@ index 0000000..d9f96c6
 +        stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 diff --git a/scripts/ao/github.py b/scripts/ao/github.py
 new file mode 100644
-index 0000000..3364e86
+index 0000000..d41155e
 --- /dev/null
 +++ b/scripts/ao/github.py
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,237 @@
 +from __future__ import annotations
 +
 +import json
@@ -1249,6 +1518,14 @@ index 0000000..3364e86
 +
 +class GitHubError(RuntimeError):
 +    """Required GitHub evidence is missing or not successful."""
++
++
++class CINotRunError(GitHubError):
++    """A CI record exists, but its required jobs did not execute."""
++
++
++class CIFailedError(GitHubError):
++    """CI executed and reached a non-successful conclusion."""
 +
 +
 +class GhGitHubData:
@@ -1318,14 +1595,6 @@ index 0000000..3364e86
 +        if not matching:
 +            raise GitHubError(f"no {self.workflow} CI run found for code commit {commit_sha}")
 +        latest = max(matching, key=lambda run: str(run.get("createdAt") or ""))
-+        status = _required_str(latest, "status")
-+        conclusion = str(latest.get("conclusion") or "")
-+        if status != "completed" or conclusion != "success":
-+            raise GitHubError(
-+                f"CI for code commit {commit_sha} is not successful "
-+                f"(status={status}, conclusion={conclusion or 'none'}); "
-+                "gate status is indeterminate and Evidence must not be generated"
-+            )
 +        run_id = _required_int(latest, "databaseId")
 +        return self._validated_run(latest, run_id)
 +
@@ -1353,17 +1622,6 @@ index 0000000..3364e86
 +    ) -> CIRun:
 +        status = _required_str(data, "status")
 +        conclusion = str(data.get("conclusion") or "")
-+        if not allow_active and (status != "completed" or conclusion != "success"):
-+            raise GitHubError(
-+                f"CI run {run_id} is not successful "
-+                f"(status={status}, conclusion={conclusion or 'none'})"
-+            )
-+        if allow_active and status not in {"in_progress", "completed"}:
-+            raise GitHubError(f"CI run {run_id} is not active or completed (status={status})")
-+        if allow_active and status == "completed" and conclusion != "success":
-+            raise GitHubError(
-+                f"completed CI run {run_id} is not successful (conclusion={conclusion or 'none'})"
-+            )
 +        jobs_value = data.get("jobs")
 +        if not isinstance(jobs_value, list):
 +            jobs_raw = self._json(
@@ -1387,6 +1645,29 @@ index 0000000..3364e86
 +            )
 +            for job in jobs_data
 +        )
++        if conclusion == "action_required" or not jobs:
++            raise CINotRunError(
++                f"CI run {run_id} did not execute required jobs "
++                f"(status={status}, conclusion={conclusion or 'none'}, jobs={len(jobs)}); "
++                "this is not a success or a test failure, so gate status is indeterminate"
++            )
++        if not allow_active and status != "completed":
++            raise GitHubError(
++                f"CI run {run_id} is not completed "
++                f"(status={status}, conclusion={conclusion or 'none'}); "
++                "gate status is indeterminate"
++            )
++        if allow_active and status not in {"in_progress", "completed"}:
++            raise GitHubError(
++                f"CI run {run_id} is not active or completed "
++                f"(status={status}, conclusion={conclusion or 'none'}); "
++                "gate status is indeterminate"
++            )
++        if status == "completed" and conclusion != "success":
++            raise CIFailedError(
++                f"CI run {run_id} executed but failed "
++                f"(status={status}, conclusion={conclusion or 'none'})"
++            )
 +        required_jobs = tuple(job for job in jobs if job.name in REQUIRED_CI_JOBS)
 +        unsuccessful = [job.name for job in required_jobs if job.conclusion != "success"]
 +        missing = REQUIRED_CI_JOBS - {job.name for job in required_jobs}
@@ -1512,10 +1793,10 @@ index 0000000..15f8ea4
 +    reason: str
 diff --git a/scripts/ao/workspace.py b/scripts/ao/workspace.py
 new file mode 100644
-index 0000000..3a8358f
+index 0000000..f581512
 --- /dev/null
 +++ b/scripts/ao/workspace.py
-@@ -0,0 +1,686 @@
+@@ -0,0 +1,702 @@
 +from __future__ import annotations
 +
 +import fcntl
@@ -2148,7 +2429,23 @@ index 0000000..3a8358f
 +def _marker_pid_active(marker: dict[str, object] | None) -> bool:
 +    if marker is None:
 +        return False
-+    pid = marker.get("pid")
++    for key in ("pid", "advisor_pid"):
++        if _pid_active(marker.get(key)):
++            return True
++    process_group_id = marker.get("advisor_process_group_id")
++    if not isinstance(process_group_id, int) or process_group_id <= 0:
++        return False
++    try:
++        os.killpg(process_group_id, 0)
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    return True
++
++
++def _pid_active(value: object) -> bool:
++    pid = value
 +    if not isinstance(pid, int) or pid <= 0:
 +        return False
 +    try:
@@ -2211,7 +2508,7 @@ index 0000000..0c46cfe
 +"""Tests for repository-local AO tooling."""
 diff --git a/tests/ao/helpers.py b/tests/ao/helpers.py
 new file mode 100644
-index 0000000..73cc03d
+index 0000000..7c802a1
 --- /dev/null
 +++ b/tests/ao/helpers.py
 @@ -0,0 +1,141 @@
@@ -2295,7 +2592,7 @@ index 0000000..73cc03d
 +        run_id: int | None = None,
 +    ) -> CIRun:
 +        self.calls.append("successful_ci_run")
-+        assert commit_sha == self.pr.head_sha
++        assert commit_sha == self.ci.commit_sha
 +        if run_id is not None:
 +            assert run_id == self.ci.run_id
 +        return self.ci
@@ -2358,13 +2655,14 @@ index 0000000..73cc03d
 +    return git(repository, "rev-parse", "HEAD").stdout.strip()
 diff --git a/tests/ao/test_evidence.py b/tests/ao/test_evidence.py
 new file mode 100644
-index 0000000..52967f1
+index 0000000..b6dc141
 --- /dev/null
 +++ b/tests/ao/test_evidence.py
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,331 @@
 +from __future__ import annotations
 +
 +import json
++from dataclasses import replace
 +from datetime import UTC, datetime
 +from pathlib import Path
 +
@@ -2376,6 +2674,7 @@ index 0000000..52967f1
 +    EvidenceGenerator,
 +    SnapshotResult,
 +    parse_evidence_binding,
++    verify_evidence_head,
 +)
 +from scripts.ao.git import GitRepository
 +from scripts.ao.models import CIRun, EvidenceSkip
@@ -2481,6 +2780,58 @@ index 0000000..52967f1
 +        git(fixture.repository, "log", "-1", "--format=%s").stdout.strip()
 +        == "docs: add PR41 review evidence"
 +    )
++
++
++def test_trusted_gate_verifies_evidence_only_parent_ci_and_patch(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    generator = EvidenceGenerator(
++        repository,
++        github,
++        log_path=tmp_path / "events.jsonl",
++        now=lambda: NOW,
++    )
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
++
++    verified = verify_evidence_head(
++        repository,
++        github,
++        41,
++        snapshot.evidence_commit_sha,
++    )
++
++    assert verified.evidence_commit_sha == snapshot.evidence_commit_sha
++    assert verified.code_commit_sha == fixture.code_sha
++    assert verified.ci_run_id == github.ci.run_id
++    assert verified.ci_url == github.ci.url
++
++
++def test_trusted_gate_refuses_tampered_evidence_patch(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    snapshot = _snapshot(
++        EvidenceGenerator(
++            repository,
++            github,
++            log_path=tmp_path / "events.jsonl",
++            now=lambda: NOW,
++        ).generate(41)
++    )
++    assert snapshot.evidence_commit_sha is not None
++    patch = fixture.repository / "docs/evidence/pr-41/diff.patch"
++    patch.write_text(patch.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
++    git(fixture.repository, "add", "docs/evidence/pr-41/diff.patch")
++    git(fixture.repository, "commit", "--amend", "--no-edit")
++    tampered_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
++    github.pr = replace(github.pr, head_sha=tampered_sha)
++
++    with pytest.raises(EvidenceError, match=r"diff\.patch does not match"):
++        verify_evidence_head(repository, github, 41, tampered_sha)
 +
 +
 +def test_second_automatic_invocation_structurally_skips_evidence_only_head(
@@ -2641,10 +2992,10 @@ index 0000000..52967f1
 +    return result
 diff --git a/tests/ao/test_github.py b/tests/ao/test_github.py
 new file mode 100644
-index 0000000..e525a12
+index 0000000..0a55bc6
 --- /dev/null
 +++ b/tests/ao/test_github.py
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,178 @@
 +from __future__ import annotations
 +
 +import json
@@ -2654,7 +3005,7 @@ index 0000000..e525a12
 +import pytest
 +
 +from scripts.ao.git import CommandResult, CommandRunner
-+from scripts.ao.github import GhGitHubData, GitHubError
++from scripts.ao.github import CIFailedError, CINotRunError, GhGitHubData, GitHubError
 +
 +SHA = "a" * 40
 +
@@ -2773,40 +3124,106 @@ index 0000000..e525a12
 +    assert ci_run.status == "required-jobs-completed"
 +    assert ci_run.conclusion == "success"
 +    assert {job.name for job in ci_run.jobs} == {"quality", "database", "container"}
++
++
++def test_action_required_zero_job_run_is_indeterminate_not_failed_or_successful() -> None:
++    runner = StubRunner(
++        [
++            [
++                {
++                    "conclusion": "action_required",
++                    "createdAt": "2026-08-03T12:00:00Z",
++                    "databaseId": 99,
++                    "headSha": SHA,
++                    "status": "completed",
++                    "url": "https://example.invalid/runs/99",
++                }
++            ],
++            {"jobs": []},
++        ]
++    )
++
++    with pytest.raises(CINotRunError, match="not a success or a test failure"):
++        GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
++
++
++def test_executed_failed_run_is_distinct_from_not_run() -> None:
++    jobs = [
++        {
++            "conclusion": "failure" if name == "quality" else "success",
++            "name": name,
++            "url": f"https://example.invalid/jobs/{name}",
++        }
++        for name in ("quality", "database", "container")
++    ]
++    runner = StubRunner(
++        [
++            [
++                {
++                    "conclusion": "failure",
++                    "createdAt": "2026-08-03T12:00:00Z",
++                    "databaseId": 100,
++                    "headSha": SHA,
++                    "status": "completed",
++                    "url": "https://example.invalid/runs/100",
++                }
++            ],
++            {"jobs": jobs},
++        ]
++    )
++
++    with pytest.raises(CIFailedError, match="executed but failed"):
++        GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
 diff --git a/tests/ao/test_workflow.py b/tests/ao/test_workflow.py
 new file mode 100644
-index 0000000..289d639
+index 0000000..3a8f6b6
 --- /dev/null
 +++ b/tests/ao/test_workflow.py
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,38 @@
 +from __future__ import annotations
 +
 +from pathlib import Path
 +
++WORKFLOWS = Path(__file__).resolve().parents[2] / ".github/workflows"
 +
-+def test_evidence_job_blocks_after_three_code_jobs_with_minimal_write_permission() -> None:
-+    workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text(
-+        encoding="utf-8"
-+    )
-+    evidence = workflow.split("\n  evidence:\n", maxsplit=1)[1]
++
++def test_pr_ci_is_read_only_and_does_not_persist_checkout_credentials() -> None:
++    workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
 +
 +    assert "permissions:\n  contents: read\n" in workflow
++    assert "contents: write" not in workflow
++    assert "GH_TOKEN" not in workflow
++    assert "python -m scripts.ao evidence" not in workflow
++    assert workflow.count("uses: actions/checkout@v4") == 3
++    assert workflow.count("persist-credentials: false") == 3
++
++
++def test_trusted_publisher_never_executes_candidate_code_and_verifies_before_green() -> None:
++    workflow = (WORKFLOWS / "evidence-publish.yml").read_text(encoding="utf-8")
++
++    assert "workflow_run:" in workflow
++    assert "github.event.workflow_run.conclusion == 'success'" in workflow
++    assert "permissions:\n  contents: read\n" in workflow
 +    assert workflow.count("contents: write") == 1
-+    assert (
-+        "permissions:\n      actions: read\n      contents: write\n      pull-requests: read"
-+        in evidence
-+    )
-+    assert "needs:\n      - quality\n      - database\n      - container" in evidence
-+    assert evidence.count("python -m scripts.ao evidence") == 1
-+    assert '--ci-run-id "$RUN_ID"' in evidence
-+    assert "GITHUB_TOKEN pushes do not start another workflow" in evidence
-+    assert "continue-on-error" not in evidence
++    assert "statuses: write" in workflow
++    assert "ref: ${{ github.event.repository.default_branch }}" in workflow
++    assert "path: trusted" in workflow
++    assert "path: candidate" in workflow
++    assert workflow.count("persist-credentials: false") == 2
++    assert "working-directory: trusted" in workflow
++    assert "python -m scripts.ao evidence \\\n              --repo ../candidate" in workflow
++    assert "python -m scripts.ao evidence-verify-head" in workflow
++    verification = workflow.index("python -m scripts.ao evidence-verify-head")
++    green_status = workflow.index('post_status "$evidence_sha" success')
++    assert verification < green_status
++    assert "github.head_ref" not in workflow
++    assert "continue-on-error" not in workflow
 diff --git a/tests/ao/test_workspace.py b/tests/ao/test_workspace.py
 new file mode 100644
-index 0000000..032da97
+index 0000000..ca8cdad
 --- /dev/null
 +++ b/tests/ao/test_workspace.py
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,525 @@
 +from __future__ import annotations
 +
 +import fcntl
@@ -3144,6 +3561,13 @@ index 0000000..032da97
 +        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 +    finally:
 +        os.close(lock_fd)
++
++    active_stale = detect_stale_worktrees(
++        repository,
++        temp_root=temp_root,
++        older_than_seconds=0,
++    )
++    assert active_stale == ()
 +
 +    os.killpg(child_pid, signal.SIGKILL)
 +    deadline = time.monotonic() + 5
