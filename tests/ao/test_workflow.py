@@ -34,5 +34,10 @@ def test_trusted_publisher_never_executes_candidate_code_and_verifies_before_gre
     verification = workflow.index("python -m scripts.ao evidence-verify-head")
     green_status = workflow.index('post_status "$evidence_sha" success')
     assert verification < green_status
+    assert 'if [[ "$generation_result" == "skipped" ]]; then' in workflow
+    assert "--require-prior-attestation" in workflow
+    skip_branch = workflow.index('if [[ "$generation_result" == "skipped" ]]; then')
+    skip_exit = workflow.index("exit 0", skip_branch)
+    assert 'post_status "$evidence_sha" success' not in workflow[skip_branch:skip_exit]
     assert "github.head_ref" not in workflow
     assert "continue-on-error" not in workflow

@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.ao.git import GitRepository, append_json_event
-from scripts.ao.github import GitHubData
+from scripts.ao.github import GitHubData, GitHubError
 from scripts.ao.models import CIRun, EvidenceBinding, EvidenceSkip, PullRequest, ReviewEvidence
 
 EVIDENCE_FILES = {
@@ -21,6 +21,7 @@ EVIDENCE_FILES = {
     "advisor-context.md",
 }
 EVIDENCE_EXCLUSION = ":(exclude)docs/evidence/**"
+EVIDENCE_STATUS_CONTEXT = "AO / evidence-snapshot"
 PROTECTED_PATHS = (
     "migrations/",
     "docs/requirements-v1.md",
@@ -51,6 +52,7 @@ class VerifiedEvidenceHead:
     code_commit_sha: str
     ci_run_id: int
     ci_url: str
+    prior_attestation: bool
 
 
 @dataclass(frozen=True)
@@ -391,6 +393,8 @@ def verify_evidence_head(
     github: GitHubData,
     pr_number: int,
     evidence_sha: str,
+    *,
+    require_prior_attestation: bool = False,
 ) -> VerifiedEvidenceHead:
     """Prove a head is an Evidence-only child of an exactly bound successful CI run."""
     _require_full_sha(evidence_sha, "Evidence commit SHA")
@@ -480,11 +484,38 @@ def verify_evidence_head(
     if actual_patch != expected_patch:
         raise EvidenceError("Evidence diff.patch does not match the bound three-dot code diff")
 
+    if require_prior_attestation:
+        try:
+            attestation = github.evidence_attestation(
+                evidence_sha,
+                EVIDENCE_STATUS_CONTEXT,
+            )
+        except GitHubError as error:
+            raise EvidenceError(
+                "Evidence skip path lacks a prior trusted publisher attestation"
+            ) from error
+        expected_description = (
+            f"Evidence-only child of {binding.code_commit_sha[:12]}; source CI {binding.ci_run_id}"
+        )
+        expected_target_prefix = f"https://github.com/{pull_request.repository}/actions/runs/"
+        if (
+            attestation.context != EVIDENCE_STATUS_CONTEXT
+            or attestation.state != "success"
+            or attestation.creator_login != "github-actions[bot]"
+            or attestation.description != expected_description
+            or not attestation.target_url.startswith(expected_target_prefix)
+        ):
+            raise EvidenceError(
+                "Evidence skip path attestation does not match its parent, CI, "
+                "publisher identity, and workflow provenance"
+            )
+
     return VerifiedEvidenceHead(
         evidence_commit_sha=evidence_sha,
         code_commit_sha=binding.code_commit_sha,
         ci_run_id=binding.ci_run_id,
         ci_url=ci_run.url,
+        prior_attestation=require_prior_attestation,
     )
 
 

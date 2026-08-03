@@ -82,7 +82,6 @@ jobs:
           }
           trap record_failure ERR
 
-          post_status "$CODE_SHA" pending "Publishing Evidence from successful source CI $RUN_ID"
           gh auth setup-git
           git -C ../candidate config user.name "github-actions[bot]"
           git -C ../candidate config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -97,7 +96,25 @@ jobs:
             python -c 'import json,sys; data=json.load(sys.stdin); print(data.get("evidence_commit_sha") or data.get("head_sha") or "")' \
               <<<"$result"
           )"
+          generation_result="$(
+            python -c 'import json,sys; print(json.load(sys.stdin)["result"])' \
+              <<<"$result"
+          )"
           test -n "$evidence_sha"
+
+          if [[ "$generation_result" == "skipped" ]]; then
+            # A skip may preserve an existing trusted green status, but it may
+            # never mint one. An author-supplied Evidence-only SHA has no prior
+            # bot-owned attestation and fails closed here.
+            python -m scripts.ao evidence-verify-head \
+              --repo ../candidate \
+              --pr "$PR_NUMBER" \
+              --evidence-sha "$evidence_sha" \
+              --require-prior-attestation
+            trap - ERR
+            exit 0
+          fi
+          test "$generation_result" = "success"
 
           verification="$(
             python -m scripts.ao evidence-verify-head \
@@ -114,8 +131,8 @@ jobs:
               <<<"$verification"
           )"
 
-          # Never copy a parent result blindly. The trusted verifier above proves
-          # the child is Evidence-only and bound to this successful parent run.
+          # Only the same trusted invocation that generated all five files may
+          # mint the first green attestation for this immutable Evidence SHA.
           post_status "$evidence_sha" success \
             "Evidence-only child of ${verified_parent:0:12}; source CI $verified_run"
           post_status "$CODE_SHA" success \

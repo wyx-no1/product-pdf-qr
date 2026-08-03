@@ -53,3 +53,12 @@ class EvidenceBinding:
 class EvidenceSkip:
     head_sha: str
     reason: str
+
+
+@dataclass(frozen=True)
+class EvidenceAttestation:
+    context: str
+    state: str
+    creator_login: str
+    description: str
+    target_url: str

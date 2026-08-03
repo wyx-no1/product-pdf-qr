@@ -176,3 +176,30 @@ def test_executed_failed_run_is_distinct_from_not_run() -> None:
 
     with pytest.raises(CIFailedError, match="executed but failed"):
         GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
+
+
+def test_gh_provider_reads_exact_prior_evidence_attestation_without_network() -> None:
+    runner = StubRunner(
+        [
+            {
+                "statuses": [
+                    {
+                        "context": "AO / evidence-snapshot",
+                        "creator": {"login": "github-actions[bot]"},
+                        "description": "Evidence-only child of aaaaaaaaaaaa; source CI 77",
+                        "state": "success",
+                        "target_url": "https://github.com/owner/repository/actions/runs/88",
+                    }
+                ]
+            }
+        ]
+    )
+
+    attestation = GhGitHubData(
+        "owner/repository",
+        runner=runner,
+    ).evidence_attestation(SHA, "AO / evidence-snapshot")
+
+    assert attestation.state == "success"
+    assert attestation.creator_login == "github-actions[bot]"
+    assert attestation.target_url.endswith("/actions/runs/88")

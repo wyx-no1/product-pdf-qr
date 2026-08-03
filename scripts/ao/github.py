@@ -4,7 +4,13 @@ import json
 from typing import Protocol, cast
 
 from scripts.ao.git import CommandRunner
-from scripts.ao.models import CIJob, CIRun, PullRequest, ReviewEvidence
+from scripts.ao.models import (
+    CIJob,
+    CIRun,
+    EvidenceAttestation,
+    PullRequest,
+    ReviewEvidence,
+)
 
 REQUIRED_CI_JOBS = {"quality", "database", "container"}
 
@@ -19,6 +25,12 @@ class GitHubData(Protocol):
     ) -> CIRun: ...
 
     def review_evidence(self, number: int, decision: str) -> ReviewEvidence: ...
+
+    def evidence_attestation(
+        self,
+        commit_sha: str,
+        context: str,
+    ) -> EvidenceAttestation: ...
 
 
 class GitHubError(RuntimeError):
@@ -213,6 +225,40 @@ class GhGitHubData:
                 url for item in comments if (url := str(item.get("html_url") or ""))
             ),
             review_urls=tuple(url for item in reviews if (url := str(item.get("html_url") or ""))),
+        )
+
+    def evidence_attestation(
+        self,
+        commit_sha: str,
+        context: str,
+    ) -> EvidenceAttestation:
+        raw = self._json(
+            "api",
+            f"repos/{self.repository}/commits/{commit_sha}/status",
+        )
+        data = cast(dict[str, object], raw)
+        statuses_value = data.get("statuses")
+        if not isinstance(statuses_value, list):
+            raise GitHubError(f"commit {commit_sha} did not return status records")
+        statuses = cast(list[dict[str, object]], statuses_value)
+        status = next(
+            (item for item in statuses if item.get("context") == context),
+            None,
+        )
+        if status is None:
+            raise GitHubError(f"commit {commit_sha} has no prior trusted {context} attestation")
+        creator = status.get("creator")
+        creator_login = (
+            str(cast(dict[str, object], creator).get("login") or "")
+            if isinstance(creator, dict)
+            else ""
+        )
+        return EvidenceAttestation(
+            context=_required_str(status, "context"),
+            state=_required_str(status, "state"),
+            creator_login=creator_login,
+            description=_required_str(status, "description"),
+            target_url=_required_str(status, "target_url"),
         )
 
 

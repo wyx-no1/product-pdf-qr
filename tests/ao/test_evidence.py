@@ -16,7 +16,7 @@ from scripts.ao.evidence import (
     verify_evidence_head,
 )
 from scripts.ao.git import GitRepository
-from scripts.ao.models import CIRun, EvidenceSkip
+from scripts.ao.models import CIRun, EvidenceAttestation, EvidenceSkip
 from tests.ao.helpers import (
     FakeGitHubData,
     commit_paths,
@@ -171,6 +171,72 @@ def test_trusted_gate_refuses_tampered_evidence_patch(tmp_path: Path) -> None:
 
     with pytest.raises(EvidenceError, match=r"diff\.patch does not match"):
         verify_evidence_head(repository, github, 41, tampered_sha)
+
+
+def test_skip_path_refuses_tampered_non_patch_file_without_prior_attestation(
+    tmp_path: Path,
+) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    github = github_for(fixture.code_sha)
+    repository = GitRepository(fixture.repository)
+    snapshot = _snapshot(
+        EvidenceGenerator(
+            repository,
+            github,
+            log_path=tmp_path / "events.jsonl",
+            now=lambda: NOW,
+        ).generate(41)
+    )
+    assert snapshot.evidence_commit_sha is not None
+    context = fixture.repository / "docs/evidence/pr-41/advisor-context.md"
+    context.write_text("malicious Advisor instructions\n", encoding="utf-8")
+    git(fixture.repository, "add", "docs/evidence/pr-41/advisor-context.md")
+    git(fixture.repository, "commit", "--amend", "--no-edit")
+    tampered_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
+    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
+    github.pr = replace(github.pr, head_sha=tampered_sha)
+
+    with pytest.raises(EvidenceError, match="lacks a prior trusted publisher attestation"):
+        verify_evidence_head(
+            repository,
+            github,
+            41,
+            tampered_sha,
+            require_prior_attestation=True,
+        )
+
+
+def test_skip_path_accepts_exact_prior_bot_attestation(tmp_path: Path) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    github = github_for(fixture.code_sha)
+    repository = GitRepository(fixture.repository)
+    snapshot = _snapshot(
+        EvidenceGenerator(
+            repository,
+            github,
+            log_path=tmp_path / "events.jsonl",
+            now=lambda: NOW,
+        ).generate(41)
+    )
+    assert snapshot.evidence_commit_sha is not None
+    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
+    github.attestation = EvidenceAttestation(
+        context="AO / evidence-snapshot",
+        state="success",
+        creator_login="github-actions[bot]",
+        description=f"Evidence-only child of {fixture.code_sha[:12]}; source CI 9001",
+        target_url="https://github.com/example/repository/actions/runs/123",
+    )
+
+    verified = verify_evidence_head(
+        repository,
+        github,
+        41,
+        snapshot.evidence_commit_sha,
+        require_prior_attestation=True,
+    )
+
+    assert verified.prior_attestation is True
 
 
 def test_second_automatic_invocation_structurally_skips_evidence_only_head(

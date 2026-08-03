@@ -5,7 +5,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.ao.models import CIJob, CIRun, PullRequest, ReviewEvidence
+from scripts.ao.github import GitHubError
+from scripts.ao.models import (
+    CIJob,
+    CIRun,
+    EvidenceAttestation,
+    PullRequest,
+    ReviewEvidence,
+)
 
 
 def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -61,10 +68,12 @@ class FakeGitHubData:
         pull_request: PullRequest,
         ci_run: CIRun,
         reviews: ReviewEvidence | None = None,
+        attestation: EvidenceAttestation | None = None,
     ) -> None:
         self.pr = pull_request
         self.ci = ci_run
         self.reviews = reviews or ReviewEvidence("not-reviewed", (), ())
+        self.attestation = attestation
         self.calls: list[str] = []
 
     def pull_request(self, number: int) -> PullRequest:
@@ -88,6 +97,17 @@ class FakeGitHubData:
         assert number == self.pr.number
         assert decision == self.pr.review_decision
         return self.reviews
+
+    def evidence_attestation(
+        self,
+        commit_sha: str,
+        context: str,
+    ) -> EvidenceAttestation:
+        self.calls.append("evidence_attestation")
+        assert commit_sha == self.pr.head_sha
+        if self.attestation is None or self.attestation.context != context:
+            raise GitHubError(f"commit {commit_sha} has no prior trusted attestation")
+        return self.attestation
 
 
 def github_for(code_sha: str, *, number: int = 41) -> FakeGitHubData:

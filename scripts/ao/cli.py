@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify_evidence.add_argument("--repo", type=Path, required=True)
     verify_evidence.add_argument("--pr", type=int, required=True)
     verify_evidence.add_argument("--evidence-sha", required=True)
+    verify_evidence.add_argument(
+        "--require-prior-attestation",
+        action="store_true",
+        help="allow a skipped Evidence head only when the trusted publisher attested it earlier",
+    )
 
     advisor = commands.add_parser("advisor-run", help="run Advisor in a bound worktree")
     advisor.add_argument("--repo", type=Path, required=True)
@@ -172,6 +177,7 @@ def _evidence_verify_head(arguments: argparse.Namespace) -> int:
         github,
         arguments.pr,
         arguments.evidence_sha,
+        require_prior_attestation=arguments.require_prior_attestation,
     )
     _print_json(asdict(result))
     return 0

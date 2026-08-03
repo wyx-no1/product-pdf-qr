@@ -36,7 +36,11 @@ there is no unconditional green path.
 A `GITHUB_TOKEN` PR update may create an approval-required, zero-job run. That record
 is neither success nor test failure and remains indeterminate. The independent
 content-based skip keeps the publisher finite if that run is approved or the
-credential later changes to a PAT or deploy key.
+credential later changes to a PAT or deploy key. A skipped head can only preserve a
+pre-existing successful `AO / evidence-snapshot` status created by
+`github-actions[bot]` with the exact parent SHA, source CI, and workflow-run target.
+It can never mint the first green status. Therefore an author-supplied or tampered
+Evidence-only commit fails closed even when its path shape and patch look valid.
 
 Generation uses `origin/<base>...<code-sha>` and excludes all of
 `docs/evidence/**`. Failure exits nonzero, records an `indeterminate` gate event in
