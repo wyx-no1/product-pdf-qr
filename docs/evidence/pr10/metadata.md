@@ -41,19 +41,20 @@ tests/integration/test_business_loop.py
 | PR 编号 | **#10** |
 | 标题 | feat: 实现 Phase 1-B PDF 二维码最小业务闭环 |
 | branch | `feat/phase1b-business-loop` |
-| commit（证据生成时刻） | **`ebddbfe`** |
+| commit（证据生成时刻） | **`587fd99`** |
 | 目标分支 | `main` |
 | merge base | `bda51a4` |
 | 状态 | OPEN，未合并 |
 | 关联 Issue | #8（范围与验收）、#9（Governance，T-C 用例范围裁决） |
-| 规模 | **39 个文件，+4355 / -26** |
+| 规模 | **39 个文件，+4356 / -26** |
 
-> **注意**：`main` 在本 PR 开出后前进过（新增 `docs/review-context-pr10.md`）。本目录的 `diff.patch` 与 `changed-files.md` 均使用**三点式**比较（`origin/main...ebddbfe`），与该代码快照在 GitHub PR「Files changed」中的内容一致，不会把 main 的新增内容误报为本 PR 的删除。证据目录在后续独立提交中入库，为避免自引用，不包含在自身的 `diff.patch` 中。
+> **注意**：`main` 在本 PR 开出后前进过（新增 `docs/review-context-pr10.md`）。本目录的 `diff.patch` 与 `changed-files.md` 均使用**三点式**比较（`origin/main...587fd99`）并排除 `docs/evidence/pr10/`，与该代码快照除证据目录外的 GitHub PR「Files changed」内容一致，不会把 main 的新增内容误报为本 PR 的删除。证据目录为避免自引用，不包含在自身的 `diff.patch` 中。
 
 ### 提交清单
 
 | SHA | 说明 |
 |---|---|
+| `587fd99` | fix: align pre-parser audit field names |
 | `ebddbfe` | fix: preserve honest pre-parser rejection audits |
 | `e43eeb6` | fix: audit pre-parser upload rejections |
 | `e4755d0` | fix: harden PDF upload resource boundaries |
@@ -63,7 +64,7 @@ tests/integration/test_business_loop.py
 | `a211b10` | feat: implement phase 1b PDF QR business loop |
 
 ```bash
-git log origin/main..ebddbfe
+git log origin/main..587fd99 -- . ':(exclude)docs/evidence/pr10/**'
 git show <sha>
 ```
 
@@ -95,7 +96,7 @@ git show <sha>
 docs/evidence/pr10/
 ├── metadata.md         本文件：PR 信息、定位与使用方式
 ├── changed-files.md    完整变更文件清单 + 未修改文件核验命令
-├── diff.patch          完整 diff（4753 行，三点式）
+├── diff.patch          完整 diff（4754 行，三点式）
 └── validation.md       Reviewer 结果、CI 结果、测试结果、独立核验判据
 ```
 
@@ -118,8 +119,8 @@ docs/evidence/pr10/
 
 ```bash
 git fetch origin
-git diff origin/main...ebddbfe > diff.patch
-git diff --name-status origin/main...ebddbfe
+git diff origin/main...587fd99 -- . ':(exclude)docs/evidence/pr10/**' > diff.patch
+git diff --name-status origin/main...587fd99 -- . ':(exclude)docs/evidence/pr10/**'
 ```
 
 本目录所有内容均由上述命令的输出与 GitHub API 查询结果整理而成，**未经人工编辑或摘要**（`validation.md` 中明确标注为「Orchestrator 观察」的部分除外）。

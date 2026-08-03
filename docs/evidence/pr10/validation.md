@@ -1,8 +1,8 @@
 # PR #10 审查证据 · 验证记录
 
 生成日期：2026-08-03
-证据生成时刻 commit：`ebddbfe`
-比较基准：`origin/main...ebddbfe`（三点式，merge base `bda51a4`；后续证据提交为避免自引用不包含在快照中）
+证据生成时刻 commit：`587fd99`
+比较基准：`origin/main...587fd99`（三点式，merge base `bda51a4`；`docs/evidence/pr10/` 为避免自引用不包含在快照中）
 
 > **本文件记录的是「验证在哪里、结果是什么」，不是对结果有效性的判断。**
 > 所有声称均可通过下方给出的位置独立核验。**发现记录与实际不符时，以实际为准。**
@@ -47,7 +47,7 @@ gh api repos/wyx-no1/product-pdf-qr/issues/10/comments
 
 **(a) 超限拒绝审计的大小语义**
 
-Content-Length 路径记录 `declared_request_body_bytes` 与 `declared_request_body_verified: false`；chunked 路径记录 `received_request_body_bytes_before_abort`。两条路径均记录 `actual_file_size_known: false`，避免把客户端声明值或提前终止前的接收量误称为真实文件大小。
+Content-Length 路径记录 `declared_content_length` 与 `declared_request_body_verified: false`；chunked 路径记录 `received_bytes_before_abort`。两条路径均记录 `complete_pdf_byte_length_known: false`，避免把客户端声明值或提前终止前的接收量误称为完整 PDF 的真实字节长度，同时所有 detail 键均不含 `file_size` 子串。
 
 两类原因分别记录为 `content_length_exceeded` 与 `chunked_stream_exceeded`。中间件无法取得可信操作者身份，因此记录 `actor_type=anonymous`、`actor_id=NULL`；`product_id` 仅从路径解析，不查询数据库。
 
@@ -57,6 +57,16 @@ Content-Length 路径记录 `declared_request_body_bytes` 与 `declared_request_
 
 **请 Advisor 独立判断**：实现与测试是否确实满足上述语义。
 
+### 1.5 G-10 字段命名复核 → 修复提交 `587fd99`
+
+| Reviewer 要求 | 修复后字段 | 语义 |
+|---|---|---|
+| Content-Length 声明值 | `declared_content_length` | 客户端声明且未经验证；不代表真实文件大小 |
+| 提前终止前已接收字节数 | `received_bytes_before_abort` | 只代表终止前接收量；不代表完整文件大小 |
+| 不使用模糊 `file_size` 字段 | `complete_pdf_byte_length_known: false` | 不含 `file_size` 子串，并明确完整 PDF 字节长度未知 |
+
+HTTP 层测试继续保留原有早终止断言，并对两类 detail 的新字段名、正确值以及不存在 `file_size` 子串进行严格断言。
+
 ---
 
 ## 2. CI 结果
@@ -65,7 +75,8 @@ Content-Length 路径记录 `declared_request_body_bytes` 与 `declared_request_
 
 | Run ID | Commit | 结论 | URL |
 |---|---|---|---|
-| **30780345357** | **`ebddbfe`**（当前 HEAD） | **success** | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30780345357 |
+| **30781351800** | **`587fd99`**（当前代码快照） | **success** | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30781351800 |
+| 30780345357 | `ebddbfe` | success | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30780345357 |
 | 30777551571 | `e43eeb6` | success | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30777551571 |
 | 30776557635 | `e4755d0` | success | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30776557635 |
 | 30694252828 | `f409b3f` | success | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30694252828 |
@@ -77,22 +88,22 @@ Content-Length 路径记录 `declared_request_body_bytes` 与 `declared_request_
 > git diff 70adea8..f409b3f
 > ```
 
-### 2.2 当前 HEAD 的三个 job（run `30780345357`）
+### 2.2 当前代码快照的三个 job（run `30781351800`）
 
 | Job | 结论 | 开始（UTC） | 结束（UTC） | 覆盖内容 |
 |---|---|---|---|---|
-| `quality` | success | 02:52:36 | 02:53:28 | 构建、类型检查、lint、单元测试、文档检查 |
-| `database` | success | 02:52:36 | 02:53:16 | 真库集成测试（含并发场景） |
-| `container` | success | 02:52:43 | 02:54:16 | 镜像构建、三轮净卷启动、非 root、镜像内容、Trivy 扫描 |
+| `quality` | success | 03:15:13 | 03:16:10 | 构建、类型检查、lint、单元测试、文档检查 |
+| `database` | success | 03:15:12 | 03:15:58 | 真库集成测试（含并发场景） |
+| `container` | success | 03:15:13 | 03:17:01 | 镜像构建、三轮净卷启动、非 root、镜像内容、Trivy 扫描 |
 
 ### 2.3 CI 产物获取
 
 ```bash
-gh run view 30780345357 --json jobs          # job 状态
-gh run view 30780345357 --log                # 完整日志
-gh run download 30780345357 --name quality-reports        # mypy.xml / ruff.xml / 覆盖率
-gh run download 30780345357 --name database-reports       # 集成测试报告
-gh run download 30780345357 --name clean-start-evidence   # 净卷启动证据
+gh run view 30781351800 --json jobs          # job 状态
+gh run view 30781351800 --log                # 完整日志
+gh run download 30781351800 --name quality-reports        # mypy.xml / ruff.xml / 覆盖率
+gh run download 30781351800 --name database-reports       # 集成测试报告
+gh run download 30781351800 --name clean-start-evidence   # 净卷启动证据
 ```
 
 ---
@@ -105,7 +116,7 @@ gh run download 30780345357 --name clean-start-evidence   # 净卷启动证据
 
 | 门禁 | 声称内容 |
 |---|---|
-| G-04 构建 | `make build-reproducible` 退出码 0；wheel SHA-256 `55e21854b19a6908d5d586499f8adca6a450c21a427c2875f200ed6117e2f7fa` |
+| G-04 构建 | `make build-reproducible` 退出码 0；wheel SHA-256 `2400b671e2c7f99681439e3b2259299bdcc0a1be5e4692880f67d451ae5df70a` |
 | G-05 类型检查 | `make typecheck`，mypy **46 个源文件零错误** |
 | G-06 lint | `make lint`，ruff check + format check 通过 |
 | G-07 单元测试 | `make test-unit`，**88 passed，覆盖率 90.65%**（阈值 90%） |
@@ -141,7 +152,7 @@ gh run download 30780345357 --name clean-start-evidence   # 净卷启动证据
 
 | 测试文件 | 分支路径 | 行数 |
 |---|---|---|
-| 上传限制（HTTP 层） | `tests/unit/test_upload_limit.py` | 215 |
+| 上传限制（HTTP 层） | `tests/unit/test_upload_limit.py` | 216 |
 | 存储与 PDF 解析 | `tests/unit/test_storage_domain.py` | 291 |
 | 业务服务（含取消场景） | `tests/unit/test_business_services.py` | 469 |
 | 公开 API 四态 | `tests/unit/test_public_api.py` | 134 |

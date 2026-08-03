@@ -1,8 +1,8 @@
 # PR #10 变更文件清单
 
 生成日期：2026-08-03
-快照 commit：`ebddbfe`
-比较基准：`git diff origin/main...ebddbfe`（三点式，与该代码快照的 GitHub PR「Files changed」一致）
+快照 commit：`587fd99`
+比较基准：`git diff origin/main...587fd99 -- . ':(exclude)docs/evidence/pr10/**'`（三点式，与该代码快照除证据目录外的 GitHub PR「Files changed」一致）
 merge base：`bda51a4`
 
 > 本清单只列出**文件路径与变更类型**，不含任何代码内容。
@@ -13,7 +13,7 @@ merge base：`bda51a4`
 | 项 | 值 |
 |---|---|
 | 变更文件数 | **39** |
-| 新增行 | **4355** |
+| 新增行 | **4356** |
 | 删除行 | **26** |
 
 ## 完整清单
@@ -78,9 +78,9 @@ merge base：`bda51a4`
 **核验方式**（在 PR 分支上执行）：
 
 ```bash
-git diff origin/main...ebddbfe -- migrations/
-git diff origin/main...ebddbfe -- docs/requirements-v1.md docs/requirements-v2.md
-git diff origin/main...ebddbfe -- CLAUDE.md docs/quality-gates-v1.md docs/advisor-protocol-v1.md docs/decision-register-v1.md docs/test-plan-v1.md
+git diff origin/main...587fd99 -- migrations/
+git diff origin/main...587fd99 -- docs/requirements-v1.md docs/requirements-v2.md
+git diff origin/main...587fd99 -- CLAUDE.md docs/quality-gates-v1.md docs/advisor-protocol-v1.md docs/decision-register-v1.md docs/test-plan-v1.md
 ```
 
 以上命令**应全部无输出**。若有输出，说明存在越界改动，请在审查意见中指出。

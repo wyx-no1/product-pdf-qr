@@ -2151,7 +2151,7 @@ index 3e1ca72..b79d759 100644
      async def liveness() -> dict[str, str]:
 diff --git a/src/product_pdf_qr/upload_limit.py b/src/product_pdf_qr/upload_limit.py
 new file mode 100644
-index 0000000..e54dd83
+index 0000000..39e9aaf
 --- /dev/null
 +++ b/src/product_pdf_qr/upload_limit.py
 @@ -0,0 +1,187 @@
@@ -2212,9 +2212,9 @@ index 0000000..e54dd83
 +                detail={
 +                    "reason": "content_length_exceeded",
 +                    "stage": "pre_parser_size",
-+                    "declared_request_body_bytes": content_length,
++                    "declared_content_length": content_length,
 +                    "declared_request_body_verified": False,
-+                    "actual_file_size_known": False,
++                    "complete_pdf_byte_length_known": False,
 +                },
 +            )
 +            await self._reject(scope, receive, send, request_id=request_id)
@@ -2253,8 +2253,8 @@ index 0000000..e54dd83
 +                detail={
 +                    "reason": "chunked_stream_exceeded",
 +                    "stage": "pre_parser_size",
-+                    "received_request_body_bytes_before_abort": received_bytes,
-+                    "actual_file_size_known": False,
++                    "received_bytes_before_abort": received_bytes,
++                    "complete_pdf_byte_length_known": False,
 +                },
 +            )
 +            await self._reject(scope, receive, send, request_id=request_id)
@@ -2358,7 +2358,7 @@ index 0000000..70da13d
 +"""Integration test package."""
 diff --git a/tests/integration/test_business_loop.py b/tests/integration/test_business_loop.py
 new file mode 100644
-index 0000000..dbd5d76
+index 0000000..ff74760
 --- /dev/null
 +++ b/tests/integration/test_business_loop.py
 @@ -0,0 +1,543 @@
@@ -2735,15 +2735,15 @@ index 0000000..dbd5d76
 +        assert rows[0][5] == {
 +            "reason": "content_length_exceeded",
 +            "stage": "pre_parser_size",
-+            "declared_request_body_bytes": 70000,
++            "declared_content_length": 70000,
 +            "declared_request_body_verified": False,
-+            "actual_file_size_known": False,
++            "complete_pdf_byte_length_known": False,
 +        }
 +        assert rows[1][5] == {
 +            "reason": "chunked_stream_exceeded",
 +            "stage": "pre_parser_size",
-+            "received_request_body_bytes_before_abort": received_chunked_bytes,
-+            "actual_file_size_known": False,
++            "received_bytes_before_abort": received_chunked_bytes,
++            "complete_pdf_byte_length_known": False,
 +        }
 +    finally:
 +        get_settings.cache_clear()
@@ -4430,10 +4430,10 @@ index 0000000..f273be2
 +        storage.relative_path_for_hash("../unsafe")
 diff --git a/tests/unit/test_upload_limit.py b/tests/unit/test_upload_limit.py
 new file mode 100644
-index 0000000..d5f7b2f
+index 0000000..a9826fe
 --- /dev/null
 +++ b/tests/unit/test_upload_limit.py
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,216 @@
 +"""HTTP-level evidence that oversized uploads stop before multipart parsing."""
 +
 +from __future__ import annotations
@@ -4541,6 +4541,7 @@ index 0000000..d5f7b2f
 +            "token",
 +        }
 +    )
++    assert all("file_size" not in key for key in detail.obj)
 +    return cast(dict[str, object], detail.obj)
 +
 +
@@ -4571,9 +4572,9 @@ index 0000000..d5f7b2f
 +        expected_detail={
 +            "reason": "content_length_exceeded",
 +            "stage": "pre_parser_size",
-+            "declared_request_body_bytes": len(complete_body),
++            "declared_content_length": len(complete_body),
 +            "declared_request_body_verified": False,
-+            "actual_file_size_known": False,
++            "complete_pdf_byte_length_known": False,
 +        },
 +    )
 +
@@ -4605,8 +4606,8 @@ index 0000000..d5f7b2f
 +        expected_detail={
 +            "reason": "chunked_stream_exceeded",
 +            "stage": "pre_parser_size",
-+            "received_request_body_bytes_before_abort": received_bytes,
-+            "actual_file_size_known": False,
++            "received_bytes_before_abort": received_bytes,
++            "complete_pdf_byte_length_known": False,
 +        },
 +    )
 +
