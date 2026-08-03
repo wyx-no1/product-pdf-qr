@@ -349,6 +349,9 @@ async def test_pre_parser_size_rejections_commit_independent_audits(
         assert declared.status_code == chunked.status_code == 413
         assert declared_body.yielded_chunks == 0
         assert 0 < chunked_body.yielded_chunks < len(chunked_body.chunks)
+        received_chunked_bytes = sum(
+            len(chunk) for chunk in chunked_body.chunks[: chunked_body.yielded_chunks]
+        )
         with psycopg.connect(runtime_url) as connection:
             rows = connection.execute(
                 """
@@ -359,16 +362,24 @@ async def test_pre_parser_size_rejections_commit_independent_audits(
                 """
             ).fetchall()
         assert len(rows) == 2
-        assert {str(row[0]) for row in rows} == {"system"}
+        assert {str(row[0]) for row in rows} == {"anonymous"}
         assert {row[1] for row in rows} == {None}
         assert {str(row[2]) for row in rows} == {"product"}
         assert {int(row[3]) for row in rows} == {5}
-        assert all(row[4] is not None for row in rows)
-        assert {
-            (str(row[5]["reason"]), str(row[5]["stage"]), str(row[5]["trigger"])) for row in rows
-        } == {
-            ("pdf_too_large", "pre_parser_size", "content_length"),
-            ("pdf_too_large", "pre_parser_size", "stream"),
+        assert str(rows[0][4]) == declared.headers["x-request-id"]
+        assert str(rows[1][4]) == chunked.headers["x-request-id"]
+        assert rows[0][5] == {
+            "reason": "content_length_exceeded",
+            "stage": "pre_parser_size",
+            "declared_request_body_bytes": 70000,
+            "declared_request_body_verified": False,
+            "actual_file_size_known": False,
+        }
+        assert rows[1][5] == {
+            "reason": "chunked_stream_exceeded",
+            "stage": "pre_parser_size",
+            "received_request_body_bytes_before_abort": received_chunked_bytes,
+            "actual_file_size_known": False,
         }
     finally:
         get_settings.cache_clear()

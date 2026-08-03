@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Annotated
+from typing import Annotated, cast
 
 import httpx
 import pytest
@@ -76,25 +76,36 @@ def limited_test_app() -> tuple[FastAPI, dict[str, bool], ScriptedConnection]:
 def assert_size_rejection_audit(
     audit_connection: ScriptedConnection,
     *,
-    trigger: str,
-) -> None:
+    response: httpx.Response,
+    expected_detail: dict[str, object],
+) -> dict[str, object]:
     assert len(audit_connection.parameters) == 1
     parameters = audit_connection.parameters[0]
     assert isinstance(parameters, tuple)
-    assert parameters[0] == "system"
+    assert parameters[0] == "anonymous"
     assert parameters[1] is None
     assert parameters[2] == "pdf_upload_rejected"
     assert parameters[3] == "product"
     assert parameters[4] == 5
     assert parameters[6] == "failure"
-    assert parameters[7] is not None
+    assert str(parameters[7]) == response.headers["x-request-id"]
     detail = parameters[8]
     assert isinstance(detail, Jsonb)
-    assert detail.obj == {
-        "reason": "pdf_too_large",
-        "stage": "pre_parser_size",
-        "trigger": trigger,
-    }
+    assert detail.obj == expected_detail
+    assert set(detail.obj).isdisjoint(
+        {
+            "actor_id",
+            "file",
+            "file_content",
+            "form",
+            "headers",
+            "password",
+            "request_body",
+            "server_path",
+            "token",
+        }
+    )
+    return cast(dict[str, object], detail.obj)
 
 
 @pytest.mark.anyio
@@ -118,7 +129,17 @@ async def test_content_length_rejection_reads_zero_request_bytes() -> None:
     assert response.json()["error"]["code"] == "pdf_too_large"
     assert body.yielded_chunks == 0
     assert not state["upload_handler_called"]
-    assert_size_rejection_audit(audit_connection, trigger="content_length")
+    assert_size_rejection_audit(
+        audit_connection,
+        response=response,
+        expected_detail={
+            "reason": "content_length_exceeded",
+            "stage": "pre_parser_size",
+            "declared_request_body_bytes": len(complete_body),
+            "declared_request_body_verified": False,
+            "actual_file_size_known": False,
+        },
+    )
 
 
 @pytest.mark.anyio
@@ -141,7 +162,17 @@ async def test_chunked_rejection_stops_before_consuming_complete_body() -> None:
     assert body.yielded_chunks > 0
     assert body.yielded_chunks < len(body.chunks)
     assert not state["upload_handler_called"]
-    assert_size_rejection_audit(audit_connection, trigger="stream")
+    received_bytes = sum(len(chunk) for chunk in body.chunks[: body.yielded_chunks])
+    assert_size_rejection_audit(
+        audit_connection,
+        response=response,
+        expected_detail={
+            "reason": "chunked_stream_exceeded",
+            "stage": "pre_parser_size",
+            "received_request_body_bytes_before_abort": received_bytes,
+            "actual_file_size_known": False,
+        },
+    )
 
 
 @pytest.mark.anyio
@@ -157,3 +188,28 @@ async def test_upload_limit_does_not_apply_to_other_endpoints() -> None:
     assert response.json() == {"received": 32}
     assert body.yielded_chunks == 1
     assert audit_connection.parameters == []
+
+
+@pytest.mark.anyio
+async def test_audit_failure_is_logged_without_blocking_early_413(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    body = CountingBody([b"must-not-be-read"])
+    app, _state, _audit_connection = limited_test_app()
+    app.state.database = as_database(
+        ScriptedDatabase(
+            ScriptedConnection([], execute_error=RuntimeError("synthetic audit failure"))
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/products/5/pdf",
+            content=body,
+            headers={"Content-Length": "1000"},
+        )
+
+    assert response.status_code == 413
+    assert body.yielded_chunks == 0
+    assert "Pre-parser upload rejection audit was not persisted" in caplog.text
