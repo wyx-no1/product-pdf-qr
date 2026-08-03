@@ -33,8 +33,9 @@ candidate code SHA and the checked-out default branch. The manifest includes:
 - `Dockerfile`, `.dockerignore`, `.env.example`, Compose files, all `docker/**`
   helpers, `alembic.ini`, and the Alembic environment/template;
 - absent-or-present markers for auto-discovered override files such as
-  `.coveragerc`, `pytest.ini`, `mypy.ini`, `setup.cfg`, `tox.ini`, `uv.toml`,
-  Compose overrides, and Dockerfile-specific ignore files.
+  `.coveragerc`, `.coveragerc.toml`, all root pytest config names, `mypy.ini`,
+  `setup.cfg`, `tox.ini`, `uv.toml`, Compose overrides, and Dockerfile-specific
+  ignore files.
 
 Each entry records path, Git mode, object type, and blob SHA; additions, removals,
 renames, permission changes, and content changes all alter the definition hash. The
@@ -46,7 +47,31 @@ Both CI Ruff invocations pass `--config pyproject.toml`, which makes that hashed
 file the configuration for every analyzed path and disables Ruff's otherwise
 hierarchical closest-config discovery. A candidate `src/ruff.toml`,
 `migrations/.ruff.toml`, or nested `pyproject.toml` therefore cannot weaken lint or
-format without first changing the hashed Makefile command.
+format without first changing the hashed Makefile command. As defense in depth, the
+definition builder also scans the entire Git tree—not a directory allowlist—for
+every `ruff.toml`, `.ruff.toml`, and `pyproject.toml` basename. An attempted nested
+override is therefore marked `requires-re-review` even though the pinned commands
+make it ineffective. Because this scan is basename-based over the complete candidate
+commit, a matching file added under any future directory is covered automatically.
+
+The other CI tools do not leave the same unbounded closest-config path:
+
+- pytest is invoked from the repository root, whose hashed `pyproject.toml` fixes
+  `testpaths = ["tests"]`; `-c pyproject.toml` pins that config, and its hierarchical
+  `conftest.py` loading is therefore bounded to the hashed root `conftest.py`
+  sentinel and recursive `tests/**` tree. All other pytest 9 root config names are
+  also represented by missing-file sentinels as defense in depth;
+- mypy selects one configuration from the invocation directory rather than one per
+  analyzed file; `--config-file pyproject.toml` pins it, and every supported root
+  candidate (`mypy.ini`, `.mypy.ini`, `pyproject.toml`, and `setup.cfg`) is hashed;
+- coverage likewise selects one root configuration (`.coveragerc`, `setup.cfg`,
+  `tox.ini`, `.coveragerc.toml`, or `pyproject.toml`) for this invocation;
+  `--cov-config=pyproject.toml` pins it and all alternatives are represented by
+  exact entries or missing-file sentinels;
+- `uv sync` runs at the repository root, so its project/config discovery is anchored
+  to the hashed root `pyproject.toml`, `uv.toml`, and `uv.lock`; it does not select a
+  separate project configuration for each installed source file.
+
 Generation and both verification paths also require this recomputed default-branch
 hash to equal the hash produced by the separate trusted checkout, preventing a
 candidate-supplied hash or a changing fetch baseline from becoming the trust anchor.

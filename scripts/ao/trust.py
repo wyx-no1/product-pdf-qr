@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 from scripts.ao.git import GitRepository
 
@@ -13,9 +14,12 @@ TRUSTED_CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 # so its otherwise hierarchical per-file configuration discovery is disabled.
 TRUSTED_CI_EXACT_PATHS = (
     ".coveragerc",
+    ".coveragerc.toml",
     ".dockerignore",
     ".env.example",
     ".mypy.ini",
+    ".pytest.ini",
+    ".pytest.toml",
     ".python-version",
     ".ruff.toml",
     "Dockerfile",
@@ -39,6 +43,7 @@ TRUSTED_CI_EXACT_PATHS = (
     "mypy.ini",
     "pyproject.toml",
     "pytest.ini",
+    "pytest.toml",
     "ruff.toml",
     "setup.cfg",
     "setup.py",
@@ -56,6 +61,17 @@ TRUSTED_CI_TREE_PATHS = (
     "docker",
     "scripts",
     "tests",
+)
+
+# Ruff is structurally pinned to the root pyproject.toml in Makefile. Scan the
+# complete Git tree as defense in depth so an attempted nested closest-config
+# override is still an explicit trust-root change, including in future directories.
+TRUSTED_CI_RECURSIVE_FILE_NAMES = frozenset(
+    {
+        ".ruff.toml",
+        "pyproject.toml",
+        "ruff.toml",
+    }
 )
 
 
@@ -121,14 +137,26 @@ def _definition_entries(repository: GitRepository, commit_sha: str) -> dict[str,
     for path in TRUSTED_CI_EXACT_PATHS:
         entry = _single_tree_entry(repository, commit_sha, path)
         entries[path] = entry or "missing"
+    all_files = repository.git("ls-tree", "-r", commit_sha, "--", ".").stdout
+    for line in all_files.splitlines():
+        path, value = _parse_tree_entry(line)
+        if PurePosixPath(path).name in TRUSTED_CI_RECURSIVE_FILE_NAMES:
+            _record_entry(entries, path, value)
     for root in TRUSTED_CI_TREE_PATHS:
         output = repository.git("ls-tree", "-r", commit_sha, "--", root).stdout
         for line in output.splitlines():
             path, value = _parse_tree_entry(line)
-            if path in entries:
-                raise CIWorkflowTrustError(f"trusted CI definition path is duplicated: {path}")
-            entries[path] = value
+            _record_entry(entries, path, value)
     return entries
+
+
+def _record_entry(entries: dict[str, str], path: str, value: str) -> None:
+    existing = entries.get(path)
+    if existing is not None and existing != value:
+        raise CIWorkflowTrustError(
+            f"trusted CI definition path has conflicting Git entries: {path}"
+        )
+    entries[path] = value
 
 
 def _single_tree_entry(

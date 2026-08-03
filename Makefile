@@ -15,7 +15,7 @@ build-reproducible:
 
 typecheck:
 	mkdir -p reports
-	$(UV) run mypy
+	$(UV) run mypy --config-file pyproject.toml
 
 lint:
 	mkdir -p reports
@@ -29,17 +29,20 @@ format:
 
 test:
 	mkdir -p reports
-	$(UV) run pytest --cov --cov-report=term-missing --cov-report=xml:reports/coverage.xml \
+	$(UV) run pytest -c pyproject.toml --cov --cov-config=pyproject.toml \
+		--cov-report=term-missing --cov-report=xml:reports/coverage.xml \
 		--junitxml=reports/pytest.xml
 
 test-unit:
 	mkdir -p reports
-	$(UV) run pytest -m "not integration" --cov --cov-report=term-missing \
+	$(UV) run pytest -c pyproject.toml -m "not integration" --cov \
+		--cov-config=pyproject.toml --cov-report=term-missing \
 		--cov-report=xml:reports/coverage-unit.xml --junitxml=reports/pytest-unit.xml
 
 test-integration:
 	mkdir -p reports
-	$(UV) run pytest -m integration --junitxml=reports/pytest-integration.xml
+	$(UV) run pytest -c pyproject.toml -m integration \
+		--junitxml=reports/pytest-integration.xml
 
 migration-upgrade:
 	DATABASE_URL="$(MIGRATION_DATABASE_URL)" $(UV) run alembic upgrade head
