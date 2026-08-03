@@ -12,7 +12,11 @@ REQUIRED_CI_JOBS = {"quality", "database", "container"}
 class GitHubData(Protocol):
     def pull_request(self, number: int) -> PullRequest: ...
 
-    def successful_ci_run(self, commit_sha: str) -> CIRun: ...
+    def successful_ci_run(
+        self,
+        commit_sha: str,
+        run_id: int | None = None,
+    ) -> CIRun: ...
 
     def review_evidence(self, number: int, decision: str) -> ReviewEvidence: ...
 
@@ -62,7 +66,13 @@ class GhGitHubData:
             review_decision=str(data.get("reviewDecision") or "not-reviewed"),
         )
 
-    def successful_ci_run(self, commit_sha: str) -> CIRun:
+    def successful_ci_run(
+        self,
+        commit_sha: str,
+        run_id: int | None = None,
+    ) -> CIRun:
+        if run_id is not None:
+            return self._successful_current_run(commit_sha, run_id)
         raw = self._json(
             "run",
             "list",
@@ -91,16 +101,58 @@ class GhGitHubData:
                 "gate status is indeterminate and Evidence must not be generated"
             )
         run_id = _required_int(latest, "databaseId")
-        jobs_raw = self._json(
+        return self._validated_run(latest, run_id)
+
+    def _successful_current_run(self, commit_sha: str, run_id: int) -> CIRun:
+        raw = self._json(
             "run",
             "view",
             str(run_id),
             "--repo",
             self.repository,
             "--json",
-            "jobs",
+            "headSha,status,conclusion,url,jobs",
         )
-        jobs_data = cast(dict[str, list[dict[str, object]]], jobs_raw).get("jobs", [])
+        data = cast(dict[str, object], raw)
+        if _required_sha(data, "headSha") != commit_sha:
+            raise GitHubError(f"CI run {run_id} does not belong to code commit {commit_sha}")
+        return self._validated_run(data, run_id, allow_active=True)
+
+    def _validated_run(
+        self,
+        data: dict[str, object],
+        run_id: int,
+        *,
+        allow_active: bool = False,
+    ) -> CIRun:
+        status = _required_str(data, "status")
+        conclusion = str(data.get("conclusion") or "")
+        if not allow_active and (status != "completed" or conclusion != "success"):
+            raise GitHubError(
+                f"CI run {run_id} is not successful "
+                f"(status={status}, conclusion={conclusion or 'none'})"
+            )
+        if allow_active and status not in {"in_progress", "completed"}:
+            raise GitHubError(f"CI run {run_id} is not active or completed (status={status})")
+        if allow_active and status == "completed" and conclusion != "success":
+            raise GitHubError(
+                f"completed CI run {run_id} is not successful (conclusion={conclusion or 'none'})"
+            )
+        jobs_value = data.get("jobs")
+        if not isinstance(jobs_value, list):
+            jobs_raw = self._json(
+                "run",
+                "view",
+                str(run_id),
+                "--repo",
+                self.repository,
+                "--json",
+                "jobs",
+            )
+            jobs_value = cast(dict[str, object], jobs_raw).get("jobs")
+        if not isinstance(jobs_value, list):
+            raise GitHubError(f"CI run {run_id} did not return jobs")
+        jobs_data = cast(list[dict[str, object]], jobs_value)
         jobs = tuple(
             CIJob(
                 name=_required_str(job, "name"),
@@ -109,9 +161,10 @@ class GhGitHubData:
             )
             for job in jobs_data
         )
-        unsuccessful = [job.name for job in jobs if job.conclusion != "success"]
-        missing = REQUIRED_CI_JOBS - {job.name for job in jobs}
-        if not jobs or unsuccessful or missing:
+        required_jobs = tuple(job for job in jobs if job.name in REQUIRED_CI_JOBS)
+        unsuccessful = [job.name for job in required_jobs if job.conclusion != "success"]
+        missing = REQUIRED_CI_JOBS - {job.name for job in required_jobs}
+        if not required_jobs or unsuccessful or missing:
             details: list[str] = []
             if unsuccessful:
                 details.append(f"unsuccessful: {', '.join(unsuccessful)}")
@@ -124,11 +177,11 @@ class GhGitHubData:
             )
         return CIRun(
             run_id=run_id,
-            commit_sha=_required_sha(latest, "headSha"),
-            status=status,
-            conclusion=conclusion,
-            url=_required_str(latest, "url"),
-            jobs=jobs,
+            commit_sha=_required_sha(data, "headSha"),
+            status="required-jobs-completed" if status == "in_progress" else status,
+            conclusion="success",
+            url=_required_str(data, "url"),
+            jobs=required_jobs,
         )
 
     def review_evidence(self, number: int, decision: str) -> ReviewEvidence:

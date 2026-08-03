@@ -47,3 +47,9 @@ class EvidenceBinding:
     code_commit_sha: str
     ci_run_id: int
     ci_conclusion: str
+
+
+@dataclass(frozen=True)
+class EvidenceSkip:
+    head_sha: str
+    reason: str

@@ -65,16 +65,26 @@ class FakeGitHubData:
         self.pr = pull_request
         self.ci = ci_run
         self.reviews = reviews or ReviewEvidence("not-reviewed", (), ())
+        self.calls: list[str] = []
 
     def pull_request(self, number: int) -> PullRequest:
+        self.calls.append("pull_request")
         assert number == self.pr.number
         return self.pr
 
-    def successful_ci_run(self, commit_sha: str) -> CIRun:
+    def successful_ci_run(
+        self,
+        commit_sha: str,
+        run_id: int | None = None,
+    ) -> CIRun:
+        self.calls.append("successful_ci_run")
         assert commit_sha == self.pr.head_sha
+        if run_id is not None:
+            assert run_id == self.ci.run_id
         return self.ci
 
     def review_evidence(self, number: int, decision: str) -> ReviewEvidence:
+        self.calls.append("review_evidence")
         assert number == self.pr.number
         assert decision == self.pr.review_decision
         return self.reviews

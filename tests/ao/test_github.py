@@ -91,3 +91,38 @@ def test_gh_provider_rejects_missing_required_job_without_network() -> None:
 
     with pytest.raises(GitHubError, match="missing: container"):
         GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
+
+
+def test_gh_provider_accepts_current_run_after_required_jobs_complete() -> None:
+    runner = StubRunner(
+        [
+            {
+                "conclusion": "",
+                "headSha": SHA,
+                "jobs": [
+                    {
+                        "conclusion": "success",
+                        "name": name,
+                        "url": f"https://example.invalid/jobs/{name}",
+                    }
+                    for name in ("quality", "database", "container")
+                ]
+                + [
+                    {
+                        "conclusion": "",
+                        "name": "evidence",
+                        "url": "https://example.invalid/jobs/evidence",
+                    }
+                ],
+                "status": "in_progress",
+                "url": "https://example.invalid/runs/88",
+            }
+        ]
+    )
+
+    ci_run = GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA, 88)
+
+    assert ci_run.run_id == 88
+    assert ci_run.status == "required-jobs-completed"
+    assert ci_run.conclusion == "success"
+    assert {job.name for job in ci_run.jobs} == {"quality", "database", "container"}

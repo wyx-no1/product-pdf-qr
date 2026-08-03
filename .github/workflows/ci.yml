@@ -97,3 +97,40 @@ jobs:
         run: docker compose logs
       - if: always()
         run: docker compose down --volumes
+
+  evidence:
+    if: github.event_name == 'pull_request'
+    needs:
+      - quality
+      - database
+      - container
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configure Evidence commit identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Generate and push bound Evidence Snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          # GITHUB_TOKEN pushes do not start another workflow. The generator also
+          # structurally skips a HEAD that changes only docs/evidence/**, so a
+          # future PAT or deploy-key migration cannot create a generation loop.
+          python -m scripts.ao evidence \
+            --repo . \
+            --pr "$PR_NUMBER" \
+            --ci-run-id "$RUN_ID"

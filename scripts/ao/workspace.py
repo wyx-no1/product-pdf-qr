@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -102,7 +103,6 @@ class WorkspaceLease:
                     "result": "failure",
                 },
             )
-            self._release_lock()
             raise WorkspaceError(f"failed to clean Advisor worktree {self.path}")
         self.closed = True
         self._release_lock()
@@ -126,6 +126,20 @@ class WorkspaceLease:
         return bool(
             data.get("pr_number") == self.binding.pr_number
             and data.get("commit_sha") == self.binding.code_commit_sha
+        )
+
+    def record_advisor_process(self, process_id: int) -> None:
+        try:
+            marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise WorkspaceError("cannot update Advisor workspace lifecycle marker") from error
+        if not isinstance(marker, dict):
+            raise WorkspaceError("Advisor workspace lifecycle marker is invalid")
+        marker["advisor_pid"] = process_id
+        marker["advisor_process_group_id"] = process_id
+        self.marker_path.write_text(
+            json.dumps(marker, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
 
     def _release_lock(self) -> None:
@@ -277,14 +291,24 @@ class WorkspaceResolver:
         metadata_path: Path,
         command: Sequence[str],
         record_path: Path,
+        *,
+        timeout_seconds: float,
+        terminate_grace_seconds: float = 5.0,
     ) -> int:
         if not command:
             raise WorkspaceError("Advisor command must not be empty")
+        if timeout_seconds <= 0:
+            raise WorkspaceError("Advisor timeout must be greater than zero")
+        if terminate_grace_seconds <= 0:
+            raise WorkspaceError("Advisor termination grace period must be greater than zero")
         lease = self.acquire(metadata_path)
         process: subprocess.Popen[str] | None = None
         started_at = self.now()
         status = "interrupted"
         exit_code: int | None = None
+        process_return_code: int | None = None
+        termination_method: str | None = None
+        failure_reason: str | None = None
         cleanup_succeeded = False
         try:
             environment = os.environ.copy()
@@ -299,36 +323,87 @@ class WorkspaceResolver:
                 list(command),
                 cwd=lease.path,
                 env=environment,
+                start_new_session=True,
                 text=True,
             )
-            exit_code = process.wait()
-            status = "completed" if exit_code == 0 else "command-failed"
-            return exit_code
+            lease.record_advisor_process(process.pid)
+            try:
+                process_return_code = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                status = "timed-out"
+                exit_code = 124
+                failure_reason = f"Advisor exceeded timeout of {timeout_seconds} seconds"
+                termination_method = _terminate_process_group(
+                    process,
+                    terminate_grace_seconds,
+                )
+            else:
+                exit_code = process_return_code
+                status = "completed" if exit_code == 0 else "command-failed"
+                if exit_code != 0:
+                    failure_reason = f"Advisor command exited with status {exit_code}"
+        except BaseException as error:
+            failure_reason = f"{type(error).__name__}: {error}"
+            if process is not None and process.poll() is None:
+                termination_method = _terminate_process_group(
+                    process,
+                    terminate_grace_seconds,
+                )
+            raise
         finally:
             if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                termination_method = _terminate_process_group(
+                    process,
+                    terminate_grace_seconds,
+                )
             try:
                 lease.close()
                 cleanup_succeeded = True
             finally:
                 record = {
                     "cleanup_succeeded": cleanup_succeeded,
-                    "command": list(command),
                     "evidence_metadata": str(metadata_path.resolve()),
                     "exit_code": exit_code,
+                    "failure_reason": failure_reason,
                     "finished_at": self.now().isoformat(),
                     "pr_number": lease.binding.pr_number,
+                    "process_return_code": (
+                        process.returncode if process is not None else process_return_code
+                    ),
                     "reviewed_commit_sha": lease.binding.code_commit_sha,
                     "started_at": started_at.isoformat(),
                     "status": status,
+                    "termination_method": termination_method,
+                    "timeout_seconds": timeout_seconds,
                     "workspace_path": str(lease.path),
                 }
                 _write_json_atomic(record_path, record)
+                append_json_event(
+                    self.log_path,
+                    {
+                        "action": "advisor.run",
+                        "cleanup_succeeded": cleanup_succeeded,
+                        "commit_sha": lease.binding.code_commit_sha,
+                        "failure_reason": failure_reason,
+                        "finished_at": self.now().isoformat(),
+                        "gate_status": (
+                            "valid"
+                            if status == "completed" and cleanup_succeeded
+                            else "indeterminate"
+                        ),
+                        "path": str(lease.path),
+                        "pr_number": lease.binding.pr_number,
+                        "result": (
+                            "success" if status == "completed" and cleanup_succeeded else "failure"
+                        ),
+                        "status": status,
+                        "termination_method": termination_method,
+                        "timeout_seconds": timeout_seconds,
+                    },
+                )
+        if exit_code is None:
+            raise WorkspaceError("Advisor process finished without an exit status")
+        return exit_code
 
 
 def detect_stale_worktrees(
@@ -579,6 +654,29 @@ def _write_json_atomic(path: Path, value: dict[str, object]) -> None:
 
 def _marker_path(worktree_path: Path) -> Path:
     return worktree_path.with_name(f".{worktree_path.name}.ao-workspace.json")
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[str],
+    grace_seconds: float,
+) -> str:
+    if process.poll() is not None:
+        return "already-exited"
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return "already-exited"
+    try:
+        process.wait(timeout=grace_seconds)
+        return "sigterm"
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        return "sigkill"
 
 
 def _workspace_prefix(repository: GitRepository, binding: EvidenceBinding) -> str:

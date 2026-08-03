@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -147,7 +149,7 @@ def test_advisor_run_records_actual_sha_and_cleans_after_command(
         ),
     )
 
-    assert resolver.run_advisor(metadata, command, record) == 0
+    assert resolver.run_advisor(metadata, command, record, timeout_seconds=5) == 0
 
     data = json.loads(record.read_text(encoding="utf-8"))
     assert data["reviewed_commit_sha"] == fixture.code_sha
@@ -155,6 +157,59 @@ def test_advisor_run_records_actual_sha_and_cleans_after_command(
     assert data["cleanup_succeeded"] is True
     assert observed.read_text(encoding="utf-8") == fixture.code_sha
     assert not Path(data["workspace_path"]).exists()
+
+
+def test_timeout_kills_process_group_before_worktree_and_lock_cleanup(
+    tmp_path: Path,
+) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
+    record = tmp_path / "timeout-record.json"
+    pid_file = tmp_path / "advisor.pid"
+    event_log = tmp_path / "events.jsonl"
+    resolver = WorkspaceResolver(
+        GitRepository(fixture.repository),
+        temp_root=tmp_path / "advisor-worktrees",
+        log_path=event_log,
+        now=lambda: NOW,
+    )
+    command = (
+        sys.executable,
+        "-c",
+        (
+            "import os,pathlib,signal,time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+            "time.sleep(30)"
+        ),
+    )
+
+    result = resolver.run_advisor(
+        metadata,
+        command,
+        record,
+        timeout_seconds=0.5,
+        terminate_grace_seconds=0.2,
+    )
+
+    assert result == 124
+    child_pid = int(pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    data = json.loads(record.read_text(encoding="utf-8"))
+    assert data["status"] == "timed-out"
+    assert data["termination_method"] == "sigkill"
+    assert data["timeout_seconds"] == 0.5
+    assert data["cleanup_succeeded"] is True
+    assert "exceeded timeout" in data["failure_reason"]
+    assert not Path(data["workspace_path"]).exists()
+    events = [json.loads(line) for line in event_log.read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["action"] == "advisor.run"
+    assert events[-1]["gate_status"] == "indeterminate"
+    assert events[-1]["termination_method"] == "sigkill"
+
+    with resolver.acquire(metadata) as lease:
+        assert lease.path.exists()
 
 
 def test_sigterm_interrupt_still_cleans_worktree(tmp_path: Path) -> None:
@@ -212,6 +267,92 @@ def test_sigterm_interrupt_still_cleans_worktree(tmp_path: Path) -> None:
     assert data["cleanup_succeeded"] is True
     assert not Path(data["workspace_path"]).exists()
     assert "advisor-pr-41-" not in git(fixture.repository, "worktree", "list", "--porcelain").stdout
+
+
+def test_sigkill_releases_kernel_lock_but_leaves_detectable_worktree(
+    tmp_path: Path,
+) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    repository = GitRepository(fixture.repository)
+    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
+    record = tmp_path / "killed-record.json"
+    pid_file = tmp_path / "advisor.pid"
+    temp_root = tmp_path / "advisor-worktrees"
+    project_root = Path(__file__).resolve().parents[2]
+    process = subprocess.Popen(
+        (
+            sys.executable,
+            "-m",
+            "scripts.ao",
+            "advisor-run",
+            "--repo",
+            str(fixture.repository),
+            "--metadata",
+            str(metadata),
+            "--record",
+            str(record),
+            "--temp-root",
+            str(temp_root),
+            "--timeout-seconds",
+            "30",
+            "--",
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,time; "
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+                "time.sleep(30)"
+            ),
+        ),
+        cwd=project_root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not pid_file.exists():
+        if process.poll() is not None:
+            pytest.fail(f"advisor parent exited early: {process.communicate()}")
+        time.sleep(0.05)
+    assert pid_file.exists()
+    child_pid = int(pid_file.read_text(encoding="utf-8"))
+
+    process.kill()
+    process.wait(timeout=5)
+
+    assert process.returncode is not None and process.returncode < 0
+    assert not record.exists()
+    registered = git(fixture.repository, "worktree", "list", "--porcelain").stdout
+    assert "advisor-pr-41-" in registered
+    lock_path = (
+        repository.common_git_dir()
+        / "ao"
+        / "locks"
+        / (f"{repository.project_name()}-advisor-pr-41-{fixture.code_sha[:12]}.lock")
+    )
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(lock_fd)
+
+    os.killpg(child_pid, signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    stale = detect_stale_worktrees(
+        repository,
+        temp_root=temp_root,
+        older_than_seconds=0,
+    )
+    assert len(stale) == 1
+    assert "advisor-pr-41-" in stale[0].path.name
+    reclaim_stale_worktrees(repository, stale, log_path=tmp_path / "reclaim.jsonl")
+    assert not stale[0].path.exists()
 
 
 def test_stale_legacy_worktree_detection_and_reclaim(tmp_path: Path) -> None:

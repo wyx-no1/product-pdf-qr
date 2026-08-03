@@ -14,6 +14,7 @@ from typing import Never
 from scripts.ao.evidence import EvidenceGenerator
 from scripts.ao.git import GitRepository
 from scripts.ao.github import GhGitHubData
+from scripts.ao.models import EvidenceSkip
 from scripts.ao.workspace import (
     WorkspaceResolver,
     detect_stale_worktrees,
@@ -36,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.add_argument("--repo", type=Path, required=True)
     evidence.add_argument("--pr", type=int, required=True)
     evidence.add_argument("--log", type=Path)
+    evidence.add_argument(
+        "--ci-run-id",
+        type=int,
+        help="current workflow run whose required code jobs have completed",
+    )
 
     advisor = commands.add_parser("advisor-run", help="run Advisor in a bound worktree")
     advisor.add_argument("--repo", type=Path, required=True)
@@ -43,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     advisor.add_argument("--record", type=Path, required=True)
     advisor.add_argument("--temp-root", type=Path)
     advisor.add_argument("--log", type=Path)
+    advisor.add_argument("--timeout-seconds", type=float, default=1800.0)
     advisor.add_argument("advisor_command", nargs=argparse.REMAINDER)
 
     validate = commands.add_parser(
@@ -106,7 +113,16 @@ def _evidence(arguments: argparse.Namespace) -> int:
         github,
         log_path=arguments.log,
     )
-    result = generator.generate(arguments.pr)
+    result = generator.generate(arguments.pr, ci_run_id=arguments.ci_run_id)
+    if isinstance(result, EvidenceSkip):
+        _print_json(
+            {
+                "head_sha": result.head_sha,
+                "reason": result.reason,
+                "result": "skipped",
+            }
+        )
+        return 0
     _print_json(
         {
             "ci_run_id": result.ci_run_id,
@@ -130,7 +146,12 @@ def _advisor_run(arguments: argparse.Namespace) -> int:
         log_path=arguments.log,
     )
     with _handled_termination_signals():
-        return resolver.run_advisor(arguments.metadata, command, arguments.record)
+        return resolver.run_advisor(
+            arguments.metadata,
+            command,
+            arguments.record,
+            timeout_seconds=arguments.timeout_seconds,
+        )
 
 
 def _advisor_validate(arguments: argparse.Namespace) -> int:

@@ -10,10 +10,11 @@ from scripts.ao.evidence import (
     EVIDENCE_FILES,
     EvidenceError,
     EvidenceGenerator,
+    SnapshotResult,
     parse_evidence_binding,
 )
 from scripts.ao.git import GitRepository
-from scripts.ao.models import CIRun
+from scripts.ao.models import CIRun, EvidenceSkip
 from tests.ao.helpers import (
     FakeGitHubData,
     commit_paths,
@@ -35,7 +36,7 @@ def test_snapshot_uses_three_dot_diff_and_contains_exact_files(tmp_path: Path) -
         now=lambda: NOW,
     )
 
-    result = generator.generate(41, commit=False)
+    result = _snapshot(generator.generate(41, commit=False))
 
     assert {path.name for path in result.directory.iterdir()} == EVIDENCE_FILES
     expected = git(
@@ -85,14 +86,15 @@ def test_snapshot_uses_three_dot_diff_and_contains_exact_files(tmp_path: Path) -
 
 def test_snapshot_is_a_separate_evidence_only_commit(tmp_path: Path) -> None:
     fixture = make_diverged_repository(tmp_path)
+    github = github_for(fixture.code_sha)
     generator = EvidenceGenerator(
         GitRepository(fixture.repository),
-        github_for(fixture.code_sha),
+        github,
         log_path=tmp_path / "events.jsonl",
         now=lambda: NOW,
     )
 
-    result = generator.generate(41)
+    result = _snapshot(generator.generate(41))
 
     assert result.evidence_commit_sha is not None
     assert git(fixture.repository, "rev-parse", "HEAD^").stdout.strip() == fixture.code_sha
@@ -115,6 +117,41 @@ def test_snapshot_is_a_separate_evidence_only_commit(tmp_path: Path) -> None:
         git(fixture.repository, "log", "-1", "--format=%s").stdout.strip()
         == "docs: add PR41 review evidence"
     )
+
+
+def test_second_automatic_invocation_structurally_skips_evidence_only_head(
+    tmp_path: Path,
+) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    github = github_for(fixture.code_sha)
+    log_path = tmp_path / "events.jsonl"
+    generator = EvidenceGenerator(
+        GitRepository(fixture.repository),
+        github,
+        log_path=log_path,
+        now=lambda: NOW,
+    )
+    _snapshot(generator.generate(41))
+    first_call_count = len(github.calls)
+    git(
+        fixture.repository,
+        "commit",
+        "--amend",
+        "-m",
+        "wording deliberately unrelated to Evidence",
+    )
+    evidence_head = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
+
+    second = generator.generate(41)
+
+    assert isinstance(second, EvidenceSkip)
+    assert second.head_sha == evidence_head
+    assert "only docs/evidence/**" in second.reason
+    assert len(github.calls) == first_call_count
+    assert git(fixture.repository, "rev-parse", "HEAD").stdout.strip() == evidence_head
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["result"] for event in events] == ["success", "skipped"]
+    assert events[1]["reason"] == second.reason
 
 
 def test_regeneration_excludes_previous_evidence_from_patch(tmp_path: Path) -> None:
@@ -142,7 +179,7 @@ def test_regeneration_excludes_previous_evidence_from_patch(tmp_path: Path) -> N
         now=lambda: NOW,
     )
 
-    result = generator.generate(41, commit=False)
+    result = _snapshot(generator.generate(41, commit=False))
     patch = (result.directory / "diff.patch").read_text(encoding="utf-8")
 
     assert "next-code.txt" in patch
@@ -233,3 +270,8 @@ def test_binding_parser_requires_all_four_bindings(tmp_path: Path) -> None:
 
     with pytest.raises(EvidenceError, match="CI conclusion"):
         parse_evidence_binding(metadata)
+
+
+def _snapshot(result: SnapshotResult | object) -> SnapshotResult:
+    assert isinstance(result, SnapshotResult)
+    return result

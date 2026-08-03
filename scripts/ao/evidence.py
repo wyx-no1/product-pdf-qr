@@ -11,7 +11,7 @@ from pathlib import Path
 
 from scripts.ao.git import GitRepository, append_json_event
 from scripts.ao.github import GitHubData
-from scripts.ao.models import CIRun, EvidenceBinding, PullRequest, ReviewEvidence
+from scripts.ao.models import CIRun, EvidenceBinding, EvidenceSkip, PullRequest, ReviewEvidence
 
 EVIDENCE_FILES = {
     "metadata.md",
@@ -71,7 +71,8 @@ class EvidenceGenerator:
         *,
         commit: bool = True,
         push: bool | None = None,
-    ) -> SnapshotResult:
+        ci_run_id: int | None = None,
+    ) -> SnapshotResult | EvidenceSkip:
         should_push = commit if push is None else push
         if should_push and not commit:
             raise ValueError("Evidence cannot be pushed without a separate commit")
@@ -81,6 +82,23 @@ class EvidenceGenerator:
         ci_run: CIRun | None = None
         try:
             self._require_clean_worktree()
+            evidence_only = self._evidence_only_head()
+            if evidence_only is not None:
+                append_json_event(
+                    self.log_path,
+                    {
+                        "action": "evidence.generate",
+                        "duration_seconds": round(time.monotonic() - started, 6),
+                        "finished_at": self.now().isoformat(),
+                        "gate_status": "not-applicable",
+                        "head_sha": evidence_only.head_sha,
+                        "pr_number": pr_number,
+                        "reason": evidence_only.reason,
+                        "result": "skipped",
+                        "started_at": started_at.isoformat(),
+                    },
+                )
+                return evidence_only
             pull_request = self.github.pull_request(pr_number)
             self._validate_pr_number(pr_number, pull_request)
             self.repository.fetch(
@@ -89,7 +107,7 @@ class EvidenceGenerator:
                 pull_request.source_branch,
             )
             self._require_checked_out_code_commit(pull_request)
-            ci_run = self.github.successful_ci_run(pull_request.head_sha)
+            ci_run = self.github.successful_ci_run(pull_request.head_sha, ci_run_id)
             self._validate_ci_binding(pull_request, ci_run)
             reviews = self.github.review_evidence(
                 pull_request.number,
@@ -146,6 +164,27 @@ class EvidenceGenerator:
             )
             raise
 
+    def _evidence_only_head(self) -> EvidenceSkip | None:
+        head_sha = self.repository.git("rev-parse", "HEAD").stdout.strip()
+        paths = tuple(
+            path
+            for path in self.repository.git(
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "HEAD",
+            ).stdout.splitlines()
+            if path
+        )
+        if paths and all(path.startswith("docs/evidence/") for path in paths):
+            return EvidenceSkip(
+                head_sha=head_sha,
+                reason="HEAD changes only docs/evidence/**; generation loop prevented",
+            )
+        return None
+
     def _require_clean_worktree(self) -> None:
         status = self.repository.git("status", "--porcelain").stdout
         if status:
@@ -190,7 +229,10 @@ class EvidenceGenerator:
                 f"CI run {ci_run.run_id} belongs to {ci_run.commit_sha}, "
                 f"not PR code commit {pull_request.head_sha}"
             )
-        if ci_run.status != "completed" or ci_run.conclusion != "success":
+        if (
+            ci_run.status not in {"completed", "required-jobs-completed"}
+            or ci_run.conclusion != "success"
+        ):
             raise EvidenceError(
                 f"CI run {ci_run.run_id} is not completed successfully; "
                 "gate status is indeterminate"
@@ -443,6 +485,13 @@ def _metadata_markdown(
         "\n".join(f"| `{sha}` | {_escape(subject)} |" for sha, subject in commits)
         or "| — | No commits in comparison range |"
     )
+    ci_timing_note = (
+        "\n> The automatic Evidence job runs after the `quality`, `database`, and "
+        "`container`\n> jobs succeed. At snapshot time the enclosing workflow is "
+        "still active only because\n> this blocking Evidence job is its final job."
+        if ci.status == "required-jobs-completed"
+        else ""
+    )
     return f"""# Evidence Snapshot for PR #{pr.number}
 
 ## Binding
@@ -464,6 +513,7 @@ def _metadata_markdown(
 > The CI result above belongs to code commit `{pr.head_sha}`, not to the later
 > Evidence commit. The Evidence commit must not be used as a new generation trigger;
 > doing so would create a CI/Evidence loop.
+{ci_timing_note}
 
 ## Change overview
 
@@ -554,6 +604,13 @@ def _validation_markdown(
     )
     comment_rows = "\n".join(f"- {url}" for url in reviews.line_comment_urls) or "- None"
     review_rows = "\n".join(f"- {url}" for url in reviews.review_urls) or "- None"
+    ci_timing_note = (
+        "\nThe automatic Evidence job observed all three required code jobs as "
+        "successful. The\nworkflow status was still active solely because the "
+        "blocking Evidence job had not yet\nfinished."
+        if ci.status == "required-jobs-completed"
+        else ""
+    )
     return f"""# Validation record for PR #{pr.number}
 
 Created at: `{created_at.isoformat()}`
@@ -577,6 +634,7 @@ is authoritative.
 > that contains this directory. Do not regenerate Evidence to describe its own
 > commit. A later code change requires a new successful CI run and a regenerated
 > snapshot.
+{ci_timing_note}
 
 | Job | Conclusion | URL |
 |---|---|---|
