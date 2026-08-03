@@ -9,14 +9,14 @@
 | PR URL | https://github.com/wyx-no1/product-pdf-qr/pull/12 |
 | Source branch | `feat/ao-p0-1-evidence-snapshot` |
 | Target branch | `main` |
-| Code commit SHA | `1873316ff372fc5ab7c4a1adb9131fc966b21cae` |
+| Code commit SHA | `279b970471cce613c6ad7eb3f8501936afebf036` |
 | Merge base | `af82f581c83bd023b4d17ccc4231a2802acf6f2c` |
-| CI run ID | `30794231743` |
+| CI run ID | `30795493137` |
 | CI conclusion | `success` |
-| CI URL | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30794231743 |
-| Created at | `2026-08-03T07:37:58.524521+00:00` |
+| CI URL | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30795493137 |
+| Created at | `2026-08-03T07:59:11.122296+00:00` |
 
-> The CI result above belongs to code commit `1873316ff372fc5ab7c4a1adb9131fc966b21cae`, not to the later
+> The CI result above belongs to code commit `279b970471cce613c6ad7eb3f8501936afebf036`, not to the later
 > Evidence commit. The Evidence commit must not be used as a new generation trigger;
 > doing so would create a CI/Evidence loop.
 
@@ -26,11 +26,11 @@
 | Metric | Value |
 |---|---:|
 | Changed files | 18 |
-| Added lines | 3855 |
+| Added lines | 4152 |
 | Deleted lines | 0 |
 
 The authoritative patch was generated with the three-dot comparison
-`git diff origin/main...1873316ff372fc5ab7c4a1adb9131fc966b21cae -- . ':(exclude)docs/evidence/**'`.
+`git diff origin/main...279b970471cce613c6ad7eb3f8501936afebf036 -- . ':(exclude)docs/evidence/**'`.
 The entire `docs/evidence/**` tree is excluded to prevent self-reference. No source
 files are copied into this directory.
 
@@ -38,6 +38,8 @@ files are copied into this directory.
 
 | Commit | Subject |
 |---|---|
+| `279b970471cce613c6ad7eb3f8501936afebf036` | fix: verify trusted Evidence before skip |
+| `b9f482464ebd73b6544a7ca6b333fd3c7a7c762c` | docs: add PR12 review evidence |
 | `1873316ff372fc5ab7c4a1adb9131fc966b21cae` | fix: attest skipped Evidence snapshots |
 | `3b745fb19fe2bcedba32e185c56d4287d1c82e06` | docs: add PR12 review evidence |
 | `80157fb3ae1e3a955eb0da29557dad80e57bc437` | fix: secure AO evidence publication |
@@ -54,6 +56,6 @@ eliminate selection bias or blind spots. `diff.patch` is the complete authoritat
 change record for scope questions, excluding only `docs/evidence/**`.
 
 Evidence does not replace source review. An Advisor must read both this snapshot and
-the source at code commit `1873316ff372fc5ab7c4a1adb9131fc966b21cae`. If Evidence and source disagree, source is
+the source at code commit `279b970471cce613c6ad7eb3f8501936afebf036`. If Evidence and source disagree, source is
 authoritative and the Evidence error must be reported. The tool cannot mechanically
 prove that an Advisor actually read the source.

@@ -31,10 +31,10 @@ index 9f2358e..a881d01 100644
        - name: Verify repeated clean-volume startup ordering
 diff --git a/.github/workflows/evidence-publish.yml b/.github/workflows/evidence-publish.yml
 new file mode 100644
-index 0000000..d457042
+index 0000000..c7c7e0c
 --- /dev/null
 +++ b/.github/workflows/evidence-publish.yml
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,141 @@
 +name: Evidence Publish
 +
 +on:
@@ -140,9 +140,10 @@ index 0000000..d457042
 +          test -n "$evidence_sha"
 +
 +          if [[ "$generation_result" == "skipped" ]]; then
-+            # A skip may preserve an existing trusted green status, but it may
-+            # never mint one. An author-supplied Evidence-only SHA has no prior
-+            # bot-owned attestation and fails closed here.
++            # The generator already verified all five files plus the exact-SHA,
++            # server-authenticated publisher attestation before returning skip.
++            # Repeat that trusted verification here as defense in depth. A skip
++            # may preserve an existing green status but may never mint one.
 +            python -m scripts.ao evidence-verify-head \
 +              --repo ../candidate \
 +              --pr "$PR_NUMBER" \
@@ -184,10 +185,10 @@ index 0000000..2bd3938
 +"""Repository automation scripts."""
 diff --git a/scripts/ao/README.md b/scripts/ao/README.md
 new file mode 100644
-index 0000000..ffea843
+index 0000000..42d6c82
 --- /dev/null
 +++ b/scripts/ao/README.md
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,115 @@
 +# AO Evidence and Advisor workspace tools
 +
 +These repository-local Python 3.12 tools implement the two parts of AO P0-1. They
@@ -217,20 +218,31 @@ index 0000000..ffea843
 +update makes the push fail instead of overwriting newer code.
 +
 +Before publishing a successful `AO / evidence-snapshot` status on the new head, the
-+trusted verifier proves that the commit changes exactly those five Evidence files,
-+its parent and metadata bind the successful source CI, its three-dot patch matches
-+the bound code diff, and the remote PR head is that exact commit. The status
-+description names the parent SHA and source run. Failure posts a failure status;
-+there is no unconditional green path.
++trusted verifier proves that the commit changes exactly those five regular Evidence
++files and that the remote PR head is that exact commit. It reconstructs
++`metadata.md`, `changed-files.md`, `diff.patch`, `validation.md`, and
++`advisor-context.md` from the bound parent, three-dot Git diff, current PR metadata,
++the exact successful CI run, and scoped GitHub review records. The creation time is
++the only reference-only metadata value: it must be a timezone-qualified ISO-8601
++value and is reused while reconstructing both files that record it. All binding,
++merge-base, change-count, file-list, patch, CI, job, branch, URL, and Advisor
++instructions are compared to independently retrieved facts. The status description
++names the parent SHA and source run. Failure posts a failure status and records an
++indeterminate event; there is no warning, neutral, or unconditional green path.
 +
 +A `GITHUB_TOKEN` PR update may create an approval-required, zero-job run. That record
 +is neither success nor test failure and remains indeterminate. The independent
 +content-based skip keeps the publisher finite if that run is approved or the
-+credential later changes to a PAT or deploy key. A skipped head can only preserve a
-+pre-existing successful `AO / evidence-snapshot` status created by
-+`github-actions[bot]` with the exact parent SHA, source CI, and workflow-run target.
-+It can never mint the first green status. Therefore an author-supplied or tampered
-+Evidence-only commit fails closed even when its path shape and patch look valid.
++credential later changes to a PAT or deploy key. Path shape only identifies a skip
++candidate; before returning `skipped`, the generator itself runs the complete
++verification above and requires a pre-existing successful `AO / evidence-snapshot`
++status on the exact immutable SHA. Generator identity comes from the GitHub Status
++API's server-authenticated creator object: numeric account ID `41898282`, login
++`github-actions[bot]`, and type `Bot`, plus the exact parent/source-CI description
++and repository workflow-run URL. These are not Git committer strings and cannot be
++set by PR content or `git config`. The workflow repeats the verification and never
++posts success on the skip branch. Therefore an author-supplied, incomplete, or
++tampered Evidence-only commit fails closed.
 +
 +Generation uses `origin/<base>...<code-sha>` and excludes all of
 +`docs/evidence/**`. Failure exits nonzero, records an `indeterminate` gate event in
@@ -583,10 +595,10 @@ index 0000000..75db7f4
 +            signal.signal(signum, handler)
 diff --git a/scripts/ao/evidence.py b/scripts/ao/evidence.py
 new file mode 100644
-index 0000000..fc6a718
+index 0000000..9203ce4
 --- /dev/null
 +++ b/scripts/ao/evidence.py
-@@ -0,0 +1,861 @@
+@@ -0,0 +1,1045 @@
 +from __future__ import annotations
 +
 +import re
@@ -594,7 +606,7 @@ index 0000000..fc6a718
 +import tempfile
 +import time
 +from collections.abc import Callable
-+from dataclasses import dataclass
++from dataclasses import dataclass, replace
 +from datetime import UTC, datetime
 +from pathlib import Path
 +
@@ -683,13 +695,22 @@ index 0000000..fc6a718
 +            self._require_clean_worktree()
 +            evidence_only = self._evidence_only_head()
 +            if evidence_only is not None:
++                verified = verify_evidence_head(
++                    self.repository,
++                    self.github,
++                    pr_number,
++                    evidence_only.head_sha,
++                    require_prior_attestation=True,
++                )
 +                append_json_event(
 +                    self.log_path,
 +                    {
 +                        "action": "evidence.generate",
++                        "ci_run_id": verified.ci_run_id,
++                        "code_commit_sha": verified.code_commit_sha,
 +                        "duration_seconds": round(time.monotonic() - started, 6),
 +                        "finished_at": self.now().isoformat(),
-+                        "gate_status": "not-applicable",
++                        "gate_status": "already-attested",
 +                        "head_sha": evidence_only.head_sha,
 +                        "pr_number": pr_number,
 +                        "reason": evidence_only.reason,
@@ -780,7 +801,10 @@ index 0000000..fc6a718
 +        if paths and all(path.startswith("docs/evidence/") for path in paths):
 +            return EvidenceSkip(
 +                head_sha=head_sha,
-+                reason="HEAD changes only docs/evidence/**; generation loop prevented",
++                reason=(
++                    "HEAD is a fully verified, previously attested AO Evidence commit; "
++                    "generation loop prevented"
++                ),
 +            )
 +        return None
 +
@@ -1020,7 +1044,10 @@ index 0000000..fc6a718
 +        if path.is_symlink() or not path.is_file():
 +            raise EvidenceError(f"Evidence entry must be a regular file: {path}")
 +
-+    binding = parse_evidence_binding(directory / "metadata.md")
++    metadata_path = directory / "metadata.md"
++    metadata_text = metadata_path.read_text(encoding="utf-8")
++    binding = parse_evidence_binding(metadata_path)
++    created_at = _metadata_created_at(metadata_text)
 +    if binding.pr_number != pr_number:
 +        raise EvidenceError(
 +            f"Evidence metadata binds PR #{binding.pr_number}, not requested PR #{pr_number}"
@@ -1062,9 +1089,75 @@ index 0000000..fc6a718
 +    ):
 +        raise EvidenceError("Evidence metadata does not bind an exact completed successful CI run")
 +
++    code_pull_request = replace(pull_request, head_sha=binding.code_commit_sha)
++    base_ref = f"origin/{binding.target_branch}"
++    comparison = f"{base_ref}...{binding.code_commit_sha}"
++    merge_base = repository.git(
++        "merge-base",
++        base_ref,
++        binding.code_commit_sha,
++    ).stdout.strip()
++    changed_files = _parse_name_status(
++        repository.git(
++            "diff",
++            "--name-status",
++            comparison,
++            "--",
++            ".",
++            EVIDENCE_EXCLUSION,
++        ).stdout
++    )
++    additions, deletions = _parse_numstat(
++        repository.git(
++            "diff",
++            "--numstat",
++            comparison,
++            "--",
++            ".",
++            EVIDENCE_EXCLUSION,
++        ).stdout
++    )
++    commits = _parse_commits(
++        repository.git(
++            "log",
++            "--format=%H%x09%s",
++            f"{merge_base}..{binding.code_commit_sha}",
++        ).stdout
++    )
++
++    expected_metadata = _metadata_markdown(
++        code_pull_request,
++        ci_run,
++        merge_base,
++        changed_files,
++        additions,
++        deletions,
++        commits,
++        created_at,
++    )
++    if metadata_text != expected_metadata:
++        raise EvidenceError(
++            "Evidence metadata.md is incomplete or does not match the bound PR, "
++            "commit, merge base, CI, and change metrics"
++        )
++
++    expected_changed_files = _changed_files_markdown(
++        code_pull_request,
++        merge_base,
++        changed_files,
++        additions,
++        deletions,
++    )
++    actual_changed_files = (directory / "changed-files.md").read_text(encoding="utf-8")
++    if actual_changed_files != expected_changed_files:
++        raise EvidenceError(
++            "Evidence changed-files.md does not match the recomputed three-dot "
++            "name-status and line counts"
++        )
++
 +    expected_patch = repository.git(
 +        "diff",
-+        f"origin/{binding.target_branch}...{binding.code_commit_sha}",
++        comparison,
 +        "--",
 +        ".",
 +        EVIDENCE_EXCLUSION,
@@ -1072,6 +1165,38 @@ index 0000000..fc6a718
 +    actual_patch = (directory / "diff.patch").read_text(encoding="utf-8")
 +    if actual_patch != expected_patch:
 +        raise EvidenceError("Evidence diff.patch does not match the bound three-dot code diff")
++
++    validation_text = (directory / "validation.md").read_text(encoding="utf-8")
++    recorded_reviews = _validation_review_evidence(validation_text, code_pull_request)
++    current_reviews = github.review_evidence(
++        pull_request.number,
++        pull_request.review_decision,
++    )
++    if not set(recorded_reviews.line_comment_urls).issubset(
++        current_reviews.line_comment_urls
++    ) or not set(recorded_reviews.review_urls).issubset(current_reviews.review_urls):
++        raise EvidenceError(
++            "Evidence validation.md contains review URLs not present in GitHub's current PR records"
++        )
++    expected_validation = _validation_markdown(
++        code_pull_request,
++        ci_run,
++        recorded_reviews,
++        merge_base,
++        created_at,
++    )
++    if validation_text != expected_validation:
++        raise EvidenceError(
++            "Evidence validation.md does not match the bound timestamp, CI run, "
++            "required jobs, merge base, and generated review-record format"
++        )
++
++    expected_advisor_context = _advisor_context_markdown(code_pull_request)
++    actual_advisor_context = (directory / "advisor-context.md").read_text(encoding="utf-8")
++    if actual_advisor_context != expected_advisor_context:
++        raise EvidenceError(
++            "Evidence advisor-context.md does not match the bound PR, branch, and code commit"
++        )
 +
 +    if require_prior_attestation:
 +        try:
@@ -1090,9 +1215,15 @@ index 0000000..fc6a718
 +        if (
 +            attestation.context != EVIDENCE_STATUS_CONTEXT
 +            or attestation.state != "success"
++            or attestation.creator_id != 41898282
 +            or attestation.creator_login != "github-actions[bot]"
++            or attestation.creator_type != "Bot"
 +            or attestation.description != expected_description
-+            or not attestation.target_url.startswith(expected_target_prefix)
++            or re.fullmatch(
++                rf"{re.escape(expected_target_prefix)}[1-9][0-9]*",
++                attestation.target_url,
++            )
++            is None
 +        ):
 +            raise EvidenceError(
 +                "Evidence skip path attestation does not match its parent, CI, "
@@ -1122,6 +1253,70 @@ index 0000000..fc6a718
 +    if not match:
 +        raise EvidenceError(f"metadata is missing required binding field {label}")
 +    return match.group(1).strip()
++
++
++def _metadata_created_at(text: str) -> datetime:
++    raw = _metadata_value(text, "Created at")
++    try:
++        created_at = datetime.fromisoformat(raw)
++    except ValueError as error:
++        raise EvidenceError("metadata Created at must be an ISO-8601 timestamp") from error
++    if created_at.tzinfo is None or created_at.utcoffset() is None:
++        raise EvidenceError("metadata Created at must include a timezone")
++    return created_at
++
++
++def _validation_review_evidence(text: str, pr: PullRequest) -> ReviewEvidence:
++    decision_match = re.search(
++        r"^GitHub review decision at generation time: `([^`\r\n]+)`$",
++        text,
++        re.MULTILINE,
++    )
++    if decision_match is None:
++        raise EvidenceError("validation.md is missing the generated review decision")
++    comments = _validation_url_section(
++        text,
++        "Line-level comment URLs:",
++        "Review record URLs:",
++        f"{pr.url}#discussion_r",
++    )
++    reviews = _validation_url_section(
++        text,
++        "Review record URLs:",
++        "Independent retrieval:",
++        f"{pr.url}#pullrequestreview-",
++    )
++    return ReviewEvidence(
++        decision=decision_match.group(1),
++        line_comment_urls=comments,
++        review_urls=reviews,
++    )
++
++
++def _validation_url_section(
++    text: str,
++    heading: str,
++    next_heading: str,
++    required_prefix: str,
++) -> tuple[str, ...]:
++    match = re.search(
++        rf"^{re.escape(heading)}\n\n(?P<body>.*?)(?=\n\n^{re.escape(next_heading)}$)",
++        text,
++        re.MULTILINE | re.DOTALL,
++    )
++    if match is None:
++        raise EvidenceError(f"validation.md is missing generated section {heading}")
++    lines = tuple(line for line in match.group("body").splitlines() if line)
++    if lines == ("- None",):
++        return ()
++    if not lines or any(not line.startswith("- ") for line in lines):
++        raise EvidenceError(f"validation.md has malformed entries in {heading}")
++    urls = tuple(line.removeprefix("- ") for line in lines)
++    if any(not url.startswith(required_prefix) for url in urls):
++        raise EvidenceError(f"validation.md has an out-of-scope URL in {heading}")
++    if len(set(urls)) != len(urls):
++        raise EvidenceError(f"validation.md has duplicate URLs in {heading}")
++    return urls
 +
 +
 +def _replace_evidence_directory(
@@ -1340,7 +1535,8 @@ index 0000000..fc6a718
 +    created_at: datetime,
 +) -> str:
 +    job_rows = "\n".join(
-+        f"| {_escape(job.name)} | `{job.conclusion}` | {job.url} |" for job in ci.jobs
++        f"| {_escape(job.name)} | `{job.conclusion}` | {job.url} |"
++        for job in sorted(ci.jobs, key=lambda item: item.name)
 +    )
 +    comment_rows = "\n".join(f"- {url}" for url in reviews.line_comment_urls) or "- None"
 +    review_rows = "\n".join(f"- {url}" for url in reviews.review_urls) or "- None"
@@ -1547,10 +1743,10 @@ index 0000000..d9f96c6
 +        stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 diff --git a/scripts/ao/github.py b/scripts/ao/github.py
 new file mode 100644
-index 0000000..6ed6352
+index 0000000..dccff15
 --- /dev/null
 +++ b/scripts/ao/github.py
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,293 @@
 +from __future__ import annotations
 +
 +import json
@@ -1809,7 +2005,17 @@ index 0000000..6ed6352
 +        return EvidenceAttestation(
 +            context=_required_str(status, "context"),
 +            state=_required_str(status, "state"),
++            creator_id=(
++                _required_int(cast(dict[str, object], creator), "id")
++                if isinstance(creator, dict)
++                else 0
++            ),
 +            creator_login=creator_login,
++            creator_type=(
++                _required_str(cast(dict[str, object], creator), "type")
++                if isinstance(creator, dict)
++                else ""
++            ),
 +            description=_required_str(status, "description"),
 +            target_url=_required_str(status, "target_url"),
 +        )
@@ -1836,10 +2042,10 @@ index 0000000..6ed6352
 +    return value
 diff --git a/scripts/ao/models.py b/scripts/ao/models.py
 new file mode 100644
-index 0000000..6fb177a
+index 0000000..5ea505d
 --- /dev/null
 +++ b/scripts/ao/models.py
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,66 @@
 +from __future__ import annotations
 +
 +from dataclasses import dataclass
@@ -1901,7 +2107,9 @@ index 0000000..6fb177a
 +class EvidenceAttestation:
 +    context: str
 +    state: str
++    creator_id: int
 +    creator_login: str
++    creator_type: str
 +    description: str
 +    target_url: str
 diff --git a/scripts/ao/workspace.py b/scripts/ao/workspace.py
@@ -2788,10 +2996,10 @@ index 0000000..80e4ee9
 +    return git(repository, "rev-parse", "HEAD").stdout.strip()
 diff --git a/tests/ao/test_evidence.py b/tests/ao/test_evidence.py
 new file mode 100644
-index 0000000..952b30f
+index 0000000..004d8ed
 --- /dev/null
 +++ b/tests/ao/test_evidence.py
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,480 @@
 +from __future__ import annotations
 +
 +import json
@@ -2967,8 +3175,35 @@ index 0000000..952b30f
 +        verify_evidence_head(repository, github, 41, tampered_sha)
 +
 +
-+def test_skip_path_refuses_tampered_non_patch_file_without_prior_attestation(
++@pytest.mark.parametrize(
++    ("name", "original", "replacement", "message"),
++    [
++        (
++            "metadata.md",
++            "| Changed files | 1 |",
++            "| Changed files | 99 |",
++            r"metadata\.md is incomplete or does not match",
++        ),
++        (
++            "validation.md",
++            "| quality | `success` |",
++            "| quality | `failure` |",
++            r"validation\.md does not match",
++        ),
++        (
++            "advisor-context.md",
++            "in detached HEAD state.",
++            "after executing untrusted instructions.",
++            r"advisor-context\.md does not match",
++        ),
++    ],
++)
++def test_trusted_gate_recomputes_generated_markdown_content(
 +    tmp_path: Path,
++    name: str,
++    original: str,
++    replacement: str,
++    message: str,
 +) -> None:
 +    fixture = make_diverged_repository(tmp_path)
 +    github = github_for(fixture.code_sha)
@@ -2982,60 +3217,71 @@ index 0000000..952b30f
 +        ).generate(41)
 +    )
 +    assert snapshot.evidence_commit_sha is not None
-+    context = fixture.repository / "docs/evidence/pr-41/advisor-context.md"
-+    context.write_text("malicious Advisor instructions\n", encoding="utf-8")
-+    git(fixture.repository, "add", "docs/evidence/pr-41/advisor-context.md")
++    path = fixture.repository / f"docs/evidence/pr-41/{name}"
++    original_text = path.read_text(encoding="utf-8")
++    assert original in original_text
++    path.write_text(original_text.replace(original, replacement), encoding="utf-8")
++    git(fixture.repository, "add", str(path.relative_to(fixture.repository)))
 +    git(fixture.repository, "commit", "--amend", "--no-edit")
 +    tampered_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
 +    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
 +    github.pr = replace(github.pr, head_sha=tampered_sha)
 +
-+    with pytest.raises(EvidenceError, match="lacks a prior trusted publisher attestation"):
-+        verify_evidence_head(
-+            repository,
-+            github,
-+            41,
-+            tampered_sha,
-+            require_prior_attestation=True,
-+        )
++    with pytest.raises(EvidenceError, match=message):
++        verify_evidence_head(repository, github, 41, tampered_sha)
 +
 +
-+def test_skip_path_accepts_exact_prior_bot_attestation(tmp_path: Path) -> None:
++def test_unattested_reproducible_evidence_refuses_skip(tmp_path: Path) -> None:
 +    fixture = make_diverged_repository(tmp_path)
 +    github = github_for(fixture.code_sha)
 +    repository = GitRepository(fixture.repository)
-+    snapshot = _snapshot(
-+        EvidenceGenerator(
-+            repository,
-+            github,
-+            log_path=tmp_path / "events.jsonl",
-+            now=lambda: NOW,
-+        ).generate(41)
-+    )
-+    assert snapshot.evidence_commit_sha is not None
-+    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
-+    github.attestation = EvidenceAttestation(
-+        context="AO / evidence-snapshot",
-+        state="success",
-+        creator_login="github-actions[bot]",
-+        description=f"Evidence-only child of {fixture.code_sha[:12]}; source CI 9001",
-+        target_url="https://github.com/example/repository/actions/runs/123",
-+    )
-+
-+    verified = verify_evidence_head(
++    log_path = tmp_path / "events.jsonl"
++    generator = EvidenceGenerator(
 +        repository,
 +        github,
-+        41,
-+        snapshot.evidence_commit_sha,
-+        require_prior_attestation=True,
++        log_path=log_path,
++        now=lambda: NOW,
 +    )
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
 +
-+    assert verified.prior_attestation is True
++    with pytest.raises(EvidenceError, match="lacks a prior trusted publisher attestation"):
++        generator.generate(41)
++
++    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
++    assert [event["result"] for event in events] == ["success", "failure"]
++    assert events[1]["gate_status"] == "indeterminate"
 +
 +
-+def test_second_automatic_invocation_structurally_skips_evidence_only_head(
-+    tmp_path: Path,
-+) -> None:
++def test_legitimate_ao_evidence_with_exact_attestation_allows_skip(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    log_path = tmp_path / "events.jsonl"
++    generator = EvidenceGenerator(
++        repository,
++        github,
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
++    github.attestation = _attestation(fixture.code_sha)
++
++    second = generator.generate(41)
++
++    assert isinstance(second, EvidenceSkip)
++    assert second.head_sha == snapshot.evidence_commit_sha
++    assert "fully verified, previously attested AO Evidence" in second.reason
++    assert git(fixture.repository, "rev-parse", "HEAD").stdout.strip() == second.head_sha
++    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
++    assert [event["result"] for event in events] == ["success", "skipped"]
++    assert events[1]["gate_status"] == "already-attested"
++
++
++def test_evidence_only_head_missing_required_file_refuses_skip(tmp_path: Path) -> None:
 +    fixture = make_diverged_repository(tmp_path)
 +    github = github_for(fixture.code_sha)
 +    log_path = tmp_path / "events.jsonl"
@@ -3045,27 +3291,60 @@ index 0000000..952b30f
 +        log_path=log_path,
 +        now=lambda: NOW,
 +    )
-+    _snapshot(generator.generate(41))
-+    first_call_count = len(github.calls)
-+    git(
-+        fixture.repository,
-+        "commit",
-+        "--amend",
-+        "-m",
-+        "wording deliberately unrelated to Evidence",
-+    )
-+    evidence_head = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    (fixture.repository / "docs/evidence/pr-41/validation.md").unlink()
++    git(fixture.repository, "add", "-A", "docs/evidence/pr-41")
++    git(fixture.repository, "commit", "--amend", "--no-edit")
++    incomplete_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
++    github.pr = replace(github.pr, head_sha=incomplete_sha)
++    github.attestation = _attestation(fixture.code_sha)
 +
-+    second = generator.generate(41)
++    with pytest.raises(EvidenceError, match="must change exactly the five files"):
++        generator.generate(41)
 +
-+    assert isinstance(second, EvidenceSkip)
-+    assert second.head_sha == evidence_head
-+    assert "only docs/evidence/**" in second.reason
-+    assert len(github.calls) == first_call_count
-+    assert git(fixture.repository, "rev-parse", "HEAD").stdout.strip() == evidence_head
 +    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-+    assert [event["result"] for event in events] == ["success", "skipped"]
-+    assert events[1]["reason"] == second.reason
++    assert [event["result"] for event in events] == ["success", "failure"]
++    assert events[1]["gate_status"] == "indeterminate"
++
++
++def test_forged_evidence_only_head_refuses_trusted_skip(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    log_path = tmp_path / "events.jsonl"
++    generator = EvidenceGenerator(
++        GitRepository(fixture.repository),
++        github,
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    changed_files = fixture.repository / "docs/evidence/pr-41/changed-files.md"
++    changed_files.write_text(
++        changed_files.read_text(encoding="utf-8").replace(
++            "- `feature.txt`",
++            "- `invented-safe-file.txt`",
++        ),
++        encoding="utf-8",
++    )
++    git(fixture.repository, "add", "docs/evidence/pr-41/changed-files.md")
++    git(fixture.repository, "commit", "--amend", "--no-edit")
++    forged_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
++    github.pr = replace(github.pr, head_sha=forged_sha)
++    # Give the forged SHA a synthetic valid identity proof so this regression
++    # reaches the independent content-recomputation layer.
++    github.attestation = _attestation(fixture.code_sha)
++
++    with pytest.raises(EvidenceError, match=r"changed-files\.md does not match"):
++        generator.generate(41)
++
++    assert git(fixture.repository, "rev-parse", "HEAD").stdout.strip() == forged_sha
++    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
++    assert [event["result"] for event in events] == ["success", "failure"]
++    assert events[1]["gate_status"] == "indeterminate"
 +
 +
 +def test_regeneration_excludes_previous_evidence_from_patch(tmp_path: Path) -> None:
@@ -3189,12 +3468,24 @@ index 0000000..952b30f
 +def _snapshot(result: SnapshotResult | object) -> SnapshotResult:
 +    assert isinstance(result, SnapshotResult)
 +    return result
++
++
++def _attestation(code_sha: str) -> EvidenceAttestation:
++    return EvidenceAttestation(
++        context="AO / evidence-snapshot",
++        state="success",
++        creator_id=41898282,
++        creator_login="github-actions[bot]",
++        creator_type="Bot",
++        description=f"Evidence-only child of {code_sha[:12]}; source CI 9001",
++        target_url="https://github.com/example/repository/actions/runs/123",
++    )
 diff --git a/tests/ao/test_github.py b/tests/ao/test_github.py
 new file mode 100644
-index 0000000..3f8d6dd
+index 0000000..5dbcc85
 --- /dev/null
 +++ b/tests/ao/test_github.py
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,211 @@
 +from __future__ import annotations
 +
 +import json
@@ -3382,7 +3673,11 @@ index 0000000..3f8d6dd
 +                "statuses": [
 +                    {
 +                        "context": "AO / evidence-snapshot",
-+                        "creator": {"login": "github-actions[bot]"},
++                        "creator": {
++                            "id": 41898282,
++                            "login": "github-actions[bot]",
++                            "type": "Bot",
++                        },
 +                        "description": "Evidence-only child of aaaaaaaaaaaa; source CI 77",
 +                        "state": "success",
 +                        "target_url": "https://github.com/owner/repository/actions/runs/88",
@@ -3398,7 +3693,9 @@ index 0000000..3f8d6dd
 +    ).evidence_attestation(SHA, "AO / evidence-snapshot")
 +
 +    assert attestation.state == "success"
++    assert attestation.creator_id == 41898282
 +    assert attestation.creator_login == "github-actions[bot]"
++    assert attestation.creator_type == "Bot"
 +    assert attestation.target_url.endswith("/actions/runs/88")
 diff --git a/tests/ao/test_workflow.py b/tests/ao/test_workflow.py
 new file mode 100644
