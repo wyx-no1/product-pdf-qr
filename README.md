@@ -57,6 +57,8 @@ curl -sS -X POST http://127.0.0.1:8000/api/products/1/pdf \
   -F file=@./synthetic.pdf
 ```
 
+上传入口在 multipart 解析前限制整个请求体，PDF 本体在隔离区再次执行 50 MB 精确限制。结构解析只在可终止子进程中运行，默认墙钟 5 秒、CPU 3 秒、地址空间 512 MiB；地址空间约为最大文件的十倍，为正常解析保留余量，同时限制紧凑恶意文件的放大效应。以上值由 `MAX_PDF_BYTES`、`PDF_VALIDATION_TIMEOUT_SECONDS`、`PDF_VALIDATION_CPU_SECONDS` 和 `PDF_VALIDATION_MEMORY_BYTES` 集中配置。
+
 下载二维码与公开扫码访问：
 
 ```bash

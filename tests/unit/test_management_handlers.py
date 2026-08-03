@@ -5,9 +5,11 @@ from __future__ import annotations
 import io
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Never
 
 import pytest
 from fastapi import UploadFile
+from psycopg.types.json import Jsonb
 from pypdf import PdfWriter
 from starlette.datastructures import Headers
 
@@ -175,7 +177,8 @@ async def test_upload_handler_validates_then_creates_version(tmp_path: Path) -> 
 @pytest.mark.anyio
 async def test_upload_validation_rejection_is_audited(tmp_path: Path) -> None:
     storage = StorageService(tmp_path, max_pdf_bytes=1024)
-    database = as_database(ScriptedDatabase(ScriptedConnection([None])))
+    audit_connection = ScriptedConnection([None])
+    database = as_database(ScriptedDatabase(audit_connection))
     invalid = UploadFile(
         file=io.BytesIO(b"not-pdf"),
         filename="bad.pdf",
@@ -184,6 +187,47 @@ async def test_upload_validation_rejection_is_audited(tmp_path: Path) -> None:
 
     with pytest.raises(UploadRejected):
         await upload_pdf_endpoint(5, 9, invalid, database, storage)
+
+    audit_parameters = audit_connection.parameters[0]
+    assert isinstance(audit_parameters, tuple)
+    audit_detail = audit_parameters[-1]
+    assert isinstance(audit_detail, Jsonb)
+    assert audit_detail.obj == {"reason": "invalid_pdf_signature", "stage": "signature"}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("code", "stage"),
+    [
+        ("pdf_validation_timeout", "structure_timeout"),
+        ("pdf_validation_resource_limit", "structure_resource"),
+    ],
+)
+async def test_parser_limit_rejection_reason_is_audited(
+    code: str,
+    stage: str,
+) -> None:
+    class ParserRejectingStorage(StorageService):
+        async def receive_and_validate(self, _upload: UploadFile) -> Never:
+            raise UploadRejected(code, "PDF 结构校验失败。", stage)
+
+    audit_connection = ScriptedConnection([None])
+    database = as_database(ScriptedDatabase(audit_connection))
+
+    with pytest.raises(UploadRejected):
+        await upload_pdf_endpoint(
+            5,
+            9,
+            synthetic_upload(),
+            database,
+            ParserRejectingStorage(Path("unused"), max_pdf_bytes=1024),
+        )
+
+    audit_parameters = audit_connection.parameters[0]
+    assert isinstance(audit_parameters, tuple)
+    audit_detail = audit_parameters[-1]
+    assert isinstance(audit_detail, Jsonb)
+    assert audit_detail.obj == {"reason": code, "stage": stage}
 
 
 @pytest.mark.anyio

@@ -17,6 +17,7 @@ from product_pdf_qr.domains.qrcode.router import router as qrcode_router
 from product_pdf_qr.domains.storage import StorageService
 from product_pdf_qr.domains.storage.router import router as storage_router
 from product_pdf_qr.errors import register_exception_handlers
+from product_pdf_qr.upload_limit import UploadRequestLimitMiddleware
 
 
 @asynccontextmanager
@@ -25,7 +26,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     settings = get_settings()
     database = Database(settings)
-    storage_service = StorageService(settings.storage_root, settings.max_pdf_bytes)
+    storage_service = StorageService(
+        settings.storage_root,
+        settings.max_pdf_bytes,
+        pdf_validation_timeout_seconds=settings.pdf_validation_timeout_seconds,
+        pdf_validation_cpu_seconds=settings.pdf_validation_cpu_seconds,
+        pdf_validation_memory_bytes=settings.pdf_validation_memory_bytes,
+    )
     storage_service.prepare()
     await database.open()
     app.state.database = database
@@ -53,6 +60,7 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    application.add_middleware(UploadRequestLimitMiddleware)
     register_exception_handlers(application)
     application.include_router(product_router)
     application.include_router(qrcode_router)

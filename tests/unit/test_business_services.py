@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,7 +17,7 @@ from product_pdf_qr.database import Connection, Database
 from product_pdf_qr.domains.audit import AuditEvent, append_event, append_independent_event
 from product_pdf_qr.domains.product import create_product
 from product_pdf_qr.domains.public import resolve_public_document
-from product_pdf_qr.domains.storage import StorageService, ValidatedUpload
+from product_pdf_qr.domains.storage import PublishedFile, StorageService, ValidatedUpload
 from product_pdf_qr.domains.version import DuplicateCurrentPDF, upload_pdf
 from product_pdf_qr.errors import AppError
 
@@ -274,6 +276,108 @@ async def test_commit_failure_leaves_traceable_orphan_not_database_result(
     audit_detail = cast(Jsonb, audit_parameters[-1]).obj
     assert isinstance(audit_detail, dict)
     assert audit_detail["moved_file_sha256"] == upload.sha256
+
+
+@pytest.mark.anyio
+async def test_cancellation_before_publish_cleans_candidate_and_is_audited(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = StorageService(tmp_path / "storage", max_pdf_bytes=1024)
+    candidate = validated_upload(tmp_path)
+    business = ScriptedConnection(
+        [
+            {"id": 5, "code": "A001", "current_version_id": None},
+            {"id": 9},
+            {"next_version_no": 1},
+        ]
+    )
+    rejection_audit = ScriptedConnection([None])
+    entered_publish = asyncio.Event()
+
+    async def block_before_publish(_upload: ValidatedUpload) -> None:
+        entered_publish.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(storage, "publish", block_before_publish)
+    task = asyncio.create_task(
+        upload_pdf(
+            as_database(ScriptedDatabase(business, rejection_audit)),
+            storage,
+            product_id=5,
+            actor_id=9,
+            upload=candidate,
+        )
+    )
+    await entered_publish.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not candidate.temporary_path.exists()
+    assert list(storage.files_root.rglob("*.pdf")) == []
+    assert not any("INSERT INTO pdf_versions" in query for query in business.queries)
+    audit_detail = cast(Jsonb, cast(tuple[object, ...], rejection_audit.parameters[0])[-1]).obj
+    assert isinstance(audit_detail, dict)
+    assert audit_detail["reason"] == "upload_cancelled"
+    assert "moved_file_sha256" not in audit_detail
+
+
+@pytest.mark.anyio
+async def test_cancellation_after_publish_leaves_audited_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = StorageService(tmp_path / "storage", max_pdf_bytes=1024)
+    storage.prepare()
+    candidate = validated_upload(tmp_path)
+    business = ScriptedConnection(
+        [
+            {"id": 5, "code": "A001", "current_version_id": None},
+            {"id": 9},
+            {"next_version_no": 1},
+        ]
+    )
+    rejection_audit = ScriptedConnection([None])
+    database = as_database(ScriptedDatabase(business, rejection_audit))
+    publication_finished = asyncio.Event()
+    release_publication = threading.Event()
+    loop = asyncio.get_running_loop()
+    original_publish_sync = storage._publish_sync
+
+    def controlled_publish(upload: ValidatedUpload) -> PublishedFile:
+        published = original_publish_sync(upload)
+        loop.call_soon_threadsafe(publication_finished.set)
+        if not release_publication.wait(timeout=2):
+            raise RuntimeError("test did not release publication")
+        return published
+
+    monkeypatch.setattr(storage, "_publish_sync", controlled_publish)
+    task = asyncio.create_task(
+        upload_pdf(
+            database,
+            storage,
+            product_id=5,
+            actor_id=9,
+            upload=candidate,
+        )
+    )
+    await asyncio.wait_for(publication_finished.wait(), timeout=2)
+    task.cancel()
+    release_publication.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    orphan = storage.files_root / storage.relative_path_for_hash(candidate.sha256)
+    assert not candidate.temporary_path.exists()
+    assert orphan.read_bytes() == b"%PDF-synthetic"
+    assert not any("INSERT INTO pdf_versions" in query for query in business.queries)
+    audit_detail = cast(Jsonb, cast(tuple[object, ...], rejection_audit.parameters[0])[-1]).obj
+    assert isinstance(audit_detail, dict)
+    assert audit_detail["reason"] == "upload_cancelled"
+    assert audit_detail["moved_file_sha256"] == candidate.sha256
 
 
 @pytest.mark.anyio

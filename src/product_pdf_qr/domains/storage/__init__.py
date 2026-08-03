@@ -2,6 +2,7 @@
 
 from product_pdf_qr.domains.storage.service import (
     OrphanFile,
+    PublishCancelled,
     PublishedFile,
     StorageService,
     UploadRejected,
@@ -10,6 +11,7 @@ from product_pdf_qr.domains.storage.service import (
 
 __all__ = [
     "OrphanFile",
+    "PublishCancelled",
     "PublishedFile",
     "StorageService",
     "UploadRejected",

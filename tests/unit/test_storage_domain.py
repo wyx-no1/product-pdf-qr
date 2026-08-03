@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import io
+import multiprocessing
+import resource
+import subprocess
+import sys
+import time
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from fastapi import UploadFile
@@ -11,6 +17,7 @@ from pypdf import PdfWriter
 from starlette.datastructures import Headers
 
 from product_pdf_qr.domains.storage import StorageService, UploadRejected
+from product_pdf_qr.domains.storage.service import _parse_pdf, _set_pdf_worker_limits
 
 
 def synthetic_pdf() -> bytes:
@@ -19,6 +26,21 @@ def synthetic_pdf() -> bytes:
     writer.add_blank_page(width=72, height=72)
     writer.write(output)
     return output.getvalue()
+
+
+def slow_pdf_parser(_path: str) -> Literal["valid", "invalid", "resource_limit"]:
+    """Simulate a compact input that traps its structural parser."""
+
+    time.sleep(30)
+    return "valid"
+
+
+def memory_exhausting_pdf_parser(
+    _path: str,
+) -> Literal["valid", "invalid", "resource_limit"]:
+    """Simulate the parser's deterministic response to exhausted address space."""
+
+    raise MemoryError
 
 
 def upload_file(
@@ -32,6 +54,62 @@ def upload_file(
         filename=filename,
         headers=Headers({"content-type": content_type}),
     )
+
+
+def test_pdf_parser_accepts_normal_and_rejects_damaged_structure(tmp_path: Path) -> None:
+    normal = tmp_path / "normal.pdf"
+    damaged = tmp_path / "damaged.pdf"
+    normal.write_bytes(synthetic_pdf())
+    damaged.write_bytes(b"%PDF-not-a-structure")
+
+    assert _parse_pdf(str(normal)) == "valid"
+    assert _parse_pdf(str(damaged)) == "invalid"
+
+
+def test_worker_limits_set_cpu_and_linux_address_space(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(
+        resource,
+        "setrlimit",
+        lambda resource_id, values: limits.append((resource_id, values)),
+    )
+
+    _set_pdf_worker_limits(3, 512)
+
+    assert limits == [
+        (resource.RLIMIT_CPU, (3, 4)),
+        (resource.RLIMIT_AS, (512, 512)),
+    ]
+
+
+def test_worker_limits_allow_only_configured_growth_on_darwin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: "1000\n",
+    )
+    monkeypatch.setattr(
+        resource,
+        "setrlimit",
+        lambda resource_id, values: limits.append((resource_id, values)),
+    )
+
+    _set_pdf_worker_limits(3, 512)
+
+    assert limits == [
+        (resource.RLIMIT_CPU, (3, 4)),
+        (
+            resource.RLIMIT_AS,
+            (1000 * 1024 + 512, 1000 * 1024 + 512),
+        ),
+    ]
 
 
 class InterruptedUpload(UploadFile):
@@ -127,6 +205,46 @@ async def test_interrupted_receive_removes_partial_file(tmp_path: Path) -> None:
 
     assert list(storage.temporary_root.iterdir()) == []
     assert list(storage.files_root.rglob("*.pdf")) == []
+
+
+@pytest.mark.anyio
+async def test_slow_pdf_parser_is_killed_and_reaped_at_wall_clock_limit(
+    tmp_path: Path,
+) -> None:
+    children_before = {child.pid for child in multiprocessing.active_children()}
+    storage = StorageService(
+        tmp_path,
+        max_pdf_bytes=1024 * 1024,
+        pdf_validation_timeout_seconds=0.1,
+        pdf_parser=slow_pdf_parser,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(UploadRejected) as captured:
+        await storage.receive_and_validate(upload_file(synthetic_pdf()))
+    elapsed = time.monotonic() - started
+
+    assert captured.value.code == "pdf_validation_timeout"
+    assert captured.value.stage == "structure_timeout"
+    assert elapsed < 2
+    assert {child.pid for child in multiprocessing.active_children()} == children_before
+    assert list(storage.temporary_root.iterdir()) == []
+
+
+@pytest.mark.anyio
+async def test_pdf_parser_memory_exhaustion_is_a_distinct_rejection(tmp_path: Path) -> None:
+    storage = StorageService(
+        tmp_path,
+        max_pdf_bytes=1024 * 1024,
+        pdf_parser=memory_exhausting_pdf_parser,
+    )
+
+    with pytest.raises(UploadRejected) as captured:
+        await storage.receive_and_validate(upload_file(synthetic_pdf()))
+
+    assert captured.value.code == "pdf_validation_resource_limit"
+    assert captured.value.stage == "structure_resource"
+    assert list(storage.temporary_root.iterdir()) == []
 
 
 @pytest.mark.anyio

@@ -7,6 +7,10 @@ from typing import Any, Self
 from pydantic import AnyHttpUrl, Field, PostgresDsn, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_PDF_VALIDATION_TIMEOUT_SECONDS = 5.0
+DEFAULT_PDF_VALIDATION_CPU_SECONDS = 3
+DEFAULT_PDF_VALIDATION_MEMORY_BYTES = 512 * 1024 * 1024
+
 
 class Settings(BaseSettings):
     """Runtime settings loaded from environment variables."""
@@ -25,6 +29,20 @@ class Settings(BaseSettings):
     storage_root: Path = Path("storage/local")
     public_base_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:8000")
     max_pdf_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    pdf_validation_timeout_seconds: float = Field(
+        default=DEFAULT_PDF_VALIDATION_TIMEOUT_SECONDS,
+        gt=0,
+        le=30,
+    )
+    pdf_validation_cpu_seconds: int = Field(
+        default=DEFAULT_PDF_VALIDATION_CPU_SECONDS,
+        ge=1,
+        le=10,
+    )
+    pdf_validation_memory_bytes: int = Field(
+        default=DEFAULT_PDF_VALIDATION_MEMORY_BYTES,
+        ge=128 * 1024 * 1024,
+    )
     public_miss_limit: int = Field(default=20, ge=1)
     public_miss_window_seconds: int = Field(default=600, ge=1)
 

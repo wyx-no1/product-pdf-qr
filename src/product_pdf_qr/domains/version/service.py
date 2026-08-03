@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import cast
@@ -9,7 +10,12 @@ from uuid import UUID
 
 from product_pdf_qr.database import Database
 from product_pdf_qr.domains.audit import AuditEvent, append_event, append_independent_event
-from product_pdf_qr.domains.storage import PublishedFile, StorageService, ValidatedUpload
+from product_pdf_qr.domains.storage import (
+    PublishCancelled,
+    PublishedFile,
+    StorageService,
+    ValidatedUpload,
+)
 from product_pdf_qr.errors import AppError
 
 logger = logging.getLogger(__name__)
@@ -34,6 +40,46 @@ class DuplicateCurrentPDF(AppError):
 
     def __init__(self) -> None:
         super().__init__("duplicate_current_pdf", "与当前文件相同", 409)
+
+
+def _upload_rejection_event(
+    *,
+    product_id: int,
+    actor_id: int,
+    product_code: str | None,
+    request_id: UUID | None,
+    reason: str,
+    sha256: str,
+    published: PublishedFile | None,
+) -> AuditEvent:
+    detail: dict[str, object] = {
+        "reason": reason,
+        "stage": "locked_transaction",
+        "sha256": sha256,
+    }
+    if published is not None and published.moved:
+        detail["moved_file_sha256"] = sha256
+    return AuditEvent(
+        action="pdf_upload_rejected",
+        result="failure",
+        actor_type="admin",
+        actor_id=actor_id,
+        target_type="product",
+        target_id=product_id,
+        product_code=product_code,
+        request_id=request_id,
+        detail=detail,
+    )
+
+
+async def _append_shielded_rejection(database: Database, event: AuditEvent) -> None:
+    """Wait for an independent rejection audit even while propagating cancellation."""
+
+    audit_task = asyncio.create_task(append_independent_event(database, event))
+    try:
+        await asyncio.shield(audit_task)
+    except asyncio.CancelledError:
+        await audit_task
 
 
 async def record_upload_rejection(
@@ -228,30 +274,38 @@ async def upload_pdf(
             storage_path=published.storage_path,
             original_filename=upload.original_filename,
         )
-    except Exception as error:
-        upload.discard()
-        detail: dict[str, object] = {
-            "reason": error.code if isinstance(error, AppError) else "upload_transaction_failed",
-            "stage": "locked_transaction",
-            "sha256": upload.sha256,
-        }
-        if published is not None and published.moved:
-            detail["moved_file_sha256"] = upload.sha256
-        await append_independent_event(
+    except asyncio.CancelledError as error:
+        if isinstance(error, PublishCancelled):
+            published = error.published
+        await _append_shielded_rejection(
             database,
-            AuditEvent(
-                action="pdf_upload_rejected",
-                result="failure",
-                actor_type="admin",
+            _upload_rejection_event(
+                product_id=product_id,
                 actor_id=actor_id,
-                target_type="product",
-                target_id=product_id,
                 product_code=product_code,
                 request_id=request_id,
-                detail=detail,
+                reason="upload_cancelled",
+                sha256=upload.sha256,
+                published=published,
+            ),
+        )
+        raise
+    except Exception as error:
+        await append_independent_event(
+            database,
+            _upload_rejection_event(
+                product_id=product_id,
+                actor_id=actor_id,
+                product_code=product_code,
+                request_id=request_id,
+                reason=error.code if isinstance(error, AppError) else "upload_transaction_failed",
+                sha256=upload.sha256,
+                published=published,
             ),
         )
         if isinstance(error, AppError):
             raise
         logger.exception("PDF upload transaction failed")
         raise AppError("pdf_upload_failed", "PDF 上传失败, 请重试。", 500) from error
+    finally:
+        upload.discard()
