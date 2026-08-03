@@ -1,12 +1,12 @@
 # Changed files for PR #12
 
-Comparison: `origin/main...744641de628ee664ab41e1a52308b7f747734263` (three-dot)
+Comparison: `origin/main...edc067f4836762f0729402e4fc545e708dfaeb43` (three-dot)
 
 | Metric | Value |
 |---|---:|
 | Merge base | `af82f581c83bd023b4d17ccc4231a2802acf6f2c` |
-| Changed files | 15 |
-| Added lines | 2688 |
+| Changed files | 17 |
+| Added lines | 3223 |
 | Deleted lines | 0 |
 
 ## Added files
@@ -25,10 +25,11 @@ Comparison: `origin/main...744641de628ee664ab41e1a52308b7f747734263` (three-dot)
 - `tests/ao/helpers.py`
 - `tests/ao/test_evidence.py`
 - `tests/ao/test_github.py`
+- `tests/ao/test_workflow.py`
 - `tests/ao/test_workspace.py`
 ## Modified files
 
-- None
+- `.github/workflows/ci.yml`
 ## Deleted files
 
 - None
@@ -39,11 +40,11 @@ Run the following command from any worktree for this repository. It must produce
 output; any output means a protected boundary changed:
 
 ```bash
-git diff origin/main...744641de628ee664ab41e1a52308b7f747734263 -- migrations/ docs/requirements-v1.md docs/requirements-v2.md CLAUDE.md docs/quality-gates-v1.md docs/advisor-protocol-v1.md docs/decision-register-v1.md docs/test-plan-v1.md
+git diff origin/main...edc067f4836762f0729402e4fc545e708dfaeb43 -- migrations/ docs/requirements-v1.md docs/requirements-v2.md CLAUDE.md docs/quality-gates-v1.md docs/advisor-protocol-v1.md docs/decision-register-v1.md docs/test-plan-v1.md
 ```
 
 The complete changed-path list can be reproduced without relying on this file:
 
 ```bash
-git diff --name-status origin/main...744641de628ee664ab41e1a52308b7f747734263 -- . ':(exclude)docs/evidence/**'
+git diff --name-status origin/main...edc067f4836762f0729402e4fc545e708dfaeb43 -- . ':(exclude)docs/evidence/**'
 ```

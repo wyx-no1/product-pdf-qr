@@ -1,3 +1,48 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 9f2358e..cdc3b5e 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -97,3 +97,40 @@ jobs:
+         run: docker compose logs
+       - if: always()
+         run: docker compose down --volumes
++
++  evidence:
++    if: github.event_name == 'pull_request'
++    needs:
++      - quality
++      - database
++      - container
++    runs-on: ubuntu-latest
++    permissions:
++      actions: read
++      contents: write
++      pull-requests: read
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++          ref: ${{ github.head_ref }}
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.12"
++      - name: Configure Evidence commit identity
++        run: |
++          git config user.name "github-actions[bot]"
++          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
++      - name: Generate and push bound Evidence Snapshot
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          PR_NUMBER: ${{ github.event.pull_request.number }}
++          RUN_ID: ${{ github.run_id }}
++        run: |
++          # GITHUB_TOKEN pushes do not start another workflow. The generator also
++          # structurally skips a HEAD that changes only docs/evidence/**, so a
++          # future PAT or deploy-key migration cannot create a generation loop.
++          python -m scripts.ao evidence \
++            --repo . \
++            --pr "$PR_NUMBER" \
++            --ci-run-id "$RUN_ID"
 diff --git a/scripts/__init__.py b/scripts/__init__.py
 new file mode 100644
 index 0000000..2bd3938
@@ -7,10 +52,10 @@ index 0000000..2bd3938
 +"""Repository automation scripts."""
 diff --git a/scripts/ao/README.md b/scripts/ao/README.md
 new file mode 100644
-index 0000000..3733d5c
+index 0000000..e308941
 --- /dev/null
 +++ b/scripts/ao/README.md
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,89 @@
 +# AO Evidence and Advisor workspace tools
 +
 +These repository-local Python 3.12 tools implement the two parts of AO P0-1. They
@@ -19,19 +64,27 @@ index 0000000..3733d5c
 +
 +## Evidence workflow
 +
-+After a PR's code commit has passed the complete `CI` workflow, run this from the
-+clean PR branch:
++The blocking `evidence` job in `.github/workflows/ci.yml` depends on `quality`,
++`database`, and `container`. After all three code jobs succeed, it automatically
++runs:
 +
 +```bash
-+uv run python -m scripts.ao evidence --repo . --pr 123
++python -m scripts.ao evidence --repo . --pr 123 --ci-run-id 456
 +```
 +
 +The command fetches the PR branches, verifies that local HEAD is the exact GitHub PR
-+head, requires the latest CI run for that SHA and every returned job to be
++head, requires all three code jobs in that run to be
 +successful, writes exactly five files under `docs/evidence/pr-123/`, and creates the
 +separate `docs: add PR123 review evidence` commit. It then pushes that commit to the
 +same PR branch with a normal non-force push. A concurrent PR update makes the push
 +fail and leaves the gate indeterminate instead of overwriting newer code.
++
++Only the `evidence` job has `contents: write`; all other jobs retain read-only
++contents access. Its `GITHUB_TOKEN` push does not trigger another GitHub Actions
++workflow. That platform behavior is only the first loop defense: the generator
++independently inspects the current commit's changed paths and explicitly skips when
++every path is under `docs/evidence/**`. This keeps the workflow finite if the push
++credential is later changed to a PAT or deploy key.
 +
 +Generation uses `origin/<base>...<code-sha>` and excludes all of
 +`docs/evidence/**`. Failure exits nonzero, records an `indeterminate` gate event in
@@ -48,14 +101,18 @@ index 0000000..3733d5c
 +  --repo /absolute/path/to/repository \
 +  --metadata /absolute/path/to/docs/evidence/pr-123/metadata.md \
 +  --record /absolute/path/to/advisor-record.json \
++  --timeout-seconds 1800 \
 +  -- advisor-command --its-arguments
 +```
 +
 +The resolver unconditionally fetches first, creates a uniquely named detached
 +worktree containing the PR number and SHA prefix, exports the bound SHA to the
 +Advisor process, and removes/prunes the worktree in a `finally` path. SIGINT,
-+SIGTERM, and SIGHUP are converted into cleanup-capable interruptions. Fetch or
-+checkout failure pauses review; there is no fallback to `main` or another commit.
++SIGTERM, and SIGHUP are converted into cleanup-capable interruptions. A timeout
++terminates the entire Advisor process group, escalates to SIGKILL when it ignores
++SIGTERM, confirms exit, then removes the worktree and releases the lock before
++recording an indeterminate result. Fetch or checkout failure pauses review; there
++is no fallback to `main` or another commit.
 +
 +Validate the resulting record before gate use:
 +
@@ -106,10 +163,10 @@ index 0000000..4443fdd
 +raise SystemExit(main())
 diff --git a/scripts/ao/cli.py b/scripts/ao/cli.py
 new file mode 100644
-index 0000000..127af30
+index 0000000..12c1d19
 --- /dev/null
 +++ b/scripts/ao/cli.py
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,238 @@
 +from __future__ import annotations
 +
 +import argparse
@@ -126,6 +183,7 @@ index 0000000..127af30
 +from scripts.ao.evidence import EvidenceGenerator
 +from scripts.ao.git import GitRepository
 +from scripts.ao.github import GhGitHubData
++from scripts.ao.models import EvidenceSkip
 +from scripts.ao.workspace import (
 +    WorkspaceResolver,
 +    detect_stale_worktrees,
@@ -148,6 +206,11 @@ index 0000000..127af30
 +    evidence.add_argument("--repo", type=Path, required=True)
 +    evidence.add_argument("--pr", type=int, required=True)
 +    evidence.add_argument("--log", type=Path)
++    evidence.add_argument(
++        "--ci-run-id",
++        type=int,
++        help="current workflow run whose required code jobs have completed",
++    )
 +
 +    advisor = commands.add_parser("advisor-run", help="run Advisor in a bound worktree")
 +    advisor.add_argument("--repo", type=Path, required=True)
@@ -155,6 +218,7 @@ index 0000000..127af30
 +    advisor.add_argument("--record", type=Path, required=True)
 +    advisor.add_argument("--temp-root", type=Path)
 +    advisor.add_argument("--log", type=Path)
++    advisor.add_argument("--timeout-seconds", type=float, default=1800.0)
 +    advisor.add_argument("advisor_command", nargs=argparse.REMAINDER)
 +
 +    validate = commands.add_parser(
@@ -218,7 +282,16 @@ index 0000000..127af30
 +        github,
 +        log_path=arguments.log,
 +    )
-+    result = generator.generate(arguments.pr)
++    result = generator.generate(arguments.pr, ci_run_id=arguments.ci_run_id)
++    if isinstance(result, EvidenceSkip):
++        _print_json(
++            {
++                "head_sha": result.head_sha,
++                "reason": result.reason,
++                "result": "skipped",
++            }
++        )
++        return 0
 +    _print_json(
 +        {
 +            "ci_run_id": result.ci_run_id,
@@ -242,7 +315,12 @@ index 0000000..127af30
 +        log_path=arguments.log,
 +    )
 +    with _handled_termination_signals():
-+        return resolver.run_advisor(arguments.metadata, command, arguments.record)
++        return resolver.run_advisor(
++            arguments.metadata,
++            command,
++            arguments.record,
++            timeout_seconds=arguments.timeout_seconds,
++        )
 +
 +
 +def _advisor_validate(arguments: argparse.Namespace) -> int:
@@ -329,10 +407,10 @@ index 0000000..127af30
 +            signal.signal(signum, handler)
 diff --git a/scripts/ao/evidence.py b/scripts/ao/evidence.py
 new file mode 100644
-index 0000000..f937df2
+index 0000000..218c4fd
 --- /dev/null
 +++ b/scripts/ao/evidence.py
-@@ -0,0 +1,652 @@
+@@ -0,0 +1,710 @@
 +from __future__ import annotations
 +
 +import re
@@ -346,7 +424,7 @@ index 0000000..f937df2
 +
 +from scripts.ao.git import GitRepository, append_json_event
 +from scripts.ao.github import GitHubData
-+from scripts.ao.models import CIRun, EvidenceBinding, PullRequest, ReviewEvidence
++from scripts.ao.models import CIRun, EvidenceBinding, EvidenceSkip, PullRequest, ReviewEvidence
 +
 +EVIDENCE_FILES = {
 +    "metadata.md",
@@ -406,7 +484,8 @@ index 0000000..f937df2
 +        *,
 +        commit: bool = True,
 +        push: bool | None = None,
-+    ) -> SnapshotResult:
++        ci_run_id: int | None = None,
++    ) -> SnapshotResult | EvidenceSkip:
 +        should_push = commit if push is None else push
 +        if should_push and not commit:
 +            raise ValueError("Evidence cannot be pushed without a separate commit")
@@ -416,6 +495,23 @@ index 0000000..f937df2
 +        ci_run: CIRun | None = None
 +        try:
 +            self._require_clean_worktree()
++            evidence_only = self._evidence_only_head()
++            if evidence_only is not None:
++                append_json_event(
++                    self.log_path,
++                    {
++                        "action": "evidence.generate",
++                        "duration_seconds": round(time.monotonic() - started, 6),
++                        "finished_at": self.now().isoformat(),
++                        "gate_status": "not-applicable",
++                        "head_sha": evidence_only.head_sha,
++                        "pr_number": pr_number,
++                        "reason": evidence_only.reason,
++                        "result": "skipped",
++                        "started_at": started_at.isoformat(),
++                    },
++                )
++                return evidence_only
 +            pull_request = self.github.pull_request(pr_number)
 +            self._validate_pr_number(pr_number, pull_request)
 +            self.repository.fetch(
@@ -424,7 +520,7 @@ index 0000000..f937df2
 +                pull_request.source_branch,
 +            )
 +            self._require_checked_out_code_commit(pull_request)
-+            ci_run = self.github.successful_ci_run(pull_request.head_sha)
++            ci_run = self.github.successful_ci_run(pull_request.head_sha, ci_run_id)
 +            self._validate_ci_binding(pull_request, ci_run)
 +            reviews = self.github.review_evidence(
 +                pull_request.number,
@@ -481,6 +577,27 @@ index 0000000..f937df2
 +            )
 +            raise
 +
++    def _evidence_only_head(self) -> EvidenceSkip | None:
++        head_sha = self.repository.git("rev-parse", "HEAD").stdout.strip()
++        paths = tuple(
++            path
++            for path in self.repository.git(
++                "diff-tree",
++                "--root",
++                "--no-commit-id",
++                "--name-only",
++                "-r",
++                "HEAD",
++            ).stdout.splitlines()
++            if path
++        )
++        if paths and all(path.startswith("docs/evidence/") for path in paths):
++            return EvidenceSkip(
++                head_sha=head_sha,
++                reason="HEAD changes only docs/evidence/**; generation loop prevented",
++            )
++        return None
++
 +    def _require_clean_worktree(self) -> None:
 +        status = self.repository.git("status", "--porcelain").stdout
 +        if status:
@@ -525,7 +642,10 @@ index 0000000..f937df2
 +                f"CI run {ci_run.run_id} belongs to {ci_run.commit_sha}, "
 +                f"not PR code commit {pull_request.head_sha}"
 +            )
-+        if ci_run.status != "completed" or ci_run.conclusion != "success":
++        if (
++            ci_run.status not in {"completed", "required-jobs-completed"}
++            or ci_run.conclusion != "success"
++        ):
 +            raise EvidenceError(
 +                f"CI run {ci_run.run_id} is not completed successfully; "
 +                "gate status is indeterminate"
@@ -778,6 +898,13 @@ index 0000000..f937df2
 +        "\n".join(f"| `{sha}` | {_escape(subject)} |" for sha, subject in commits)
 +        or "| — | No commits in comparison range |"
 +    )
++    ci_timing_note = (
++        "\n> The automatic Evidence job runs after the `quality`, `database`, and "
++        "`container`\n> jobs succeed. At snapshot time the enclosing workflow is "
++        "still active only because\n> this blocking Evidence job is its final job."
++        if ci.status == "required-jobs-completed"
++        else ""
++    )
 +    return f"""# Evidence Snapshot for PR #{pr.number}
 +
 +## Binding
@@ -799,6 +926,7 @@ index 0000000..f937df2
 +> The CI result above belongs to code commit `{pr.head_sha}`, not to the later
 +> Evidence commit. The Evidence commit must not be used as a new generation trigger;
 +> doing so would create a CI/Evidence loop.
++{ci_timing_note}
 +
 +## Change overview
 +
@@ -889,6 +1017,13 @@ index 0000000..f937df2
 +    )
 +    comment_rows = "\n".join(f"- {url}" for url in reviews.line_comment_urls) or "- None"
 +    review_rows = "\n".join(f"- {url}" for url in reviews.review_urls) or "- None"
++    ci_timing_note = (
++        "\nThe automatic Evidence job observed all three required code jobs as "
++        "successful. The\nworkflow status was still active solely because the "
++        "blocking Evidence job had not yet\nfinished."
++        if ci.status == "required-jobs-completed"
++        else ""
++    )
 +    return f"""# Validation record for PR #{pr.number}
 +
 +Created at: `{created_at.isoformat()}`
@@ -912,6 +1047,7 @@ index 0000000..f937df2
 +> that contains this directory. Do not regenerate Evidence to describe its own
 +> commit. A later code change requires a new successful CI run and a regenerated
 +> snapshot.
++{ci_timing_note}
 +
 +| Job | Conclusion | URL |
 +|---|---|---|
@@ -1084,10 +1220,10 @@ index 0000000..d9f96c6
 +        stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 diff --git a/scripts/ao/github.py b/scripts/ao/github.py
 new file mode 100644
-index 0000000..c167f38
+index 0000000..3364e86
 --- /dev/null
 +++ b/scripts/ao/github.py
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,225 @@
 +from __future__ import annotations
 +
 +import json
@@ -1102,7 +1238,11 @@ index 0000000..c167f38
 +class GitHubData(Protocol):
 +    def pull_request(self, number: int) -> PullRequest: ...
 +
-+    def successful_ci_run(self, commit_sha: str) -> CIRun: ...
++    def successful_ci_run(
++        self,
++        commit_sha: str,
++        run_id: int | None = None,
++    ) -> CIRun: ...
 +
 +    def review_evidence(self, number: int, decision: str) -> ReviewEvidence: ...
 +
@@ -1152,7 +1292,13 @@ index 0000000..c167f38
 +            review_decision=str(data.get("reviewDecision") or "not-reviewed"),
 +        )
 +
-+    def successful_ci_run(self, commit_sha: str) -> CIRun:
++    def successful_ci_run(
++        self,
++        commit_sha: str,
++        run_id: int | None = None,
++    ) -> CIRun:
++        if run_id is not None:
++            return self._successful_current_run(commit_sha, run_id)
 +        raw = self._json(
 +            "run",
 +            "list",
@@ -1181,16 +1327,58 @@ index 0000000..c167f38
 +                "gate status is indeterminate and Evidence must not be generated"
 +            )
 +        run_id = _required_int(latest, "databaseId")
-+        jobs_raw = self._json(
++        return self._validated_run(latest, run_id)
++
++    def _successful_current_run(self, commit_sha: str, run_id: int) -> CIRun:
++        raw = self._json(
 +            "run",
 +            "view",
 +            str(run_id),
 +            "--repo",
 +            self.repository,
 +            "--json",
-+            "jobs",
++            "headSha,status,conclusion,url,jobs",
 +        )
-+        jobs_data = cast(dict[str, list[dict[str, object]]], jobs_raw).get("jobs", [])
++        data = cast(dict[str, object], raw)
++        if _required_sha(data, "headSha") != commit_sha:
++            raise GitHubError(f"CI run {run_id} does not belong to code commit {commit_sha}")
++        return self._validated_run(data, run_id, allow_active=True)
++
++    def _validated_run(
++        self,
++        data: dict[str, object],
++        run_id: int,
++        *,
++        allow_active: bool = False,
++    ) -> CIRun:
++        status = _required_str(data, "status")
++        conclusion = str(data.get("conclusion") or "")
++        if not allow_active and (status != "completed" or conclusion != "success"):
++            raise GitHubError(
++                f"CI run {run_id} is not successful "
++                f"(status={status}, conclusion={conclusion or 'none'})"
++            )
++        if allow_active and status not in {"in_progress", "completed"}:
++            raise GitHubError(f"CI run {run_id} is not active or completed (status={status})")
++        if allow_active and status == "completed" and conclusion != "success":
++            raise GitHubError(
++                f"completed CI run {run_id} is not successful (conclusion={conclusion or 'none'})"
++            )
++        jobs_value = data.get("jobs")
++        if not isinstance(jobs_value, list):
++            jobs_raw = self._json(
++                "run",
++                "view",
++                str(run_id),
++                "--repo",
++                self.repository,
++                "--json",
++                "jobs",
++            )
++            jobs_value = cast(dict[str, object], jobs_raw).get("jobs")
++        if not isinstance(jobs_value, list):
++            raise GitHubError(f"CI run {run_id} did not return jobs")
++        jobs_data = cast(list[dict[str, object]], jobs_value)
 +        jobs = tuple(
 +            CIJob(
 +                name=_required_str(job, "name"),
@@ -1199,9 +1387,10 @@ index 0000000..c167f38
 +            )
 +            for job in jobs_data
 +        )
-+        unsuccessful = [job.name for job in jobs if job.conclusion != "success"]
-+        missing = REQUIRED_CI_JOBS - {job.name for job in jobs}
-+        if not jobs or unsuccessful or missing:
++        required_jobs = tuple(job for job in jobs if job.name in REQUIRED_CI_JOBS)
++        unsuccessful = [job.name for job in required_jobs if job.conclusion != "success"]
++        missing = REQUIRED_CI_JOBS - {job.name for job in required_jobs}
++        if not required_jobs or unsuccessful or missing:
 +            details: list[str] = []
 +            if unsuccessful:
 +                details.append(f"unsuccessful: {', '.join(unsuccessful)}")
@@ -1214,11 +1403,11 @@ index 0000000..c167f38
 +            )
 +        return CIRun(
 +            run_id=run_id,
-+            commit_sha=_required_sha(latest, "headSha"),
-+            status=status,
-+            conclusion=conclusion,
-+            url=_required_str(latest, "url"),
-+            jobs=jobs,
++            commit_sha=_required_sha(data, "headSha"),
++            status="required-jobs-completed" if status == "in_progress" else status,
++            conclusion="success",
++            url=_required_str(data, "url"),
++            jobs=required_jobs,
 +        )
 +
 +    def review_evidence(self, number: int, decision: str) -> ReviewEvidence:
@@ -1262,10 +1451,10 @@ index 0000000..c167f38
 +    return value
 diff --git a/scripts/ao/models.py b/scripts/ao/models.py
 new file mode 100644
-index 0000000..0666afe
+index 0000000..15f8ea4
 --- /dev/null
 +++ b/scripts/ao/models.py
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,55 @@
 +from __future__ import annotations
 +
 +from dataclasses import dataclass
@@ -1315,12 +1504,18 @@ index 0000000..0666afe
 +    code_commit_sha: str
 +    ci_run_id: int
 +    ci_conclusion: str
++
++
++@dataclass(frozen=True)
++class EvidenceSkip:
++    head_sha: str
++    reason: str
 diff --git a/scripts/ao/workspace.py b/scripts/ao/workspace.py
 new file mode 100644
-index 0000000..b66d409
+index 0000000..3a8358f
 --- /dev/null
 +++ b/scripts/ao/workspace.py
-@@ -0,0 +1,588 @@
+@@ -0,0 +1,686 @@
 +from __future__ import annotations
 +
 +import fcntl
@@ -1328,6 +1523,7 @@ index 0000000..b66d409
 +import os
 +import re
 +import shutil
++import signal
 +import subprocess
 +import tempfile
 +import time
@@ -1425,7 +1621,6 @@ index 0000000..b66d409
 +                    "result": "failure",
 +                },
 +            )
-+            self._release_lock()
 +            raise WorkspaceError(f"failed to clean Advisor worktree {self.path}")
 +        self.closed = True
 +        self._release_lock()
@@ -1449,6 +1644,20 @@ index 0000000..b66d409
 +        return bool(
 +            data.get("pr_number") == self.binding.pr_number
 +            and data.get("commit_sha") == self.binding.code_commit_sha
++        )
++
++    def record_advisor_process(self, process_id: int) -> None:
++        try:
++            marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
++        except (OSError, json.JSONDecodeError) as error:
++            raise WorkspaceError("cannot update Advisor workspace lifecycle marker") from error
++        if not isinstance(marker, dict):
++            raise WorkspaceError("Advisor workspace lifecycle marker is invalid")
++        marker["advisor_pid"] = process_id
++        marker["advisor_process_group_id"] = process_id
++        self.marker_path.write_text(
++            json.dumps(marker, sort_keys=True) + "\n",
++            encoding="utf-8",
 +        )
 +
 +    def _release_lock(self) -> None:
@@ -1600,14 +1809,24 @@ index 0000000..b66d409
 +        metadata_path: Path,
 +        command: Sequence[str],
 +        record_path: Path,
++        *,
++        timeout_seconds: float,
++        terminate_grace_seconds: float = 5.0,
 +    ) -> int:
 +        if not command:
 +            raise WorkspaceError("Advisor command must not be empty")
++        if timeout_seconds <= 0:
++            raise WorkspaceError("Advisor timeout must be greater than zero")
++        if terminate_grace_seconds <= 0:
++            raise WorkspaceError("Advisor termination grace period must be greater than zero")
 +        lease = self.acquire(metadata_path)
 +        process: subprocess.Popen[str] | None = None
 +        started_at = self.now()
 +        status = "interrupted"
 +        exit_code: int | None = None
++        process_return_code: int | None = None
++        termination_method: str | None = None
++        failure_reason: str | None = None
 +        cleanup_succeeded = False
 +        try:
 +            environment = os.environ.copy()
@@ -1622,36 +1841,87 @@ index 0000000..b66d409
 +                list(command),
 +                cwd=lease.path,
 +                env=environment,
++                start_new_session=True,
 +                text=True,
 +            )
-+            exit_code = process.wait()
-+            status = "completed" if exit_code == 0 else "command-failed"
-+            return exit_code
++            lease.record_advisor_process(process.pid)
++            try:
++                process_return_code = process.wait(timeout=timeout_seconds)
++            except subprocess.TimeoutExpired:
++                status = "timed-out"
++                exit_code = 124
++                failure_reason = f"Advisor exceeded timeout of {timeout_seconds} seconds"
++                termination_method = _terminate_process_group(
++                    process,
++                    terminate_grace_seconds,
++                )
++            else:
++                exit_code = process_return_code
++                status = "completed" if exit_code == 0 else "command-failed"
++                if exit_code != 0:
++                    failure_reason = f"Advisor command exited with status {exit_code}"
++        except BaseException as error:
++            failure_reason = f"{type(error).__name__}: {error}"
++            if process is not None and process.poll() is None:
++                termination_method = _terminate_process_group(
++                    process,
++                    terminate_grace_seconds,
++                )
++            raise
 +        finally:
 +            if process is not None and process.poll() is None:
-+                process.terminate()
-+                try:
-+                    process.wait(timeout=5)
-+                except subprocess.TimeoutExpired:
-+                    process.kill()
-+                    process.wait()
++                termination_method = _terminate_process_group(
++                    process,
++                    terminate_grace_seconds,
++                )
 +            try:
 +                lease.close()
 +                cleanup_succeeded = True
 +            finally:
 +                record = {
 +                    "cleanup_succeeded": cleanup_succeeded,
-+                    "command": list(command),
 +                    "evidence_metadata": str(metadata_path.resolve()),
 +                    "exit_code": exit_code,
++                    "failure_reason": failure_reason,
 +                    "finished_at": self.now().isoformat(),
 +                    "pr_number": lease.binding.pr_number,
++                    "process_return_code": (
++                        process.returncode if process is not None else process_return_code
++                    ),
 +                    "reviewed_commit_sha": lease.binding.code_commit_sha,
 +                    "started_at": started_at.isoformat(),
 +                    "status": status,
++                    "termination_method": termination_method,
++                    "timeout_seconds": timeout_seconds,
 +                    "workspace_path": str(lease.path),
 +                }
 +                _write_json_atomic(record_path, record)
++                append_json_event(
++                    self.log_path,
++                    {
++                        "action": "advisor.run",
++                        "cleanup_succeeded": cleanup_succeeded,
++                        "commit_sha": lease.binding.code_commit_sha,
++                        "failure_reason": failure_reason,
++                        "finished_at": self.now().isoformat(),
++                        "gate_status": (
++                            "valid"
++                            if status == "completed" and cleanup_succeeded
++                            else "indeterminate"
++                        ),
++                        "path": str(lease.path),
++                        "pr_number": lease.binding.pr_number,
++                        "result": (
++                            "success" if status == "completed" and cleanup_succeeded else "failure"
++                        ),
++                        "status": status,
++                        "termination_method": termination_method,
++                        "timeout_seconds": timeout_seconds,
++                    },
++                )
++        if exit_code is None:
++            raise WorkspaceError("Advisor process finished without an exit status")
++        return exit_code
 +
 +
 +def detect_stale_worktrees(
@@ -1904,6 +2174,29 @@ index 0000000..b66d409
 +    return worktree_path.with_name(f".{worktree_path.name}.ao-workspace.json")
 +
 +
++def _terminate_process_group(
++    process: subprocess.Popen[str],
++    grace_seconds: float,
++) -> str:
++    if process.poll() is not None:
++        return "already-exited"
++    try:
++        os.killpg(process.pid, signal.SIGTERM)
++    except ProcessLookupError:
++        process.wait()
++        return "already-exited"
++    try:
++        process.wait(timeout=grace_seconds)
++        return "sigterm"
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(process.pid, signal.SIGKILL)
++        except ProcessLookupError:
++            pass
++        process.wait()
++        return "sigkill"
++
++
 +def _workspace_prefix(repository: GitRepository, binding: EvidenceBinding) -> str:
 +    return (
 +        f"{repository.project_name()}-advisor-pr-{binding.pr_number}-"
@@ -1918,10 +2211,10 @@ index 0000000..0c46cfe
 +"""Tests for repository-local AO tooling."""
 diff --git a/tests/ao/helpers.py b/tests/ao/helpers.py
 new file mode 100644
-index 0000000..75641a6
+index 0000000..73cc03d
 --- /dev/null
 +++ b/tests/ao/helpers.py
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,141 @@
 +from __future__ import annotations
 +
 +import subprocess
@@ -1989,16 +2282,26 @@ index 0000000..75641a6
 +        self.pr = pull_request
 +        self.ci = ci_run
 +        self.reviews = reviews or ReviewEvidence("not-reviewed", (), ())
++        self.calls: list[str] = []
 +
 +    def pull_request(self, number: int) -> PullRequest:
++        self.calls.append("pull_request")
 +        assert number == self.pr.number
 +        return self.pr
 +
-+    def successful_ci_run(self, commit_sha: str) -> CIRun:
++    def successful_ci_run(
++        self,
++        commit_sha: str,
++        run_id: int | None = None,
++    ) -> CIRun:
++        self.calls.append("successful_ci_run")
 +        assert commit_sha == self.pr.head_sha
++        if run_id is not None:
++            assert run_id == self.ci.run_id
 +        return self.ci
 +
 +    def review_evidence(self, number: int, decision: str) -> ReviewEvidence:
++        self.calls.append("review_evidence")
 +        assert number == self.pr.number
 +        assert decision == self.pr.review_decision
 +        return self.reviews
@@ -2055,10 +2358,10 @@ index 0000000..75641a6
 +    return git(repository, "rev-parse", "HEAD").stdout.strip()
 diff --git a/tests/ao/test_evidence.py b/tests/ao/test_evidence.py
 new file mode 100644
-index 0000000..3a0065b
+index 0000000..52967f1
 --- /dev/null
 +++ b/tests/ao/test_evidence.py
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,277 @@
 +from __future__ import annotations
 +
 +import json
@@ -2071,10 +2374,11 @@ index 0000000..3a0065b
 +    EVIDENCE_FILES,
 +    EvidenceError,
 +    EvidenceGenerator,
++    SnapshotResult,
 +    parse_evidence_binding,
 +)
 +from scripts.ao.git import GitRepository
-+from scripts.ao.models import CIRun
++from scripts.ao.models import CIRun, EvidenceSkip
 +from tests.ao.helpers import (
 +    FakeGitHubData,
 +    commit_paths,
@@ -2096,7 +2400,7 @@ index 0000000..3a0065b
 +        now=lambda: NOW,
 +    )
 +
-+    result = generator.generate(41, commit=False)
++    result = _snapshot(generator.generate(41, commit=False))
 +
 +    assert {path.name for path in result.directory.iterdir()} == EVIDENCE_FILES
 +    expected = git(
@@ -2146,14 +2450,15 @@ index 0000000..3a0065b
 +
 +def test_snapshot_is_a_separate_evidence_only_commit(tmp_path: Path) -> None:
 +    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
 +    generator = EvidenceGenerator(
 +        GitRepository(fixture.repository),
-+        github_for(fixture.code_sha),
++        github,
 +        log_path=tmp_path / "events.jsonl",
 +        now=lambda: NOW,
 +    )
 +
-+    result = generator.generate(41)
++    result = _snapshot(generator.generate(41))
 +
 +    assert result.evidence_commit_sha is not None
 +    assert git(fixture.repository, "rev-parse", "HEAD^").stdout.strip() == fixture.code_sha
@@ -2176,6 +2481,41 @@ index 0000000..3a0065b
 +        git(fixture.repository, "log", "-1", "--format=%s").stdout.strip()
 +        == "docs: add PR41 review evidence"
 +    )
++
++
++def test_second_automatic_invocation_structurally_skips_evidence_only_head(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    log_path = tmp_path / "events.jsonl"
++    generator = EvidenceGenerator(
++        GitRepository(fixture.repository),
++        github,
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++    _snapshot(generator.generate(41))
++    first_call_count = len(github.calls)
++    git(
++        fixture.repository,
++        "commit",
++        "--amend",
++        "-m",
++        "wording deliberately unrelated to Evidence",
++    )
++    evidence_head = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++
++    second = generator.generate(41)
++
++    assert isinstance(second, EvidenceSkip)
++    assert second.head_sha == evidence_head
++    assert "only docs/evidence/**" in second.reason
++    assert len(github.calls) == first_call_count
++    assert git(fixture.repository, "rev-parse", "HEAD").stdout.strip() == evidence_head
++    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
++    assert [event["result"] for event in events] == ["success", "skipped"]
++    assert events[1]["reason"] == second.reason
 +
 +
 +def test_regeneration_excludes_previous_evidence_from_patch(tmp_path: Path) -> None:
@@ -2203,7 +2543,7 @@ index 0000000..3a0065b
 +        now=lambda: NOW,
 +    )
 +
-+    result = generator.generate(41, commit=False)
++    result = _snapshot(generator.generate(41, commit=False))
 +    patch = (result.directory / "diff.patch").read_text(encoding="utf-8")
 +
 +    assert "next-code.txt" in patch
@@ -2294,12 +2634,17 @@ index 0000000..3a0065b
 +
 +    with pytest.raises(EvidenceError, match="CI conclusion"):
 +        parse_evidence_binding(metadata)
++
++
++def _snapshot(result: SnapshotResult | object) -> SnapshotResult:
++    assert isinstance(result, SnapshotResult)
++    return result
 diff --git a/tests/ao/test_github.py b/tests/ao/test_github.py
 new file mode 100644
-index 0000000..152136a
+index 0000000..e525a12
 --- /dev/null
 +++ b/tests/ao/test_github.py
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,128 @@
 +from __future__ import annotations
 +
 +import json
@@ -2393,16 +2738,81 @@ index 0000000..152136a
 +
 +    with pytest.raises(GitHubError, match="missing: container"):
 +        GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
-diff --git a/tests/ao/test_workspace.py b/tests/ao/test_workspace.py
++
++
++def test_gh_provider_accepts_current_run_after_required_jobs_complete() -> None:
++    runner = StubRunner(
++        [
++            {
++                "conclusion": "",
++                "headSha": SHA,
++                "jobs": [
++                    {
++                        "conclusion": "success",
++                        "name": name,
++                        "url": f"https://example.invalid/jobs/{name}",
++                    }
++                    for name in ("quality", "database", "container")
++                ]
++                + [
++                    {
++                        "conclusion": "",
++                        "name": "evidence",
++                        "url": "https://example.invalid/jobs/evidence",
++                    }
++                ],
++                "status": "in_progress",
++                "url": "https://example.invalid/runs/88",
++            }
++        ]
++    )
++
++    ci_run = GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA, 88)
++
++    assert ci_run.run_id == 88
++    assert ci_run.status == "required-jobs-completed"
++    assert ci_run.conclusion == "success"
++    assert {job.name for job in ci_run.jobs} == {"quality", "database", "container"}
+diff --git a/tests/ao/test_workflow.py b/tests/ao/test_workflow.py
 new file mode 100644
-index 0000000..4d1b3de
+index 0000000..289d639
 --- /dev/null
-+++ b/tests/ao/test_workspace.py
-@@ -0,0 +1,377 @@
++++ b/tests/ao/test_workflow.py
+@@ -0,0 +1,22 @@
 +from __future__ import annotations
 +
++from pathlib import Path
++
++
++def test_evidence_job_blocks_after_three_code_jobs_with_minimal_write_permission() -> None:
++    workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text(
++        encoding="utf-8"
++    )
++    evidence = workflow.split("\n  evidence:\n", maxsplit=1)[1]
++
++    assert "permissions:\n  contents: read\n" in workflow
++    assert workflow.count("contents: write") == 1
++    assert (
++        "permissions:\n      actions: read\n      contents: write\n      pull-requests: read"
++        in evidence
++    )
++    assert "needs:\n      - quality\n      - database\n      - container" in evidence
++    assert evidence.count("python -m scripts.ao evidence") == 1
++    assert '--ci-run-id "$RUN_ID"' in evidence
++    assert "GITHUB_TOKEN pushes do not start another workflow" in evidence
++    assert "continue-on-error" not in evidence
+diff --git a/tests/ao/test_workspace.py b/tests/ao/test_workspace.py
+new file mode 100644
+index 0000000..032da97
+--- /dev/null
++++ b/tests/ao/test_workspace.py
+@@ -0,0 +1,518 @@
++from __future__ import annotations
++
++import fcntl
 +import json
 +import os
++import signal
 +import subprocess
 +import sys
 +import time
@@ -2548,7 +2958,7 @@ index 0000000..4d1b3de
 +        ),
 +    )
 +
-+    assert resolver.run_advisor(metadata, command, record) == 0
++    assert resolver.run_advisor(metadata, command, record, timeout_seconds=5) == 0
 +
 +    data = json.loads(record.read_text(encoding="utf-8"))
 +    assert data["reviewed_commit_sha"] == fixture.code_sha
@@ -2556,6 +2966,59 @@ index 0000000..4d1b3de
 +    assert data["cleanup_succeeded"] is True
 +    assert observed.read_text(encoding="utf-8") == fixture.code_sha
 +    assert not Path(data["workspace_path"]).exists()
++
++
++def test_timeout_kills_process_group_before_worktree_and_lock_cleanup(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
++    record = tmp_path / "timeout-record.json"
++    pid_file = tmp_path / "advisor.pid"
++    event_log = tmp_path / "events.jsonl"
++    resolver = WorkspaceResolver(
++        GitRepository(fixture.repository),
++        temp_root=tmp_path / "advisor-worktrees",
++        log_path=event_log,
++        now=lambda: NOW,
++    )
++    command = (
++        sys.executable,
++        "-c",
++        (
++            "import os,pathlib,signal,time; "
++            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
++            f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
++            "time.sleep(30)"
++        ),
++    )
++
++    result = resolver.run_advisor(
++        metadata,
++        command,
++        record,
++        timeout_seconds=0.5,
++        terminate_grace_seconds=0.2,
++    )
++
++    assert result == 124
++    child_pid = int(pid_file.read_text(encoding="utf-8"))
++    with pytest.raises(ProcessLookupError):
++        os.kill(child_pid, 0)
++    data = json.loads(record.read_text(encoding="utf-8"))
++    assert data["status"] == "timed-out"
++    assert data["termination_method"] == "sigkill"
++    assert data["timeout_seconds"] == 0.5
++    assert data["cleanup_succeeded"] is True
++    assert "exceeded timeout" in data["failure_reason"]
++    assert not Path(data["workspace_path"]).exists()
++    events = [json.loads(line) for line in event_log.read_text(encoding="utf-8").splitlines()]
++    assert events[-1]["action"] == "advisor.run"
++    assert events[-1]["gate_status"] == "indeterminate"
++    assert events[-1]["termination_method"] == "sigkill"
++
++    with resolver.acquire(metadata) as lease:
++        assert lease.path.exists()
 +
 +
 +def test_sigterm_interrupt_still_cleans_worktree(tmp_path: Path) -> None:
@@ -2613,6 +3076,92 @@ index 0000000..4d1b3de
 +    assert data["cleanup_succeeded"] is True
 +    assert not Path(data["workspace_path"]).exists()
 +    assert "advisor-pr-41-" not in git(fixture.repository, "worktree", "list", "--porcelain").stdout
++
++
++def test_sigkill_releases_kernel_lock_but_leaves_detectable_worktree(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    repository = GitRepository(fixture.repository)
++    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
++    record = tmp_path / "killed-record.json"
++    pid_file = tmp_path / "advisor.pid"
++    temp_root = tmp_path / "advisor-worktrees"
++    project_root = Path(__file__).resolve().parents[2]
++    process = subprocess.Popen(
++        (
++            sys.executable,
++            "-m",
++            "scripts.ao",
++            "advisor-run",
++            "--repo",
++            str(fixture.repository),
++            "--metadata",
++            str(metadata),
++            "--record",
++            str(record),
++            "--temp-root",
++            str(temp_root),
++            "--timeout-seconds",
++            "30",
++            "--",
++            sys.executable,
++            "-c",
++            (
++                "import os,pathlib,time; "
++                f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
++                "time.sleep(30)"
++            ),
++        ),
++        cwd=project_root,
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++        text=True,
++    )
++    deadline = time.monotonic() + 10
++    while time.monotonic() < deadline and not pid_file.exists():
++        if process.poll() is not None:
++            pytest.fail(f"advisor parent exited early: {process.communicate()}")
++        time.sleep(0.05)
++    assert pid_file.exists()
++    child_pid = int(pid_file.read_text(encoding="utf-8"))
++
++    process.kill()
++    process.wait(timeout=5)
++
++    assert process.returncode is not None and process.returncode < 0
++    assert not record.exists()
++    registered = git(fixture.repository, "worktree", "list", "--porcelain").stdout
++    assert "advisor-pr-41-" in registered
++    lock_path = (
++        repository.common_git_dir()
++        / "ao"
++        / "locks"
++        / (f"{repository.project_name()}-advisor-pr-41-{fixture.code_sha[:12]}.lock")
++    )
++    lock_fd = os.open(lock_path, os.O_RDWR)
++    try:
++        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    finally:
++        os.close(lock_fd)
++
++    os.killpg(child_pid, signal.SIGKILL)
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline:
++        try:
++            os.kill(child_pid, 0)
++        except ProcessLookupError:
++            break
++        time.sleep(0.05)
++    stale = detect_stale_worktrees(
++        repository,
++        temp_root=temp_root,
++        older_than_seconds=0,
++    )
++    assert len(stale) == 1
++    assert "advisor-pr-41-" in stale[0].path.name
++    reclaim_stale_worktrees(repository, stale, log_path=tmp_path / "reclaim.jsonl")
++    assert not stale[0].path.exists()
 +
 +
 +def test_stale_legacy_worktree_detection_and_reclaim(tmp_path: Path) -> None:

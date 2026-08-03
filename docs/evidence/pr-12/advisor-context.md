@@ -7,11 +7,11 @@
 3. Read `validation.md` and follow its original evidence links.
 4. Inspect `diff.patch` for the complete three-dot change record.
 5. Use the Advisor Workspace Resolver to inspect the source at code commit
-   `744641de628ee664ab41e1a52308b7f747734263` in detached HEAD state.
+   `edc067f4836762f0729402e4fc545e708dfaeb43` in detached HEAD state.
 
 The original Evidence files are in `docs/evidence/pr-12/` on branch
 `feat/ao-p0-1-evidence-snapshot`. The source of record is the repository at code commit
-`744641de628ee664ab41e1a52308b7f747734263`.
+`edc067f4836762f0729402e4fc545e708dfaeb43`.
 
 ## Non-substitution rule
 

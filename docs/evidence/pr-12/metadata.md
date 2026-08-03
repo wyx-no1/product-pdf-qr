@@ -9,27 +9,31 @@
 | PR URL | https://github.com/wyx-no1/product-pdf-qr/pull/12 |
 | Source branch | `feat/ao-p0-1-evidence-snapshot` |
 | Target branch | `main` |
-| Code commit SHA | `744641de628ee664ab41e1a52308b7f747734263` |
+| Code commit SHA | `edc067f4836762f0729402e4fc545e708dfaeb43` |
 | Merge base | `af82f581c83bd023b4d17ccc4231a2802acf6f2c` |
-| CI run ID | `30788671105` |
+| CI run ID | `30790486727` |
 | CI conclusion | `success` |
-| CI URL | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30788671105 |
-| Created at | `2026-08-03T06:00:14.407162+00:00` |
+| CI URL | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30790486727 |
+| Created at | `2026-08-03T06:33:20.941685+00:00` |
 
-> The CI result above belongs to code commit `744641de628ee664ab41e1a52308b7f747734263`, not to the later
+> The CI result above belongs to code commit `edc067f4836762f0729402e4fc545e708dfaeb43`, not to the later
 > Evidence commit. The Evidence commit must not be used as a new generation trigger;
 > doing so would create a CI/Evidence loop.
+
+> The automatic Evidence job runs after the `quality`, `database`, and `container`
+> jobs succeed. At snapshot time the enclosing workflow is still active only because
+> this blocking Evidence job is its final job.
 
 ## Change overview
 
 | Metric | Value |
 |---|---:|
-| Changed files | 15 |
-| Added lines | 2688 |
+| Changed files | 17 |
+| Added lines | 3223 |
 | Deleted lines | 0 |
 
 The authoritative patch was generated with the three-dot comparison
-`git diff origin/main...744641de628ee664ab41e1a52308b7f747734263 -- . ':(exclude)docs/evidence/**'`.
+`git diff origin/main...edc067f4836762f0729402e4fc545e708dfaeb43 -- . ':(exclude)docs/evidence/**'`.
 The entire `docs/evidence/**` tree is excluded to prevent self-reference. No source
 files are copied into this directory.
 
@@ -37,6 +41,8 @@ files are copied into this directory.
 
 | Commit | Subject |
 |---|---|
+| `edc067f4836762f0729402e4fc545e708dfaeb43` | fix: close AO evidence review gaps |
+| `705bfa105d26d1007e15294124eb5dd6dbfaad69` | docs: add PR12 review evidence |
 | `744641de628ee664ab41e1a52308b7f747734263` | feat: automate AO evidence and advisor workspaces |
 
 ## Position and known limitations
@@ -47,6 +53,6 @@ eliminate selection bias or blind spots. `diff.patch` is the complete authoritat
 change record for scope questions, excluding only `docs/evidence/**`.
 
 Evidence does not replace source review. An Advisor must read both this snapshot and
-the source at code commit `744641de628ee664ab41e1a52308b7f747734263`. If Evidence and source disagree, source is
+the source at code commit `edc067f4836762f0729402e4fc545e708dfaeb43`. If Evidence and source disagree, source is
 authoritative and the Evidence error must be reported. The tool cannot mechanically
 prove that an Advisor actually read the source.
