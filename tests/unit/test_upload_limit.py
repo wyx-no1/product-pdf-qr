@@ -105,6 +105,7 @@ def assert_size_rejection_audit(
             "token",
         }
     )
+    assert all("file_size" not in key for key in detail.obj)
     return cast(dict[str, object], detail.obj)
 
 
@@ -135,9 +136,9 @@ async def test_content_length_rejection_reads_zero_request_bytes() -> None:
         expected_detail={
             "reason": "content_length_exceeded",
             "stage": "pre_parser_size",
-            "declared_request_body_bytes": len(complete_body),
+            "declared_content_length": len(complete_body),
             "declared_request_body_verified": False,
-            "actual_file_size_known": False,
+            "complete_pdf_byte_length_known": False,
         },
     )
 
@@ -169,8 +170,8 @@ async def test_chunked_rejection_stops_before_consuming_complete_body() -> None:
         expected_detail={
             "reason": "chunked_stream_exceeded",
             "stage": "pre_parser_size",
-            "received_request_body_bytes_before_abort": received_bytes,
-            "actual_file_size_known": False,
+            "received_bytes_before_abort": received_bytes,
+            "complete_pdf_byte_length_known": False,
         },
     )
 

@@ -371,15 +371,15 @@ async def test_pre_parser_size_rejections_commit_independent_audits(
         assert rows[0][5] == {
             "reason": "content_length_exceeded",
             "stage": "pre_parser_size",
-            "declared_request_body_bytes": 70000,
+            "declared_content_length": 70000,
             "declared_request_body_verified": False,
-            "actual_file_size_known": False,
+            "complete_pdf_byte_length_known": False,
         }
         assert rows[1][5] == {
             "reason": "chunked_stream_exceeded",
             "stage": "pre_parser_size",
-            "received_request_body_bytes_before_abort": received_chunked_bytes,
-            "actual_file_size_known": False,
+            "received_bytes_before_abort": received_chunked_bytes,
+            "complete_pdf_byte_length_known": False,
         }
     finally:
         get_settings.cache_clear()

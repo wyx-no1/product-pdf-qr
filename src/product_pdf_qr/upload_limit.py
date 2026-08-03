@@ -55,9 +55,9 @@ class UploadRequestLimitMiddleware:
                 detail={
                     "reason": "content_length_exceeded",
                     "stage": "pre_parser_size",
-                    "declared_request_body_bytes": content_length,
+                    "declared_content_length": content_length,
                     "declared_request_body_verified": False,
-                    "actual_file_size_known": False,
+                    "complete_pdf_byte_length_known": False,
                 },
             )
             await self._reject(scope, receive, send, request_id=request_id)
@@ -96,8 +96,8 @@ class UploadRequestLimitMiddleware:
                 detail={
                     "reason": "chunked_stream_exceeded",
                     "stage": "pre_parser_size",
-                    "received_request_body_bytes_before_abort": received_bytes,
-                    "actual_file_size_known": False,
+                    "received_bytes_before_abort": received_bytes,
+                    "complete_pdf_byte_length_known": False,
                 },
             )
             await self._reject(scope, receive, send, request_id=request_id)
