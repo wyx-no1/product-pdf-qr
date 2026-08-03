@@ -59,6 +59,8 @@ class EvidenceSkip:
 class EvidenceAttestation:
     context: str
     state: str
+    creator_id: int
     creator_login: str
+    creator_type: str
     description: str
     target_url: str

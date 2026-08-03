@@ -27,20 +27,31 @@ writes exactly five files under `docs/evidence/pr-123/`, creates a separate
 update makes the push fail instead of overwriting newer code.
 
 Before publishing a successful `AO / evidence-snapshot` status on the new head, the
-trusted verifier proves that the commit changes exactly those five Evidence files,
-its parent and metadata bind the successful source CI, its three-dot patch matches
-the bound code diff, and the remote PR head is that exact commit. The status
-description names the parent SHA and source run. Failure posts a failure status;
-there is no unconditional green path.
+trusted verifier proves that the commit changes exactly those five regular Evidence
+files and that the remote PR head is that exact commit. It reconstructs
+`metadata.md`, `changed-files.md`, `diff.patch`, `validation.md`, and
+`advisor-context.md` from the bound parent, three-dot Git diff, current PR metadata,
+the exact successful CI run, and scoped GitHub review records. The creation time is
+the only reference-only metadata value: it must be a timezone-qualified ISO-8601
+value and is reused while reconstructing both files that record it. All binding,
+merge-base, change-count, file-list, patch, CI, job, branch, URL, and Advisor
+instructions are compared to independently retrieved facts. The status description
+names the parent SHA and source run. Failure posts a failure status and records an
+indeterminate event; there is no warning, neutral, or unconditional green path.
 
 A `GITHUB_TOKEN` PR update may create an approval-required, zero-job run. That record
 is neither success nor test failure and remains indeterminate. The independent
 content-based skip keeps the publisher finite if that run is approved or the
-credential later changes to a PAT or deploy key. A skipped head can only preserve a
-pre-existing successful `AO / evidence-snapshot` status created by
-`github-actions[bot]` with the exact parent SHA, source CI, and workflow-run target.
-It can never mint the first green status. Therefore an author-supplied or tampered
-Evidence-only commit fails closed even when its path shape and patch look valid.
+credential later changes to a PAT or deploy key. Path shape only identifies a skip
+candidate; before returning `skipped`, the generator itself runs the complete
+verification above and requires a pre-existing successful `AO / evidence-snapshot`
+status on the exact immutable SHA. Generator identity comes from the GitHub Status
+API's server-authenticated creator object: numeric account ID `41898282`, login
+`github-actions[bot]`, and type `Bot`, plus the exact parent/source-CI description
+and repository workflow-run URL. These are not Git committer strings and cannot be
+set by PR content or `git config`. The workflow repeats the verification and never
+posts success on the skip branch. Therefore an author-supplied, incomplete, or
+tampered Evidence-only commit fails closed.
 
 Generation uses `origin/<base>...<code-sha>` and excludes all of
 `docs/evidence/**`. Failure exits nonzero, records an `indeterminate` gate event in

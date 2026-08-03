@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -94,13 +94,22 @@ class EvidenceGenerator:
             self._require_clean_worktree()
             evidence_only = self._evidence_only_head()
             if evidence_only is not None:
+                verified = verify_evidence_head(
+                    self.repository,
+                    self.github,
+                    pr_number,
+                    evidence_only.head_sha,
+                    require_prior_attestation=True,
+                )
                 append_json_event(
                     self.log_path,
                     {
                         "action": "evidence.generate",
+                        "ci_run_id": verified.ci_run_id,
+                        "code_commit_sha": verified.code_commit_sha,
                         "duration_seconds": round(time.monotonic() - started, 6),
                         "finished_at": self.now().isoformat(),
-                        "gate_status": "not-applicable",
+                        "gate_status": "already-attested",
                         "head_sha": evidence_only.head_sha,
                         "pr_number": pr_number,
                         "reason": evidence_only.reason,
@@ -191,7 +200,10 @@ class EvidenceGenerator:
         if paths and all(path.startswith("docs/evidence/") for path in paths):
             return EvidenceSkip(
                 head_sha=head_sha,
-                reason="HEAD changes only docs/evidence/**; generation loop prevented",
+                reason=(
+                    "HEAD is a fully verified, previously attested AO Evidence commit; "
+                    "generation loop prevented"
+                ),
             )
         return None
 
@@ -431,7 +443,10 @@ def verify_evidence_head(
         if path.is_symlink() or not path.is_file():
             raise EvidenceError(f"Evidence entry must be a regular file: {path}")
 
-    binding = parse_evidence_binding(directory / "metadata.md")
+    metadata_path = directory / "metadata.md"
+    metadata_text = metadata_path.read_text(encoding="utf-8")
+    binding = parse_evidence_binding(metadata_path)
+    created_at = _metadata_created_at(metadata_text)
     if binding.pr_number != pr_number:
         raise EvidenceError(
             f"Evidence metadata binds PR #{binding.pr_number}, not requested PR #{pr_number}"
@@ -473,9 +488,75 @@ def verify_evidence_head(
     ):
         raise EvidenceError("Evidence metadata does not bind an exact completed successful CI run")
 
+    code_pull_request = replace(pull_request, head_sha=binding.code_commit_sha)
+    base_ref = f"origin/{binding.target_branch}"
+    comparison = f"{base_ref}...{binding.code_commit_sha}"
+    merge_base = repository.git(
+        "merge-base",
+        base_ref,
+        binding.code_commit_sha,
+    ).stdout.strip()
+    changed_files = _parse_name_status(
+        repository.git(
+            "diff",
+            "--name-status",
+            comparison,
+            "--",
+            ".",
+            EVIDENCE_EXCLUSION,
+        ).stdout
+    )
+    additions, deletions = _parse_numstat(
+        repository.git(
+            "diff",
+            "--numstat",
+            comparison,
+            "--",
+            ".",
+            EVIDENCE_EXCLUSION,
+        ).stdout
+    )
+    commits = _parse_commits(
+        repository.git(
+            "log",
+            "--format=%H%x09%s",
+            f"{merge_base}..{binding.code_commit_sha}",
+        ).stdout
+    )
+
+    expected_metadata = _metadata_markdown(
+        code_pull_request,
+        ci_run,
+        merge_base,
+        changed_files,
+        additions,
+        deletions,
+        commits,
+        created_at,
+    )
+    if metadata_text != expected_metadata:
+        raise EvidenceError(
+            "Evidence metadata.md is incomplete or does not match the bound PR, "
+            "commit, merge base, CI, and change metrics"
+        )
+
+    expected_changed_files = _changed_files_markdown(
+        code_pull_request,
+        merge_base,
+        changed_files,
+        additions,
+        deletions,
+    )
+    actual_changed_files = (directory / "changed-files.md").read_text(encoding="utf-8")
+    if actual_changed_files != expected_changed_files:
+        raise EvidenceError(
+            "Evidence changed-files.md does not match the recomputed three-dot "
+            "name-status and line counts"
+        )
+
     expected_patch = repository.git(
         "diff",
-        f"origin/{binding.target_branch}...{binding.code_commit_sha}",
+        comparison,
         "--",
         ".",
         EVIDENCE_EXCLUSION,
@@ -483,6 +564,38 @@ def verify_evidence_head(
     actual_patch = (directory / "diff.patch").read_text(encoding="utf-8")
     if actual_patch != expected_patch:
         raise EvidenceError("Evidence diff.patch does not match the bound three-dot code diff")
+
+    validation_text = (directory / "validation.md").read_text(encoding="utf-8")
+    recorded_reviews = _validation_review_evidence(validation_text, code_pull_request)
+    current_reviews = github.review_evidence(
+        pull_request.number,
+        pull_request.review_decision,
+    )
+    if not set(recorded_reviews.line_comment_urls).issubset(
+        current_reviews.line_comment_urls
+    ) or not set(recorded_reviews.review_urls).issubset(current_reviews.review_urls):
+        raise EvidenceError(
+            "Evidence validation.md contains review URLs not present in GitHub's current PR records"
+        )
+    expected_validation = _validation_markdown(
+        code_pull_request,
+        ci_run,
+        recorded_reviews,
+        merge_base,
+        created_at,
+    )
+    if validation_text != expected_validation:
+        raise EvidenceError(
+            "Evidence validation.md does not match the bound timestamp, CI run, "
+            "required jobs, merge base, and generated review-record format"
+        )
+
+    expected_advisor_context = _advisor_context_markdown(code_pull_request)
+    actual_advisor_context = (directory / "advisor-context.md").read_text(encoding="utf-8")
+    if actual_advisor_context != expected_advisor_context:
+        raise EvidenceError(
+            "Evidence advisor-context.md does not match the bound PR, branch, and code commit"
+        )
 
     if require_prior_attestation:
         try:
@@ -501,9 +614,15 @@ def verify_evidence_head(
         if (
             attestation.context != EVIDENCE_STATUS_CONTEXT
             or attestation.state != "success"
+            or attestation.creator_id != 41898282
             or attestation.creator_login != "github-actions[bot]"
+            or attestation.creator_type != "Bot"
             or attestation.description != expected_description
-            or not attestation.target_url.startswith(expected_target_prefix)
+            or re.fullmatch(
+                rf"{re.escape(expected_target_prefix)}[1-9][0-9]*",
+                attestation.target_url,
+            )
+            is None
         ):
             raise EvidenceError(
                 "Evidence skip path attestation does not match its parent, CI, "
@@ -533,6 +652,70 @@ def _metadata_value(text: str, label: str) -> str:
     if not match:
         raise EvidenceError(f"metadata is missing required binding field {label}")
     return match.group(1).strip()
+
+
+def _metadata_created_at(text: str) -> datetime:
+    raw = _metadata_value(text, "Created at")
+    try:
+        created_at = datetime.fromisoformat(raw)
+    except ValueError as error:
+        raise EvidenceError("metadata Created at must be an ISO-8601 timestamp") from error
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise EvidenceError("metadata Created at must include a timezone")
+    return created_at
+
+
+def _validation_review_evidence(text: str, pr: PullRequest) -> ReviewEvidence:
+    decision_match = re.search(
+        r"^GitHub review decision at generation time: `([^`\r\n]+)`$",
+        text,
+        re.MULTILINE,
+    )
+    if decision_match is None:
+        raise EvidenceError("validation.md is missing the generated review decision")
+    comments = _validation_url_section(
+        text,
+        "Line-level comment URLs:",
+        "Review record URLs:",
+        f"{pr.url}#discussion_r",
+    )
+    reviews = _validation_url_section(
+        text,
+        "Review record URLs:",
+        "Independent retrieval:",
+        f"{pr.url}#pullrequestreview-",
+    )
+    return ReviewEvidence(
+        decision=decision_match.group(1),
+        line_comment_urls=comments,
+        review_urls=reviews,
+    )
+
+
+def _validation_url_section(
+    text: str,
+    heading: str,
+    next_heading: str,
+    required_prefix: str,
+) -> tuple[str, ...]:
+    match = re.search(
+        rf"^{re.escape(heading)}\n\n(?P<body>.*?)(?=\n\n^{re.escape(next_heading)}$)",
+        text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise EvidenceError(f"validation.md is missing generated section {heading}")
+    lines = tuple(line for line in match.group("body").splitlines() if line)
+    if lines == ("- None",):
+        return ()
+    if not lines or any(not line.startswith("- ") for line in lines):
+        raise EvidenceError(f"validation.md has malformed entries in {heading}")
+    urls = tuple(line.removeprefix("- ") for line in lines)
+    if any(not url.startswith(required_prefix) for url in urls):
+        raise EvidenceError(f"validation.md has an out-of-scope URL in {heading}")
+    if len(set(urls)) != len(urls):
+        raise EvidenceError(f"validation.md has duplicate URLs in {heading}")
+    return urls
 
 
 def _replace_evidence_directory(
@@ -751,7 +934,8 @@ def _validation_markdown(
     created_at: datetime,
 ) -> str:
     job_rows = "\n".join(
-        f"| {_escape(job.name)} | `{job.conclusion}` | {job.url} |" for job in ci.jobs
+        f"| {_escape(job.name)} | `{job.conclusion}` | {job.url} |"
+        for job in sorted(ci.jobs, key=lambda item: item.name)
     )
     comment_rows = "\n".join(f"- {url}" for url in reviews.line_comment_urls) or "- None"
     review_rows = "\n".join(f"- {url}" for url in reviews.review_urls) or "- None"

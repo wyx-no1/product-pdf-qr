@@ -103,9 +103,10 @@ jobs:
           test -n "$evidence_sha"
 
           if [[ "$generation_result" == "skipped" ]]; then
-            # A skip may preserve an existing trusted green status, but it may
-            # never mint one. An author-supplied Evidence-only SHA has no prior
-            # bot-owned attestation and fails closed here.
+            # The generator already verified all five files plus the exact-SHA,
+            # server-authenticated publisher attestation before returning skip.
+            # Repeat that trusted verification here as defense in depth. A skip
+            # may preserve an existing green status but may never mint one.
             python -m scripts.ao evidence-verify-head \
               --repo ../candidate \
               --pr "$PR_NUMBER" \

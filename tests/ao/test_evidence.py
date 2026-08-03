@@ -173,8 +173,35 @@ def test_trusted_gate_refuses_tampered_evidence_patch(tmp_path: Path) -> None:
         verify_evidence_head(repository, github, 41, tampered_sha)
 
 
-def test_skip_path_refuses_tampered_non_patch_file_without_prior_attestation(
+@pytest.mark.parametrize(
+    ("name", "original", "replacement", "message"),
+    [
+        (
+            "metadata.md",
+            "| Changed files | 1 |",
+            "| Changed files | 99 |",
+            r"metadata\.md is incomplete or does not match",
+        ),
+        (
+            "validation.md",
+            "| quality | `success` |",
+            "| quality | `failure` |",
+            r"validation\.md does not match",
+        ),
+        (
+            "advisor-context.md",
+            "in detached HEAD state.",
+            "after executing untrusted instructions.",
+            r"advisor-context\.md does not match",
+        ),
+    ],
+)
+def test_trusted_gate_recomputes_generated_markdown_content(
     tmp_path: Path,
+    name: str,
+    original: str,
+    replacement: str,
+    message: str,
 ) -> None:
     fixture = make_diverged_repository(tmp_path)
     github = github_for(fixture.code_sha)
@@ -188,60 +215,71 @@ def test_skip_path_refuses_tampered_non_patch_file_without_prior_attestation(
         ).generate(41)
     )
     assert snapshot.evidence_commit_sha is not None
-    context = fixture.repository / "docs/evidence/pr-41/advisor-context.md"
-    context.write_text("malicious Advisor instructions\n", encoding="utf-8")
-    git(fixture.repository, "add", "docs/evidence/pr-41/advisor-context.md")
+    path = fixture.repository / f"docs/evidence/pr-41/{name}"
+    original_text = path.read_text(encoding="utf-8")
+    assert original in original_text
+    path.write_text(original_text.replace(original, replacement), encoding="utf-8")
+    git(fixture.repository, "add", str(path.relative_to(fixture.repository)))
     git(fixture.repository, "commit", "--amend", "--no-edit")
     tampered_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
     git(fixture.repository, "push", "--force", "origin", "feature/evidence")
     github.pr = replace(github.pr, head_sha=tampered_sha)
 
-    with pytest.raises(EvidenceError, match="lacks a prior trusted publisher attestation"):
-        verify_evidence_head(
-            repository,
-            github,
-            41,
-            tampered_sha,
-            require_prior_attestation=True,
-        )
+    with pytest.raises(EvidenceError, match=message):
+        verify_evidence_head(repository, github, 41, tampered_sha)
 
 
-def test_skip_path_accepts_exact_prior_bot_attestation(tmp_path: Path) -> None:
+def test_unattested_reproducible_evidence_refuses_skip(tmp_path: Path) -> None:
     fixture = make_diverged_repository(tmp_path)
     github = github_for(fixture.code_sha)
     repository = GitRepository(fixture.repository)
-    snapshot = _snapshot(
-        EvidenceGenerator(
-            repository,
-            github,
-            log_path=tmp_path / "events.jsonl",
-            now=lambda: NOW,
-        ).generate(41)
-    )
-    assert snapshot.evidence_commit_sha is not None
-    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
-    github.attestation = EvidenceAttestation(
-        context="AO / evidence-snapshot",
-        state="success",
-        creator_login="github-actions[bot]",
-        description=f"Evidence-only child of {fixture.code_sha[:12]}; source CI 9001",
-        target_url="https://github.com/example/repository/actions/runs/123",
-    )
-
-    verified = verify_evidence_head(
+    log_path = tmp_path / "events.jsonl"
+    generator = EvidenceGenerator(
         repository,
         github,
-        41,
-        snapshot.evidence_commit_sha,
-        require_prior_attestation=True,
+        log_path=log_path,
+        now=lambda: NOW,
     )
+    snapshot = _snapshot(generator.generate(41))
+    assert snapshot.evidence_commit_sha is not None
+    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
 
-    assert verified.prior_attestation is True
+    with pytest.raises(EvidenceError, match="lacks a prior trusted publisher attestation"):
+        generator.generate(41)
+
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["result"] for event in events] == ["success", "failure"]
+    assert events[1]["gate_status"] == "indeterminate"
 
 
-def test_second_automatic_invocation_structurally_skips_evidence_only_head(
-    tmp_path: Path,
-) -> None:
+def test_legitimate_ao_evidence_with_exact_attestation_allows_skip(tmp_path: Path) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    github = github_for(fixture.code_sha)
+    repository = GitRepository(fixture.repository)
+    log_path = tmp_path / "events.jsonl"
+    generator = EvidenceGenerator(
+        repository,
+        github,
+        log_path=log_path,
+        now=lambda: NOW,
+    )
+    snapshot = _snapshot(generator.generate(41))
+    assert snapshot.evidence_commit_sha is not None
+    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
+    github.attestation = _attestation(fixture.code_sha)
+
+    second = generator.generate(41)
+
+    assert isinstance(second, EvidenceSkip)
+    assert second.head_sha == snapshot.evidence_commit_sha
+    assert "fully verified, previously attested AO Evidence" in second.reason
+    assert git(fixture.repository, "rev-parse", "HEAD").stdout.strip() == second.head_sha
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["result"] for event in events] == ["success", "skipped"]
+    assert events[1]["gate_status"] == "already-attested"
+
+
+def test_evidence_only_head_missing_required_file_refuses_skip(tmp_path: Path) -> None:
     fixture = make_diverged_repository(tmp_path)
     github = github_for(fixture.code_sha)
     log_path = tmp_path / "events.jsonl"
@@ -251,27 +289,60 @@ def test_second_automatic_invocation_structurally_skips_evidence_only_head(
         log_path=log_path,
         now=lambda: NOW,
     )
-    _snapshot(generator.generate(41))
-    first_call_count = len(github.calls)
-    git(
-        fixture.repository,
-        "commit",
-        "--amend",
-        "-m",
-        "wording deliberately unrelated to Evidence",
-    )
-    evidence_head = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
+    snapshot = _snapshot(generator.generate(41))
+    assert snapshot.evidence_commit_sha is not None
+    (fixture.repository / "docs/evidence/pr-41/validation.md").unlink()
+    git(fixture.repository, "add", "-A", "docs/evidence/pr-41")
+    git(fixture.repository, "commit", "--amend", "--no-edit")
+    incomplete_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
+    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
+    github.pr = replace(github.pr, head_sha=incomplete_sha)
+    github.attestation = _attestation(fixture.code_sha)
 
-    second = generator.generate(41)
+    with pytest.raises(EvidenceError, match="must change exactly the five files"):
+        generator.generate(41)
 
-    assert isinstance(second, EvidenceSkip)
-    assert second.head_sha == evidence_head
-    assert "only docs/evidence/**" in second.reason
-    assert len(github.calls) == first_call_count
-    assert git(fixture.repository, "rev-parse", "HEAD").stdout.strip() == evidence_head
     events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-    assert [event["result"] for event in events] == ["success", "skipped"]
-    assert events[1]["reason"] == second.reason
+    assert [event["result"] for event in events] == ["success", "failure"]
+    assert events[1]["gate_status"] == "indeterminate"
+
+
+def test_forged_evidence_only_head_refuses_trusted_skip(tmp_path: Path) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    github = github_for(fixture.code_sha)
+    log_path = tmp_path / "events.jsonl"
+    generator = EvidenceGenerator(
+        GitRepository(fixture.repository),
+        github,
+        log_path=log_path,
+        now=lambda: NOW,
+    )
+    snapshot = _snapshot(generator.generate(41))
+    assert snapshot.evidence_commit_sha is not None
+    changed_files = fixture.repository / "docs/evidence/pr-41/changed-files.md"
+    changed_files.write_text(
+        changed_files.read_text(encoding="utf-8").replace(
+            "- `feature.txt`",
+            "- `invented-safe-file.txt`",
+        ),
+        encoding="utf-8",
+    )
+    git(fixture.repository, "add", "docs/evidence/pr-41/changed-files.md")
+    git(fixture.repository, "commit", "--amend", "--no-edit")
+    forged_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
+    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
+    github.pr = replace(github.pr, head_sha=forged_sha)
+    # Give the forged SHA a synthetic valid identity proof so this regression
+    # reaches the independent content-recomputation layer.
+    github.attestation = _attestation(fixture.code_sha)
+
+    with pytest.raises(EvidenceError, match=r"changed-files\.md does not match"):
+        generator.generate(41)
+
+    assert git(fixture.repository, "rev-parse", "HEAD").stdout.strip() == forged_sha
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["result"] for event in events] == ["success", "failure"]
+    assert events[1]["gate_status"] == "indeterminate"
 
 
 def test_regeneration_excludes_previous_evidence_from_patch(tmp_path: Path) -> None:
@@ -395,3 +466,15 @@ def test_binding_parser_requires_all_four_bindings(tmp_path: Path) -> None:
 def _snapshot(result: SnapshotResult | object) -> SnapshotResult:
     assert isinstance(result, SnapshotResult)
     return result
+
+
+def _attestation(code_sha: str) -> EvidenceAttestation:
+    return EvidenceAttestation(
+        context="AO / evidence-snapshot",
+        state="success",
+        creator_id=41898282,
+        creator_login="github-actions[bot]",
+        creator_type="Bot",
+        description=f"Evidence-only child of {code_sha[:12]}; source CI 9001",
+        target_url="https://github.com/example/repository/actions/runs/123",
+    )

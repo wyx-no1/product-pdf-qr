@@ -185,7 +185,11 @@ def test_gh_provider_reads_exact_prior_evidence_attestation_without_network() ->
                 "statuses": [
                     {
                         "context": "AO / evidence-snapshot",
-                        "creator": {"login": "github-actions[bot]"},
+                        "creator": {
+                            "id": 41898282,
+                            "login": "github-actions[bot]",
+                            "type": "Bot",
+                        },
                         "description": "Evidence-only child of aaaaaaaaaaaa; source CI 77",
                         "state": "success",
                         "target_url": "https://github.com/owner/repository/actions/runs/88",
@@ -201,5 +205,7 @@ def test_gh_provider_reads_exact_prior_evidence_attestation_without_network() ->
     ).evidence_attestation(SHA, "AO / evidence-snapshot")
 
     assert attestation.state == "success"
+    assert attestation.creator_id == 41898282
     assert attestation.creator_login == "github-actions[bot]"
+    assert attestation.creator_type == "Bot"
     assert attestation.target_url.endswith("/actions/runs/88")

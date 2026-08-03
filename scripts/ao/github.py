@@ -256,7 +256,17 @@ class GhGitHubData:
         return EvidenceAttestation(
             context=_required_str(status, "context"),
             state=_required_str(status, "state"),
+            creator_id=(
+                _required_int(cast(dict[str, object], creator), "id")
+                if isinstance(creator, dict)
+                else 0
+            ),
             creator_login=creator_login,
+            creator_type=(
+                _required_str(cast(dict[str, object], creator), "type")
+                if isinstance(creator, dict)
+                else ""
+            ),
             description=_required_str(status, "description"),
             target_url=_required_str(status, "target_url"),
         )
