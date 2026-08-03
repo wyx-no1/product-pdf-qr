@@ -62,6 +62,9 @@ def test_snapshot_uses_three_dot_diff_and_contains_exact_files(tmp_path: Path) -
     assert parse_evidence_binding(result.directory / "metadata.md").code_commit_sha == (
         fixture.code_sha
     )
+    assert "| CI definition status | `trusted` |" in metadata
+    assert "| Trusted CI definition hash | `" in metadata
+    assert "| Candidate CI definition hash | `" in metadata
 
     changed = (result.directory / "changed-files.md").read_text(encoding="utf-8")
     assert "`feature.txt`" in changed
@@ -73,6 +76,9 @@ def test_snapshot_uses_three_dot_diff_and_contains_exact_files(tmp_path: Path) -
         {
             "action": "evidence.generate",
             "ci_run_id": 9001,
+            "ci_definition_status": "trusted",
+            "trusted_ci_definition_hash": events[0]["trusted_ci_definition_hash"],
+            "candidate_ci_definition_hash": events[0]["candidate_ci_definition_hash"],
             "code_commit_sha": fixture.code_sha,
             "duration_seconds": events[0]["duration_seconds"],
             "evidence_commit_sha": None,
@@ -84,6 +90,7 @@ def test_snapshot_uses_three_dot_diff_and_contains_exact_files(tmp_path: Path) -
             "started_at": NOW.isoformat(),
         }
     ]
+    assert events[0]["trusted_ci_definition_hash"] == events[0]["candidate_ci_definition_hash"]
 
 
 def test_snapshot_is_a_separate_evidence_only_commit(tmp_path: Path) -> None:
@@ -140,12 +147,40 @@ def test_trusted_gate_verifies_evidence_only_parent_ci_and_patch(tmp_path: Path)
         github,
         41,
         snapshot.evidence_commit_sha,
+        trusted_ci_definition_hash=snapshot.trusted_ci_definition_hash,
     )
 
     assert verified.evidence_commit_sha == snapshot.evidence_commit_sha
     assert verified.code_commit_sha == fixture.code_sha
     assert verified.ci_run_id == github.ci.run_id
     assert verified.ci_url == github.ci.url
+
+
+def test_trusted_gate_refuses_a_hash_not_from_its_fetched_default_branch(
+    tmp_path: Path,
+) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    github = github_for(fixture.code_sha)
+    repository = GitRepository(fixture.repository)
+    snapshot = _snapshot(
+        EvidenceGenerator(
+            repository,
+            github,
+            log_path=tmp_path / "events.jsonl",
+            now=lambda: NOW,
+        ).generate(41)
+    )
+    assert snapshot.evidence_commit_sha is not None
+    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
+
+    with pytest.raises(EvidenceError, match="does not match fetched default branch"):
+        verify_evidence_head(
+            repository,
+            github,
+            41,
+            snapshot.evidence_commit_sha,
+            trusted_ci_definition_hash="0" * 64,
+        )
 
 
 def test_trusted_gate_refuses_tampered_evidence_patch(tmp_path: Path) -> None:
@@ -277,6 +312,44 @@ def test_legitimate_ao_evidence_with_exact_attestation_allows_skip(tmp_path: Pat
     events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert [event["result"] for event in events] == ["success", "skipped"]
     assert events[1]["gate_status"] == "already-attested"
+
+
+def test_changed_ci_definition_blocks_trusted_skip_and_requires_re_review(
+    tmp_path: Path,
+) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    makefile = fixture.repository / "Makefile"
+    makefile.write_text("test-unit:\n\ttrue\n", encoding="utf-8")
+    code_sha = commit_paths(
+        fixture.repository,
+        "ci: weaken test gate",
+        ["Makefile"],
+    )
+    git(fixture.repository, "push", "origin", "feature/evidence")
+    github = github_for(code_sha)
+    log_path = tmp_path / "events.jsonl"
+    generator = EvidenceGenerator(
+        GitRepository(fixture.repository),
+        github,
+        log_path=log_path,
+        now=lambda: NOW,
+    )
+    snapshot = _snapshot(generator.generate(41))
+    assert snapshot.evidence_commit_sha is not None
+    assert snapshot.ci_definition_status == "requires-re-review"
+    metadata = (snapshot.directory / "metadata.md").read_text(encoding="utf-8")
+    assert "| CI definition status | `requires-re-review` |" in metadata
+    assert "**Re-review required:**" in metadata
+    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
+    github.attestation = _attestation(code_sha)
+
+    with pytest.raises(EvidenceError, match="CI definition changed; re-review is required"):
+        generator.generate(41)
+
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert events[0]["gate_status"] == "requires-re-review"
+    assert events[1]["result"] == "failure"
+    assert events[1]["gate_status"] == "indeterminate"
 
 
 def test_evidence_only_head_missing_required_file_refuses_skip(tmp_path: Path) -> None:

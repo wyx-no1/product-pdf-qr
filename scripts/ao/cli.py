@@ -15,7 +15,7 @@ from scripts.ao.evidence import EvidenceGenerator, verify_evidence_head
 from scripts.ao.git import GitRepository
 from scripts.ao.github import GhGitHubData
 from scripts.ao.models import EvidenceSkip
-from scripts.ao.trust import verify_ci_workflow_definition
+from scripts.ao.trust import compare_ci_definition
 from scripts.ao.workspace import (
     WorkspaceResolver,
     detect_stale_worktrees,
@@ -52,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="current workflow run whose required code jobs have completed",
     )
+    evidence.add_argument(
+        "--trusted-ci-definition-hash",
+        help="default-branch CI definition hash computed by the trusted publisher",
+    )
 
     verify_evidence = commands.add_parser(
         "evidence-verify-head",
@@ -60,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     verify_evidence.add_argument("--repo", type=Path, required=True)
     verify_evidence.add_argument("--pr", type=int, required=True)
     verify_evidence.add_argument("--evidence-sha", required=True)
+    verify_evidence.add_argument(
+        "--trusted-ci-definition-hash",
+        help="default-branch CI definition hash computed by the trusted publisher",
+    )
     verify_evidence.add_argument(
         "--require-prior-attestation",
         action="store_true",
@@ -140,7 +148,11 @@ def _evidence(arguments: argparse.Namespace) -> int:
         github,
         log_path=arguments.log,
     )
-    result = generator.generate(arguments.pr, ci_run_id=arguments.ci_run_id)
+    result = generator.generate(
+        arguments.pr,
+        ci_run_id=arguments.ci_run_id,
+        trusted_ci_definition_hash=arguments.trusted_ci_definition_hash,
+    )
     if isinstance(result, EvidenceSkip):
         _print_json(
             {
@@ -153,6 +165,9 @@ def _evidence(arguments: argparse.Namespace) -> int:
     _print_json(
         {
             "ci_run_id": result.ci_run_id,
+            "ci_definition_status": result.ci_definition_status,
+            "trusted_ci_definition_hash": result.trusted_ci_definition_hash,
+            "candidate_ci_definition_hash": result.candidate_ci_definition_hash,
             "code_commit_sha": result.code_commit_sha,
             "directory": str(result.directory),
             "evidence_commit_sha": result.evidence_commit_sha,
@@ -163,7 +178,7 @@ def _evidence(arguments: argparse.Namespace) -> int:
 
 
 def _ci_verify_definition(arguments: argparse.Namespace) -> int:
-    result = verify_ci_workflow_definition(
+    result = compare_ci_definition(
         GitRepository(arguments.trusted_repo),
         GitRepository(arguments.candidate_repo),
         arguments.candidate_sha,
@@ -201,6 +216,7 @@ def _evidence_verify_head(arguments: argparse.Namespace) -> int:
         arguments.pr,
         arguments.evidence_sha,
         require_prior_attestation=arguments.require_prior_attestation,
+        trusted_ci_definition_hash=arguments.trusted_ci_definition_hash,
     )
     _print_json(asdict(result))
     return 0

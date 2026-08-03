@@ -12,6 +12,11 @@ from pathlib import Path
 from scripts.ao.git import GitRepository, append_json_event
 from scripts.ao.github import GitHubData, GitHubError
 from scripts.ao.models import CIRun, EvidenceBinding, EvidenceSkip, PullRequest, ReviewEvidence
+from scripts.ao.trust import (
+    TRUSTED_CI_WORKFLOW_PATH,
+    CIDefinitionComparison,
+    compare_ci_definition,
+)
 
 EVIDENCE_FILES = {
     "metadata.md",
@@ -44,6 +49,9 @@ class SnapshotResult:
     code_commit_sha: str
     ci_run_id: int
     evidence_commit_sha: str | None
+    ci_definition_status: str
+    trusted_ci_definition_hash: str
+    candidate_ci_definition_hash: str
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,9 @@ class VerifiedEvidenceHead:
     ci_run_id: int
     ci_url: str
     prior_attestation: bool
+    ci_definition_status: str
+    trusted_ci_definition_hash: str
+    candidate_ci_definition_hash: str
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,7 @@ class EvidenceGenerator:
         commit: bool = True,
         push: bool | None = None,
         ci_run_id: int | None = None,
+        trusted_ci_definition_hash: str | None = None,
     ) -> SnapshotResult | EvidenceSkip:
         should_push = commit if push is None else push
         if should_push and not commit:
@@ -100,6 +112,7 @@ class EvidenceGenerator:
                     pr_number,
                     evidence_only.head_sha,
                     require_prior_attestation=True,
+                    trusted_ci_definition_hash=trusted_ci_definition_hash,
                 )
                 append_json_event(
                     self.log_path,
@@ -126,13 +139,33 @@ class EvidenceGenerator:
                 pull_request.source_branch,
             )
             self._require_checked_out_code_commit(pull_request)
+            ci_definition = compare_ci_definition(
+                self.repository,
+                self.repository,
+                pull_request.head_sha,
+                TRUSTED_CI_WORKFLOW_PATH,
+                trusted_ref=f"origin/{pull_request.target_branch}",
+            )
+            if (
+                trusted_ci_definition_hash is not None
+                and trusted_ci_definition_hash != ci_definition.trusted_definition_hash
+            ):
+                raise EvidenceError(
+                    "trusted checkout CI definition hash does not match fetched default branch"
+                )
             ci_run = self.github.successful_ci_run(pull_request.head_sha, ci_run_id)
             self._validate_ci_binding(pull_request, ci_run)
             reviews = self.github.review_evidence(
                 pull_request.number,
                 pull_request.review_decision,
             )
-            result = self._write_snapshot(pull_request, ci_run, reviews, started_at)
+            result = self._write_snapshot(
+                pull_request,
+                ci_run,
+                reviews,
+                ci_definition,
+                started_at,
+            )
             evidence_commit = self._commit_snapshot(pull_request) if commit else None
             if should_push:
                 self.repository.git(
@@ -150,7 +183,14 @@ class EvidenceGenerator:
                     "duration_seconds": duration,
                     "evidence_commit_sha": evidence_commit,
                     "finished_at": self.now().isoformat(),
-                    "gate_status": "ready-for-review",
+                    "gate_status": (
+                        "ready-for-review"
+                        if ci_definition.status == "trusted"
+                        else "requires-re-review"
+                    ),
+                    "ci_definition_status": ci_definition.status,
+                    "trusted_ci_definition_hash": ci_definition.trusted_definition_hash,
+                    "candidate_ci_definition_hash": ci_definition.candidate_definition_hash,
                     "pr_number": pull_request.number,
                     "pushed": should_push,
                     "result": "success",
@@ -162,6 +202,9 @@ class EvidenceGenerator:
                 code_commit_sha=pull_request.head_sha,
                 ci_run_id=ci_run.run_id,
                 evidence_commit_sha=evidence_commit,
+                ci_definition_status=ci_definition.status,
+                trusted_ci_definition_hash=ci_definition.trusted_definition_hash,
+                candidate_ci_definition_hash=ci_definition.candidate_definition_hash,
             )
         except BaseException as error:
             duration = round(time.monotonic() - started, 6)
@@ -265,6 +308,7 @@ class EvidenceGenerator:
         pull_request: PullRequest,
         ci_run: CIRun,
         reviews: ReviewEvidence,
+        ci_definition: CIDefinitionComparison,
         created_at: datetime,
     ) -> Path:
         base_ref = f"origin/{pull_request.target_branch}"
@@ -318,6 +362,7 @@ class EvidenceGenerator:
                 additions,
                 deletions,
                 commits,
+                ci_definition,
                 created_at,
             ),
             "changed-files.md": _changed_files_markdown(
@@ -407,6 +452,7 @@ def verify_evidence_head(
     evidence_sha: str,
     *,
     require_prior_attestation: bool = False,
+    trusted_ci_definition_hash: str | None = None,
 ) -> VerifiedEvidenceHead:
     """Prove a head is an Evidence-only child of an exactly bound successful CI run."""
     _require_full_sha(evidence_sha, "Evidence commit SHA")
@@ -523,6 +569,20 @@ def verify_evidence_head(
             f"{merge_base}..{binding.code_commit_sha}",
         ).stdout
     )
+    ci_definition = compare_ci_definition(
+        repository,
+        repository,
+        binding.code_commit_sha,
+        TRUSTED_CI_WORKFLOW_PATH,
+        trusted_ref=base_ref,
+    )
+    if (
+        trusted_ci_definition_hash is not None
+        and trusted_ci_definition_hash != ci_definition.trusted_definition_hash
+    ):
+        raise EvidenceError(
+            "trusted checkout CI definition hash does not match fetched default branch"
+        )
 
     expected_metadata = _metadata_markdown(
         code_pull_request,
@@ -532,6 +592,7 @@ def verify_evidence_head(
         additions,
         deletions,
         commits,
+        ci_definition,
         created_at,
     )
     if metadata_text != expected_metadata:
@@ -598,6 +659,11 @@ def verify_evidence_head(
         )
 
     if require_prior_attestation:
+        if ci_definition.status != "trusted":
+            raise EvidenceError(
+                "Evidence skip path is blocked because the CI definition changed; "
+                "re-review is required"
+            )
         try:
             attestation = github.evidence_attestation(
                 evidence_sha,
@@ -635,6 +701,9 @@ def verify_evidence_head(
         ci_run_id=binding.ci_run_id,
         ci_url=ci_run.url,
         prior_attestation=require_prior_attestation,
+        ci_definition_status=ci_definition.status,
+        trusted_ci_definition_hash=ci_definition.trusted_definition_hash,
+        candidate_ci_definition_hash=ci_definition.candidate_definition_hash,
     )
 
 
@@ -813,6 +882,7 @@ def _metadata_markdown(
     additions: int,
     deletions: int,
     commits: tuple[tuple[str, str], ...],
+    ci_definition: CIDefinitionComparison,
     created_at: datetime,
 ) -> str:
     commit_rows = (
@@ -824,6 +894,13 @@ def _metadata_markdown(
         "`container`\n> jobs succeed. At snapshot time the enclosing workflow is "
         "still active only because\n> this blocking Evidence job is its final job."
         if ci.status == "required-jobs-completed"
+        else ""
+    )
+    definition_note = (
+        "\n> **Re-review required:** repository-controlled CI gate inputs differ from "
+        "the trusted\n> default-branch definition. This Evidence must not receive or "
+        "preserve a trusted\n> green status."
+        if ci_definition.status == "requires-re-review"
         else ""
     )
     return f"""# Evidence Snapshot for PR #{pr.number}
@@ -842,12 +919,16 @@ def _metadata_markdown(
 | CI run ID | `{ci.run_id}` |
 | CI conclusion | `{ci.conclusion}` |
 | CI URL | {ci.url} |
+| CI definition status | `{ci_definition.status}` |
+| Trusted CI definition hash | `{ci_definition.trusted_definition_hash}` |
+| Candidate CI definition hash | `{ci_definition.candidate_definition_hash}` |
 | Created at | `{created_at.isoformat()}` |
 
 > The CI result above belongs to code commit `{pr.head_sha}`, not to the later
 > Evidence commit. The Evidence commit must not be used as a new generation trigger;
 > doing so would create a CI/Evidence loop.
 {ci_timing_note}
+{definition_note}
 
 ## Change overview
 

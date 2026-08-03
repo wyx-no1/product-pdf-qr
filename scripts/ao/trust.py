@@ -1,87 +1,171 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 from scripts.ao.git import GitRepository
 
 TRUSTED_CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 
+# These fixed files are direct gate commands/configuration or auto-discovered
+# configuration that could override the checked-in policy when newly added.
+TRUSTED_CI_EXACT_PATHS = (
+    ".coveragerc",
+    ".dockerignore",
+    ".env.example",
+    ".mypy.ini",
+    ".python-version",
+    ".ruff.toml",
+    "Dockerfile",
+    "Dockerfile.dockerignore",
+    "GNUmakefile",
+    "MANIFEST.in",
+    "Makefile",
+    "alembic.ini",
+    "compose.override.yml",
+    "compose.override.yaml",
+    "compose.yaml",
+    "compose.yml",
+    "conftest.py",
+    "docker-compose.override.yaml",
+    "docker-compose.override.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+    "makefile",
+    "migrations/env.py",
+    "migrations/script.py.mako",
+    "mypy.ini",
+    "pyproject.toml",
+    "pytest.ini",
+    "ruff.toml",
+    "setup.cfg",
+    "setup.py",
+    "sitecustomize.py",
+    "tox.ini",
+    "usercustomize.py",
+    "uv.lock",
+    "uv.toml",
+)
+
+# Every Git entry below these roots is part of the gate implementation. New,
+# removed, renamed, or mode-changed files therefore alter the definition hash.
+TRUSTED_CI_TREE_PATHS = (
+    ".github",
+    "docker",
+    "scripts",
+    "tests",
+)
+
 
 class CIWorkflowTrustError(RuntimeError):
-    """The source CI run did not use the trusted workflow definition."""
+    """The source CI run did not use a comparable trusted workflow definition."""
 
 
 @dataclass(frozen=True)
-class VerifiedCIWorkflow:
-    path: str
-    blob_sha: str
+class CIDefinitionComparison:
+    source_run_path: str
+    trusted_definition_hash: str
+    candidate_definition_hash: str
+    status: str
+    differing_paths: tuple[str, ...]
     trusted_commit_sha: str
     candidate_commit_sha: str
 
 
-@dataclass(frozen=True)
-class _TreeEntry:
-    mode: str
-    object_type: str
-    object_sha: str
-    path: str
-
-
-def verify_ci_workflow_definition(
+def compare_ci_definition(
     trusted_repository: GitRepository,
     candidate_repository: GitRepository,
     candidate_sha: str,
     source_run_path: str,
-) -> VerifiedCIWorkflow:
-    """Require the source run to use the default-branch CI workflow byte-for-byte."""
-    _require_full_sha(candidate_sha)
+    *,
+    trusted_ref: str = "HEAD",
+) -> CIDefinitionComparison:
+    """Compare every repository-controlled CI gate input against a trusted ref."""
+    _require_full_sha(candidate_sha, "candidate CI commit SHA")
     if source_run_path != TRUSTED_CI_WORKFLOW_PATH:
         raise CIWorkflowTrustError(
             f"source CI run path {source_run_path!r} is not trusted {TRUSTED_CI_WORKFLOW_PATH!r}"
         )
 
-    trusted_sha = trusted_repository.git("rev-parse", "HEAD").stdout.strip()
-    _require_full_sha(trusted_sha)
-    trusted_entry = _workflow_tree_entry(trusted_repository, trusted_sha)
-    candidate_entry = _workflow_tree_entry(candidate_repository, candidate_sha)
-    if trusted_entry.mode != "100644" or trusted_entry.object_type != "blob":
-        raise CIWorkflowTrustError(
-            f"trusted {TRUSTED_CI_WORKFLOW_PATH} must be a regular non-executable Git blob"
-        )
-    if candidate_entry != trusted_entry:
-        raise CIWorkflowTrustError(
-            f"candidate {TRUSTED_CI_WORKFLOW_PATH} tree entry differs from the "
-            "trusted default-branch definition; automatic Evidence publication is blocked"
-        )
-    return VerifiedCIWorkflow(
-        path=TRUSTED_CI_WORKFLOW_PATH,
-        blob_sha=trusted_entry.object_sha,
+    trusted_sha = trusted_repository.git("rev-parse", trusted_ref).stdout.strip()
+    _require_full_sha(trusted_sha, "trusted CI commit SHA")
+    trusted_entries = _definition_entries(trusted_repository, trusted_sha)
+    candidate_entries = _definition_entries(candidate_repository, candidate_sha)
+    differing_paths = tuple(
+        path
+        for path in sorted(trusted_entries.keys() | candidate_entries.keys())
+        if trusted_entries.get(path) != candidate_entries.get(path)
+    )
+    trusted_hash = _definition_hash(trusted_entries)
+    candidate_hash = _definition_hash(candidate_entries)
+    status = (
+        "trusted"
+        if not differing_paths and trusted_hash == candidate_hash
+        else "requires-re-review"
+    )
+    return CIDefinitionComparison(
+        source_run_path=source_run_path,
+        trusted_definition_hash=trusted_hash,
+        candidate_definition_hash=candidate_hash,
+        status=status,
+        differing_paths=differing_paths,
         trusted_commit_sha=trusted_sha,
         candidate_commit_sha=candidate_sha,
     )
 
 
-def _workflow_tree_entry(repository: GitRepository, commit_sha: str) -> _TreeEntry:
-    output = repository.git(
-        "ls-tree",
-        commit_sha,
-        "--",
-        TRUSTED_CI_WORKFLOW_PATH,
-    ).stdout.rstrip("\n")
-    metadata, separator, path = output.partition("\t")
-    fields = metadata.split()
-    if not separator or len(fields) != 3 or path != TRUSTED_CI_WORKFLOW_PATH:
+def _definition_entries(repository: GitRepository, commit_sha: str) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    for path in TRUSTED_CI_EXACT_PATHS:
+        entry = _single_tree_entry(repository, commit_sha, path)
+        entries[path] = entry or "missing"
+    for root in TRUSTED_CI_TREE_PATHS:
+        output = repository.git("ls-tree", "-r", commit_sha, "--", root).stdout
+        for line in output.splitlines():
+            path, value = _parse_tree_entry(line)
+            if path in entries:
+                raise CIWorkflowTrustError(f"trusted CI definition path is duplicated: {path}")
+            entries[path] = value
+    return entries
+
+
+def _single_tree_entry(
+    repository: GitRepository,
+    commit_sha: str,
+    path: str,
+) -> str | None:
+    output = repository.git("ls-tree", commit_sha, "--", path).stdout.rstrip("\n")
+    if not output:
+        return None
+    parsed_path, value = _parse_tree_entry(output)
+    if parsed_path != path:
         raise CIWorkflowTrustError(
-            f"commit {commit_sha} lacks a single regular {TRUSTED_CI_WORKFLOW_PATH} entry"
+            f"commit {commit_sha} returned unexpected tree path {parsed_path!r} for {path!r}"
         )
-    return _TreeEntry(
-        mode=fields[0],
-        object_type=fields[1],
-        object_sha=fields[2],
-        path=path,
-    )
+    return value
 
 
-def _require_full_sha(value: str) -> None:
+def _parse_tree_entry(line: str) -> tuple[str, str]:
+    metadata, separator, path = line.partition("\t")
+    fields = metadata.split()
+    if not separator or len(fields) != 3 or not path:
+        raise CIWorkflowTrustError(f"malformed trusted CI Git tree entry: {line!r}")
+    mode, object_type, object_sha = fields
+    if object_type != "blob":
+        raise CIWorkflowTrustError(f"trusted CI definition entry must be a blob: {path}")
+    return path, f"{mode} {object_type} {object_sha}"
+
+
+def _definition_hash(entries: dict[str, str]) -> str:
+    digest = hashlib.sha256()
+    for path, value in sorted(entries.items()):
+        digest.update(path.encode())
+        digest.update(b"\0")
+        digest.update(value.encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _require_full_sha(value: str, label: str) -> None:
     if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
-        raise CIWorkflowTrustError("candidate CI commit SHA must be a full lowercase SHA")
+        raise CIWorkflowTrustError(f"{label} must be a full lowercase SHA")

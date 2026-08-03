@@ -38,6 +38,9 @@ def test_trusted_publisher_never_executes_candidate_code_and_verifies_before_gre
     assert "--candidate-repo ../candidate" in workflow
     assert '--candidate-sha "$CODE_SHA"' in workflow
     assert '--source-run-path "$source_workflow_path"' in workflow
+    assert 'if [[ "$definition_status" != "trusted" ]]; then' in workflow
+    assert "Trusted CI definition changed; re-review required" in workflow
+    assert workflow.count('--trusted-ci-definition-hash "$trusted_definition_hash"') == 3
     assert "python -m scripts.ao evidence \\\n              --repo ../candidate" in workflow
     assert "python -m scripts.ao evidence-verify-head" in workflow
     verification = workflow.index("python -m scripts.ao evidence-verify-head")

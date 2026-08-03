@@ -23,19 +23,45 @@ the write token exists only in the trusted publish step.
 
 Before treating a successful source run as CI evidence, the publisher retrieves the
 run's workflow path from GitHub and requires exactly `.github/workflows/ci.yml`. It
-then compares that file's complete Git tree entry at the candidate code SHA with the
-entry in the checked-out default branch: mode `100644`, object type `blob`, and blob
-SHA must all match. Job names and the run conclusion are considered only after this
-definition check. A PR therefore cannot substitute same-named no-op jobs or add a
-different workflow named `CI`.
+then computes a canonical SHA-256 definition hash from Git tree entries in the
+candidate code SHA and the checked-out default branch. The manifest includes:
+
+- all `.github/**` files, including every third-party `uses:` reference and the
+  privileged publisher itself;
+- `Makefile`, `pyproject.toml`, `uv.lock`, the build/test/link/clean-start scripts,
+  and every `tests/**` and `scripts/**` file;
+- `Dockerfile`, `.dockerignore`, `.env.example`, Compose files, all `docker/**`
+  helpers, `alembic.ini`, and the Alembic environment/template;
+- absent-or-present markers for auto-discovered override files such as
+  `.coveragerc`, `pytest.ini`, `mypy.ini`, `ruff.toml`, `setup.cfg`, `tox.ini`,
+  `uv.toml`, Compose overrides, and Dockerfile-specific ignore files.
+
+Each entry records path, Git mode, object type, and blob SHA; additions, removals,
+renames, permission changes, and content changes all alter the definition hash. The
+fixed files are every direct repository-controlled CI command/configuration input.
+The recursive roots cover executable test, AO, workflow/action, and Docker helper
+code, including newly added files. Product source, migration revisions, and reviewed
+documents remain the subjects being tested rather than the gate definition.
+Generation and both verification paths also require this recomputed default-branch
+hash to equal the hash produced by the separate trusted checkout, preventing a
+candidate-supplied hash or a changing fetch baseline from becoming the trust anchor.
+
+External runner images and upstream implementations behind movable action major
+tags remain platform supply-chain risks. Their reference strings are protected by
+the workflow hash, and image/action pins already present in the repository are
+protected, but this tool does not independently snapshot GitHub-hosted runner images
+or resolve movable tags to immutable commits.
 
 Changes to `.github/workflows/ci.yml` intentionally fail this automatic check. That
-includes legitimate gate maintenance: a maintainer must review it as a trust-root
-change, generate Evidence manually, verify the latest-head checks, and use the
-repository's explicit human bootstrap/branch-protection override process. The
-publisher does not downgrade the mismatch, create a trusted success status, or
-silently adopt the candidate definition. After the reviewed workflow reaches the
-default branch, later PRs are compared against that new trusted blob.
+also applies to every manifest entry above, including legitimate gate maintenance.
+Evidence records the trusted hash, candidate hash, and `requires-re-review` status;
+trusted skip is forbidden. A maintainer must review the trust-root change, verify
+the latest-head checks, and use the repository's explicit human
+bootstrap/branch-protection override process. The publisher does not downgrade the
+mismatch, create a trusted success status, or silently adopt the candidate
+definition. After the reviewed definition reaches the default branch, a restored or
+later matching PR is trusted again. PR #12 itself changes workflow/AO trust-root
+files, so its expected self-assessment is `requires-re-review`; it has no exemption.
 
 The command fetches the PR branches, requires the exact completed three-job CI run,
 writes exactly five files under `docs/evidence/pr-123/`, creates a separate

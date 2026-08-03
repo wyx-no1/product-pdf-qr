@@ -83,16 +83,33 @@ jobs:
           trap record_failure ERR
 
           # workflow_run identifies a GitHub-authenticated run, but the candidate
-          # normally controls its workflow file. Prove both the exact source path
-          # and its Git tree entry match the default-branch trusted definition.
+          # controls repository gate inputs. Compare the complete trusted manifest
+          # (workflow/actions, Make/config/lock, tests, and validation helpers)
+          # against the default-branch checkout before accepting the conclusion.
           source_workflow_path="$(
             gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq .path
           )"
-          python -m scripts.ao ci-verify-definition \
-            --trusted-repo . \
-            --candidate-repo ../candidate \
-            --candidate-sha "$CODE_SHA" \
-            --source-run-path "$source_workflow_path"
+          definition="$(
+            python -m scripts.ao ci-verify-definition \
+              --trusted-repo . \
+              --candidate-repo ../candidate \
+              --candidate-sha "$CODE_SHA" \
+              --source-run-path "$source_workflow_path"
+          )"
+          definition_status="$(
+            python -c 'import json,sys; print(json.load(sys.stdin)["status"])' \
+              <<<"$definition"
+          )"
+          trusted_definition_hash="$(
+            python -c 'import json,sys; print(json.load(sys.stdin)["trusted_definition_hash"])' \
+              <<<"$definition"
+          )"
+          if [[ "$definition_status" != "trusted" ]]; then
+            post_status "$CODE_SHA" failure \
+              "Trusted CI definition changed; re-review required"
+            trap - ERR
+            exit 1
+          fi
 
           gh auth setup-git
           git -C ../candidate config user.name "github-actions[bot]"
@@ -102,7 +119,8 @@ jobs:
             python -m scripts.ao evidence \
               --repo ../candidate \
               --pr "$PR_NUMBER" \
-              --ci-run-id "$RUN_ID"
+              --ci-run-id "$RUN_ID" \
+              --trusted-ci-definition-hash "$trusted_definition_hash"
           )"
           evidence_sha="$(
             python -c 'import json,sys; data=json.load(sys.stdin); print(data.get("evidence_commit_sha") or data.get("head_sha") or "")' \
@@ -123,6 +141,7 @@ jobs:
               --repo ../candidate \
               --pr "$PR_NUMBER" \
               --evidence-sha "$evidence_sha" \
+              --trusted-ci-definition-hash "$trusted_definition_hash" \
               --require-prior-attestation
             trap - ERR
             exit 0
@@ -133,7 +152,8 @@ jobs:
             python -m scripts.ao evidence-verify-head \
               --repo ../candidate \
               --pr "$PR_NUMBER" \
-              --evidence-sha "$evidence_sha"
+              --evidence-sha "$evidence_sha" \
+              --trusted-ci-definition-hash "$trusted_definition_hash"
           )"
           verified_parent="$(
             python -c 'import json,sys; print(json.load(sys.stdin)["code_commit_sha"])' \
