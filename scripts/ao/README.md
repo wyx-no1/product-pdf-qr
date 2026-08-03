@@ -54,6 +54,14 @@ override is therefore marked `requires-re-review` even though the pinned command
 make it ineffective. Because this scan is basename-based over the complete candidate
 commit, a matching file added under any future directory is covered automatically.
 
+The same full-tree pass treats Python startup hooks as gate inputs. `uv sync`
+installs the project editably, so an otherwise ordinary `src/sitecustomize.py` can
+execute before pytest or mypy starts. Every `sitecustomize` and `usercustomize`
+module form is hashed: the `.py` basenames, extension/bytecode-style basenames, and
+all files below same-named package directories. This is path-wide rather than limited
+to today's `src/` layout; if the hashed project configuration later changes the
+editable source root, the hook scan still covers the new directory.
+
 The other CI tools do not leave the same unbounded closest-config path:
 
 - pytest is invoked from the repository root, whose hashed `pyproject.toml` fixes

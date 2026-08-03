@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ from scripts.ao.git import GitRepository
 from scripts.ao.trust import (
     TRUSTED_CI_EXACT_PATHS,
     TRUSTED_CI_RECURSIVE_FILE_NAMES,
+    TRUSTED_CI_RECURSIVE_MODULE_NAMES,
     TRUSTED_CI_TREE_PATHS,
     TRUSTED_CI_WORKFLOW_PATH,
     CIDefinitionComparison,
@@ -236,6 +238,65 @@ def test_modified_root_ruff_configuration_requires_re_review(tmp_path: Path) -> 
     assert comparison.differing_paths == ("pyproject.toml",)
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/sitecustomize.py",
+        "src/usercustomize.py",
+        "src/sitecustomize/__init__.py",
+        "future/python-path/usercustomize/helper.py",
+    ],
+)
+def test_python_startup_hook_anywhere_requires_re_review(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    trusted, candidate = _repositories(tmp_path)
+    hook = candidate / path
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("import os\n\nos._exit(0)\n", encoding="utf-8")
+    candidate_sha = commit_paths(
+        candidate,
+        "ci: add Python startup hook",
+        [path],
+    )
+
+    comparison = _compare(trusted, candidate, candidate_sha)
+
+    assert comparison.status == "requires-re-review"
+    assert comparison.differing_paths == (path,)
+
+
+def test_editable_sitecustomize_attack_exits_before_gate_command(
+    tmp_path: Path,
+) -> None:
+    trusted, candidate = _repositories(tmp_path)
+    hook = candidate / "src/sitecustomize.py"
+    hook.parent.mkdir(parents=True)
+    hook.write_text(
+        "import os\n\nos._exit(0)\n",
+        encoding="utf-8",
+    )
+    candidate_sha = commit_paths(
+        candidate,
+        "ci: bypass Python gate startup",
+        ["src/sitecustomize.py"],
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(candidate / "src")
+
+    bypassed = subprocess.run(
+        [sys.executable, "-c", "raise SystemExit(23)"],
+        env=environment,
+        check=False,
+    )
+    comparison = _compare(trusted, candidate, candidate_sha)
+
+    assert bypassed.returncode == 0
+    assert comparison.status == "requires-re-review"
+    assert comparison.differing_paths == ("src/sitecustomize.py",)
+
+
 def test_differently_named_candidate_workflow_cannot_spoof_ci_run(tmp_path: Path) -> None:
     trusted, candidate = _repositories(tmp_path)
     candidate_sha = git(candidate, "rev-parse", "HEAD").stdout.strip()
@@ -276,6 +337,12 @@ def test_manifest_covers_direct_commands_configs_and_recursive_gate_code() -> No
         ".ruff.toml",
         "pyproject.toml",
         "ruff.toml",
+        "sitecustomize.py",
+        "usercustomize.py",
+    }
+    assert TRUSTED_CI_RECURSIVE_MODULE_NAMES == {
+        "sitecustomize",
+        "usercustomize",
     }
     makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
     assert "mypy --config-file pyproject.toml" in makefile

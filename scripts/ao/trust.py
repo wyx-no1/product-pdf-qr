@@ -71,6 +71,18 @@ TRUSTED_CI_RECURSIVE_FILE_NAMES = frozenset(
         ".ruff.toml",
         "pyproject.toml",
         "ruff.toml",
+        "sitecustomize.py",
+        "usercustomize.py",
+    }
+)
+
+# Python imports these optional modules during site initialization. Hash every
+# importable file form and every file below a same-named package anywhere in the
+# Git tree; the editable source root is itself controlled by hashed pyproject.toml.
+TRUSTED_CI_RECURSIVE_MODULE_NAMES = frozenset(
+    {
+        "sitecustomize",
+        "usercustomize",
     }
 )
 
@@ -140,7 +152,7 @@ def _definition_entries(repository: GitRepository, commit_sha: str) -> dict[str,
     all_files = repository.git("ls-tree", "-r", commit_sha, "--", ".").stdout
     for line in all_files.splitlines():
         path, value = _parse_tree_entry(line)
-        if PurePosixPath(path).name in TRUSTED_CI_RECURSIVE_FILE_NAMES:
+        if _is_recursive_trust_path(path):
             _record_entry(entries, path, value)
     for root in TRUSTED_CI_TREE_PATHS:
         output = repository.git("ls-tree", "-r", commit_sha, "--", root).stdout
@@ -148,6 +160,18 @@ def _definition_entries(repository: GitRepository, commit_sha: str) -> dict[str,
             path, value = _parse_tree_entry(line)
             _record_entry(entries, path, value)
     return entries
+
+
+def _is_recursive_trust_path(path: str) -> bool:
+    parsed = PurePosixPath(path)
+    file_name = parsed.name
+    if file_name in TRUSTED_CI_RECURSIVE_FILE_NAMES:
+        return True
+    if any(
+        file_name.startswith(f"{module_name}.") for module_name in TRUSTED_CI_RECURSIVE_MODULE_NAMES
+    ):
+        return True
+    return any(part in TRUSTED_CI_RECURSIVE_MODULE_NAMES for part in parsed.parts[:-1])
 
 
 def _record_entry(entries: dict[str, str], path: str, value: str) -> None:
