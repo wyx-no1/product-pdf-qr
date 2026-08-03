@@ -31,10 +31,10 @@ index 9f2358e..a881d01 100644
        - name: Verify repeated clean-volume startup ordering
 diff --git a/.github/workflows/evidence-publish.yml b/.github/workflows/evidence-publish.yml
 new file mode 100644
-index 0000000..7d6cacf
+index 0000000..d457042
 --- /dev/null
 +++ b/.github/workflows/evidence-publish.yml
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,140 @@
 +name: Evidence Publish
 +
 +on:
@@ -119,7 +119,6 @@ index 0000000..7d6cacf
 +          }
 +          trap record_failure ERR
 +
-+          post_status "$CODE_SHA" pending "Publishing Evidence from successful source CI $RUN_ID"
 +          gh auth setup-git
 +          git -C ../candidate config user.name "github-actions[bot]"
 +          git -C ../candidate config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -134,7 +133,25 @@ index 0000000..7d6cacf
 +            python -c 'import json,sys; data=json.load(sys.stdin); print(data.get("evidence_commit_sha") or data.get("head_sha") or "")' \
 +              <<<"$result"
 +          )"
++          generation_result="$(
++            python -c 'import json,sys; print(json.load(sys.stdin)["result"])' \
++              <<<"$result"
++          )"
 +          test -n "$evidence_sha"
++
++          if [[ "$generation_result" == "skipped" ]]; then
++            # A skip may preserve an existing trusted green status, but it may
++            # never mint one. An author-supplied Evidence-only SHA has no prior
++            # bot-owned attestation and fails closed here.
++            python -m scripts.ao evidence-verify-head \
++              --repo ../candidate \
++              --pr "$PR_NUMBER" \
++              --evidence-sha "$evidence_sha" \
++              --require-prior-attestation
++            trap - ERR
++            exit 0
++          fi
++          test "$generation_result" = "success"
 +
 +          verification="$(
 +            python -m scripts.ao evidence-verify-head \
@@ -151,8 +168,8 @@ index 0000000..7d6cacf
 +              <<<"$verification"
 +          )"
 +
-+          # Never copy a parent result blindly. The trusted verifier above proves
-+          # the child is Evidence-only and bound to this successful parent run.
++          # Only the same trusted invocation that generated all five files may
++          # mint the first green attestation for this immutable Evidence SHA.
 +          post_status "$evidence_sha" success \
 +            "Evidence-only child of ${verified_parent:0:12}; source CI $verified_run"
 +          post_status "$CODE_SHA" success \
@@ -167,10 +184,10 @@ index 0000000..2bd3938
 +"""Repository automation scripts."""
 diff --git a/scripts/ao/README.md b/scripts/ao/README.md
 new file mode 100644
-index 0000000..797ca85
+index 0000000..ffea843
 --- /dev/null
 +++ b/scripts/ao/README.md
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,104 @@
 +# AO Evidence and Advisor workspace tools
 +
 +These repository-local Python 3.12 tools implement the two parts of AO P0-1. They
@@ -209,7 +226,11 @@ index 0000000..797ca85
 +A `GITHUB_TOKEN` PR update may create an approval-required, zero-job run. That record
 +is neither success nor test failure and remains indeterminate. The independent
 +content-based skip keeps the publisher finite if that run is approved or the
-+credential later changes to a PAT or deploy key.
++credential later changes to a PAT or deploy key. A skipped head can only preserve a
++pre-existing successful `AO / evidence-snapshot` status created by
++`github-actions[bot]` with the exact parent SHA, source CI, and workflow-run target.
++It can never mint the first green status. Therefore an author-supplied or tampered
++Evidence-only commit fails closed even when its path shape and patch look valid.
 +
 +Generation uses `origin/<base>...<code-sha>` and excludes all of
 +`docs/evidence/**`. Failure exits nonzero, records an `indeterminate` gate event in
@@ -289,10 +310,10 @@ index 0000000..4443fdd
 +raise SystemExit(main())
 diff --git a/scripts/ao/cli.py b/scripts/ao/cli.py
 new file mode 100644
-index 0000000..34fde5a
+index 0000000..75db7f4
 --- /dev/null
 +++ b/scripts/ao/cli.py
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,267 @@
 +from __future__ import annotations
 +
 +import argparse
@@ -345,6 +366,11 @@ index 0000000..34fde5a
 +    verify_evidence.add_argument("--repo", type=Path, required=True)
 +    verify_evidence.add_argument("--pr", type=int, required=True)
 +    verify_evidence.add_argument("--evidence-sha", required=True)
++    verify_evidence.add_argument(
++        "--require-prior-attestation",
++        action="store_true",
++        help="allow a skipped Evidence head only when the trusted publisher attested it earlier",
++    )
 +
 +    advisor = commands.add_parser("advisor-run", help="run Advisor in a bound worktree")
 +    advisor.add_argument("--repo", type=Path, required=True)
@@ -467,6 +493,7 @@ index 0000000..34fde5a
 +        github,
 +        arguments.pr,
 +        arguments.evidence_sha,
++        require_prior_attestation=arguments.require_prior_attestation,
 +    )
 +    _print_json(asdict(result))
 +    return 0
@@ -556,10 +583,10 @@ index 0000000..34fde5a
 +            signal.signal(signum, handler)
 diff --git a/scripts/ao/evidence.py b/scripts/ao/evidence.py
 new file mode 100644
-index 0000000..eadfe89
+index 0000000..fc6a718
 --- /dev/null
 +++ b/scripts/ao/evidence.py
-@@ -0,0 +1,830 @@
+@@ -0,0 +1,861 @@
 +from __future__ import annotations
 +
 +import re
@@ -572,7 +599,7 @@ index 0000000..eadfe89
 +from pathlib import Path
 +
 +from scripts.ao.git import GitRepository, append_json_event
-+from scripts.ao.github import GitHubData
++from scripts.ao.github import GitHubData, GitHubError
 +from scripts.ao.models import CIRun, EvidenceBinding, EvidenceSkip, PullRequest, ReviewEvidence
 +
 +EVIDENCE_FILES = {
@@ -583,6 +610,7 @@ index 0000000..eadfe89
 +    "advisor-context.md",
 +}
 +EVIDENCE_EXCLUSION = ":(exclude)docs/evidence/**"
++EVIDENCE_STATUS_CONTEXT = "AO / evidence-snapshot"
 +PROTECTED_PATHS = (
 +    "migrations/",
 +    "docs/requirements-v1.md",
@@ -613,6 +641,7 @@ index 0000000..eadfe89
 +    code_commit_sha: str
 +    ci_run_id: int
 +    ci_url: str
++    prior_attestation: bool
 +
 +
 +@dataclass(frozen=True)
@@ -953,6 +982,8 @@ index 0000000..eadfe89
 +    github: GitHubData,
 +    pr_number: int,
 +    evidence_sha: str,
++    *,
++    require_prior_attestation: bool = False,
 +) -> VerifiedEvidenceHead:
 +    """Prove a head is an Evidence-only child of an exactly bound successful CI run."""
 +    _require_full_sha(evidence_sha, "Evidence commit SHA")
@@ -1042,11 +1073,38 @@ index 0000000..eadfe89
 +    if actual_patch != expected_patch:
 +        raise EvidenceError("Evidence diff.patch does not match the bound three-dot code diff")
 +
++    if require_prior_attestation:
++        try:
++            attestation = github.evidence_attestation(
++                evidence_sha,
++                EVIDENCE_STATUS_CONTEXT,
++            )
++        except GitHubError as error:
++            raise EvidenceError(
++                "Evidence skip path lacks a prior trusted publisher attestation"
++            ) from error
++        expected_description = (
++            f"Evidence-only child of {binding.code_commit_sha[:12]}; source CI {binding.ci_run_id}"
++        )
++        expected_target_prefix = f"https://github.com/{pull_request.repository}/actions/runs/"
++        if (
++            attestation.context != EVIDENCE_STATUS_CONTEXT
++            or attestation.state != "success"
++            or attestation.creator_login != "github-actions[bot]"
++            or attestation.description != expected_description
++            or not attestation.target_url.startswith(expected_target_prefix)
++        ):
++            raise EvidenceError(
++                "Evidence skip path attestation does not match its parent, CI, "
++                "publisher identity, and workflow provenance"
++            )
++
 +    return VerifiedEvidenceHead(
 +        evidence_commit_sha=evidence_sha,
 +        code_commit_sha=binding.code_commit_sha,
 +        ci_run_id=binding.ci_run_id,
 +        ci_url=ci_run.url,
++        prior_attestation=require_prior_attestation,
 +    )
 +
 +
@@ -1489,17 +1547,23 @@ index 0000000..d9f96c6
 +        stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 diff --git a/scripts/ao/github.py b/scripts/ao/github.py
 new file mode 100644
-index 0000000..d41155e
+index 0000000..6ed6352
 --- /dev/null
 +++ b/scripts/ao/github.py
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,283 @@
 +from __future__ import annotations
 +
 +import json
 +from typing import Protocol, cast
 +
 +from scripts.ao.git import CommandRunner
-+from scripts.ao.models import CIJob, CIRun, PullRequest, ReviewEvidence
++from scripts.ao.models import (
++    CIJob,
++    CIRun,
++    EvidenceAttestation,
++    PullRequest,
++    ReviewEvidence,
++)
 +
 +REQUIRED_CI_JOBS = {"quality", "database", "container"}
 +
@@ -1514,6 +1578,12 @@ index 0000000..d41155e
 +    ) -> CIRun: ...
 +
 +    def review_evidence(self, number: int, decision: str) -> ReviewEvidence: ...
++
++    def evidence_attestation(
++        self,
++        commit_sha: str,
++        context: str,
++    ) -> EvidenceAttestation: ...
 +
 +
 +class GitHubError(RuntimeError):
@@ -1710,6 +1780,40 @@ index 0000000..d41155e
 +            review_urls=tuple(url for item in reviews if (url := str(item.get("html_url") or ""))),
 +        )
 +
++    def evidence_attestation(
++        self,
++        commit_sha: str,
++        context: str,
++    ) -> EvidenceAttestation:
++        raw = self._json(
++            "api",
++            f"repos/{self.repository}/commits/{commit_sha}/status",
++        )
++        data = cast(dict[str, object], raw)
++        statuses_value = data.get("statuses")
++        if not isinstance(statuses_value, list):
++            raise GitHubError(f"commit {commit_sha} did not return status records")
++        statuses = cast(list[dict[str, object]], statuses_value)
++        status = next(
++            (item for item in statuses if item.get("context") == context),
++            None,
++        )
++        if status is None:
++            raise GitHubError(f"commit {commit_sha} has no prior trusted {context} attestation")
++        creator = status.get("creator")
++        creator_login = (
++            str(cast(dict[str, object], creator).get("login") or "")
++            if isinstance(creator, dict)
++            else ""
++        )
++        return EvidenceAttestation(
++            context=_required_str(status, "context"),
++            state=_required_str(status, "state"),
++            creator_login=creator_login,
++            description=_required_str(status, "description"),
++            target_url=_required_str(status, "target_url"),
++        )
++
 +
 +def _required_str(data: dict[str, object], key: str) -> str:
 +    value = data.get(key)
@@ -1732,10 +1836,10 @@ index 0000000..d41155e
 +    return value
 diff --git a/scripts/ao/models.py b/scripts/ao/models.py
 new file mode 100644
-index 0000000..15f8ea4
+index 0000000..6fb177a
 --- /dev/null
 +++ b/scripts/ao/models.py
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,64 @@
 +from __future__ import annotations
 +
 +from dataclasses import dataclass
@@ -1791,6 +1895,15 @@ index 0000000..15f8ea4
 +class EvidenceSkip:
 +    head_sha: str
 +    reason: str
++
++
++@dataclass(frozen=True)
++class EvidenceAttestation:
++    context: str
++    state: str
++    creator_login: str
++    description: str
++    target_url: str
 diff --git a/scripts/ao/workspace.py b/scripts/ao/workspace.py
 new file mode 100644
 index 0000000..f581512
@@ -2508,10 +2621,10 @@ index 0000000..0c46cfe
 +"""Tests for repository-local AO tooling."""
 diff --git a/tests/ao/helpers.py b/tests/ao/helpers.py
 new file mode 100644
-index 0000000..7c802a1
+index 0000000..80e4ee9
 --- /dev/null
 +++ b/tests/ao/helpers.py
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,161 @@
 +from __future__ import annotations
 +
 +import subprocess
@@ -2519,7 +2632,14 @@ index 0000000..7c802a1
 +from dataclasses import dataclass
 +from pathlib import Path
 +
-+from scripts.ao.models import CIJob, CIRun, PullRequest, ReviewEvidence
++from scripts.ao.github import GitHubError
++from scripts.ao.models import (
++    CIJob,
++    CIRun,
++    EvidenceAttestation,
++    PullRequest,
++    ReviewEvidence,
++)
 +
 +
 +def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -2575,10 +2695,12 @@ index 0000000..7c802a1
 +        pull_request: PullRequest,
 +        ci_run: CIRun,
 +        reviews: ReviewEvidence | None = None,
++        attestation: EvidenceAttestation | None = None,
 +    ) -> None:
 +        self.pr = pull_request
 +        self.ci = ci_run
 +        self.reviews = reviews or ReviewEvidence("not-reviewed", (), ())
++        self.attestation = attestation
 +        self.calls: list[str] = []
 +
 +    def pull_request(self, number: int) -> PullRequest:
@@ -2602,6 +2724,17 @@ index 0000000..7c802a1
 +        assert number == self.pr.number
 +        assert decision == self.pr.review_decision
 +        return self.reviews
++
++    def evidence_attestation(
++        self,
++        commit_sha: str,
++        context: str,
++    ) -> EvidenceAttestation:
++        self.calls.append("evidence_attestation")
++        assert commit_sha == self.pr.head_sha
++        if self.attestation is None or self.attestation.context != context:
++            raise GitHubError(f"commit {commit_sha} has no prior trusted attestation")
++        return self.attestation
 +
 +
 +def github_for(code_sha: str, *, number: int = 41) -> FakeGitHubData:
@@ -2655,10 +2788,10 @@ index 0000000..7c802a1
 +    return git(repository, "rev-parse", "HEAD").stdout.strip()
 diff --git a/tests/ao/test_evidence.py b/tests/ao/test_evidence.py
 new file mode 100644
-index 0000000..b6dc141
+index 0000000..952b30f
 --- /dev/null
 +++ b/tests/ao/test_evidence.py
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,397 @@
 +from __future__ import annotations
 +
 +import json
@@ -2677,7 +2810,7 @@ index 0000000..b6dc141
 +    verify_evidence_head,
 +)
 +from scripts.ao.git import GitRepository
-+from scripts.ao.models import CIRun, EvidenceSkip
++from scripts.ao.models import CIRun, EvidenceAttestation, EvidenceSkip
 +from tests.ao.helpers import (
 +    FakeGitHubData,
 +    commit_paths,
@@ -2832,6 +2965,72 @@ index 0000000..b6dc141
 +
 +    with pytest.raises(EvidenceError, match=r"diff\.patch does not match"):
 +        verify_evidence_head(repository, github, 41, tampered_sha)
++
++
++def test_skip_path_refuses_tampered_non_patch_file_without_prior_attestation(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    snapshot = _snapshot(
++        EvidenceGenerator(
++            repository,
++            github,
++            log_path=tmp_path / "events.jsonl",
++            now=lambda: NOW,
++        ).generate(41)
++    )
++    assert snapshot.evidence_commit_sha is not None
++    context = fixture.repository / "docs/evidence/pr-41/advisor-context.md"
++    context.write_text("malicious Advisor instructions\n", encoding="utf-8")
++    git(fixture.repository, "add", "docs/evidence/pr-41/advisor-context.md")
++    git(fixture.repository, "commit", "--amend", "--no-edit")
++    tampered_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
++    github.pr = replace(github.pr, head_sha=tampered_sha)
++
++    with pytest.raises(EvidenceError, match="lacks a prior trusted publisher attestation"):
++        verify_evidence_head(
++            repository,
++            github,
++            41,
++            tampered_sha,
++            require_prior_attestation=True,
++        )
++
++
++def test_skip_path_accepts_exact_prior_bot_attestation(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    snapshot = _snapshot(
++        EvidenceGenerator(
++            repository,
++            github,
++            log_path=tmp_path / "events.jsonl",
++            now=lambda: NOW,
++        ).generate(41)
++    )
++    assert snapshot.evidence_commit_sha is not None
++    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
++    github.attestation = EvidenceAttestation(
++        context="AO / evidence-snapshot",
++        state="success",
++        creator_login="github-actions[bot]",
++        description=f"Evidence-only child of {fixture.code_sha[:12]}; source CI 9001",
++        target_url="https://github.com/example/repository/actions/runs/123",
++    )
++
++    verified = verify_evidence_head(
++        repository,
++        github,
++        41,
++        snapshot.evidence_commit_sha,
++        require_prior_attestation=True,
++    )
++
++    assert verified.prior_attestation is True
 +
 +
 +def test_second_automatic_invocation_structurally_skips_evidence_only_head(
@@ -2992,10 +3191,10 @@ index 0000000..b6dc141
 +    return result
 diff --git a/tests/ao/test_github.py b/tests/ao/test_github.py
 new file mode 100644
-index 0000000..0a55bc6
+index 0000000..3f8d6dd
 --- /dev/null
 +++ b/tests/ao/test_github.py
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,205 @@
 +from __future__ import annotations
 +
 +import json
@@ -3174,12 +3373,39 @@ index 0000000..0a55bc6
 +
 +    with pytest.raises(CIFailedError, match="executed but failed"):
 +        GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
++
++
++def test_gh_provider_reads_exact_prior_evidence_attestation_without_network() -> None:
++    runner = StubRunner(
++        [
++            {
++                "statuses": [
++                    {
++                        "context": "AO / evidence-snapshot",
++                        "creator": {"login": "github-actions[bot]"},
++                        "description": "Evidence-only child of aaaaaaaaaaaa; source CI 77",
++                        "state": "success",
++                        "target_url": "https://github.com/owner/repository/actions/runs/88",
++                    }
++                ]
++            }
++        ]
++    )
++
++    attestation = GhGitHubData(
++        "owner/repository",
++        runner=runner,
++    ).evidence_attestation(SHA, "AO / evidence-snapshot")
++
++    assert attestation.state == "success"
++    assert attestation.creator_login == "github-actions[bot]"
++    assert attestation.target_url.endswith("/actions/runs/88")
 diff --git a/tests/ao/test_workflow.py b/tests/ao/test_workflow.py
 new file mode 100644
-index 0000000..3a8f6b6
+index 0000000..558c74d
 --- /dev/null
 +++ b/tests/ao/test_workflow.py
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,43 @@
 +from __future__ import annotations
 +
 +from pathlib import Path
@@ -3216,6 +3442,11 @@ index 0000000..3a8f6b6
 +    verification = workflow.index("python -m scripts.ao evidence-verify-head")
 +    green_status = workflow.index('post_status "$evidence_sha" success')
 +    assert verification < green_status
++    assert 'if [[ "$generation_result" == "skipped" ]]; then' in workflow
++    assert "--require-prior-attestation" in workflow
++    skip_branch = workflow.index('if [[ "$generation_result" == "skipped" ]]; then')
++    skip_exit = workflow.index("exit 0", skip_branch)
++    assert 'post_status "$evidence_sha" success' not in workflow[skip_branch:skip_exit]
 +    assert "github.head_ref" not in workflow
 +    assert "continue-on-error" not in workflow
 diff --git a/tests/ao/test_workspace.py b/tests/ao/test_workspace.py

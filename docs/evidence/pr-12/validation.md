@@ -1,6 +1,6 @@
 # Validation record for PR #12
 
-Created at: `2026-08-03T07:03:44.474517+00:00`
+Created at: `2026-08-03T07:37:58.524521+00:00`
 
 This file records evidence locations and results, not an evaluation of their
 correctness. When a record disagrees with its original source, the original source
@@ -10,14 +10,14 @@ is authoritative.
 
 | Field | Value |
 |---|---|
-| Run ID | `30792140720` |
-| Code commit | `80157fb3ae1e3a955eb0da29557dad80e57bc437` |
+| Run ID | `30794231743` |
+| Code commit | `1873316ff372fc5ab7c4a1adb9131fc966b21cae` |
 | Status | `completed` |
 | Conclusion | `success` |
-| URL | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30792140720 |
+| URL | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30794231743 |
 | Merge base | `af82f581c83bd023b4d17ccc4231a2802acf6f2c` |
 
-> This CI result applies to code commit `80157fb3ae1e3a955eb0da29557dad80e57bc437`, not to the Evidence commit
+> This CI result applies to code commit `1873316ff372fc5ab7c4a1adb9131fc966b21cae`, not to the Evidence commit
 > that contains this directory. Do not regenerate Evidence to describe its own
 > commit. A later code change requires a new successful CI run and a regenerated
 > snapshot.
@@ -25,24 +25,24 @@ is authoritative.
 
 | Job | Conclusion | URL |
 |---|---|---|
-| database | `success` | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30792140720/job/91617738517 |
-| container | `success` | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30792140720/job/91617738585 |
-| quality | `success` | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30792140720/job/91617738621 |
+| quality | `success` | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30794231743/job/91624078707 |
+| container | `success` | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30794231743/job/91624078733 |
+| database | `success` | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30794231743/job/91624078781 |
 
 CI retrieval:
 
 ```bash
-gh run view 30792140720 --json jobs
-gh run view 30792140720 --log
-gh run download 30792140720 --name quality-reports
-gh run download 30792140720 --name database-reports
-gh run download 30792140720 --name clean-start-evidence
+gh run view 30794231743 --json jobs
+gh run view 30794231743 --log
+gh run download 30794231743 --name quality-reports
+gh run download 30794231743 --name database-reports
+gh run download 30794231743 --name clean-start-evidence
 ```
 
 ## Test evidence
 
 Test result locations are the `quality-reports` and `database-reports` artifacts
-from run `30792140720`. Reproduce the repository checks with:
+from run `30794231743`. Reproduce the repository checks with:
 
 ```bash
 make build-reproducible
@@ -67,6 +67,10 @@ Line-level comment URLs:
 - https://github.com/wyx-no1/product-pdf-qr/pull/12#discussion_r3701861914
 - https://github.com/wyx-no1/product-pdf-qr/pull/12#discussion_r3701861918
 - https://github.com/wyx-no1/product-pdf-qr/pull/12#discussion_r3701861922
+- https://github.com/wyx-no1/product-pdf-qr/pull/12#discussion_r3701953765
+- https://github.com/wyx-no1/product-pdf-qr/pull/12#discussion_r3701953979
+- https://github.com/wyx-no1/product-pdf-qr/pull/12#discussion_r3701954184
+- https://github.com/wyx-no1/product-pdf-qr/pull/12#discussion_r3702060367
 
 Review record URLs:
 
@@ -75,6 +79,10 @@ Review record URLs:
 - https://github.com/wyx-no1/product-pdf-qr/pull/12#pullrequestreview-4841386044
 - https://github.com/wyx-no1/product-pdf-qr/pull/12#pullrequestreview-4841386413
 - https://github.com/wyx-no1/product-pdf-qr/pull/12#pullrequestreview-4841458182
+- https://github.com/wyx-no1/product-pdf-qr/pull/12#pullrequestreview-4841573341
+- https://github.com/wyx-no1/product-pdf-qr/pull/12#pullrequestreview-4841573639
+- https://github.com/wyx-no1/product-pdf-qr/pull/12#pullrequestreview-4841573924
+- https://github.com/wyx-no1/product-pdf-qr/pull/12#pullrequestreview-4841706063
 
 Independent retrieval:
 
