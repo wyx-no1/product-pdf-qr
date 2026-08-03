@@ -33,8 +33,8 @@ candidate code SHA and the checked-out default branch. The manifest includes:
 - `Dockerfile`, `.dockerignore`, `.env.example`, Compose files, all `docker/**`
   helpers, `alembic.ini`, and the Alembic environment/template;
 - absent-or-present markers for auto-discovered override files such as
-  `.coveragerc`, `pytest.ini`, `mypy.ini`, `ruff.toml`, `setup.cfg`, `tox.ini`,
-  `uv.toml`, Compose overrides, and Dockerfile-specific ignore files.
+  `.coveragerc`, `pytest.ini`, `mypy.ini`, `setup.cfg`, `tox.ini`, `uv.toml`,
+  Compose overrides, and Dockerfile-specific ignore files.
 
 Each entry records path, Git mode, object type, and blob SHA; additions, removals,
 renames, permission changes, and content changes all alter the definition hash. The
@@ -42,6 +42,11 @@ fixed files are every direct repository-controlled CI command/configuration inpu
 The recursive roots cover executable test, AO, workflow/action, and Docker helper
 code, including newly added files. Product source, migration revisions, and reviewed
 documents remain the subjects being tested rather than the gate definition.
+Both CI Ruff invocations pass `--config pyproject.toml`, which makes that hashed root
+file the configuration for every analyzed path and disables Ruff's otherwise
+hierarchical closest-config discovery. A candidate `src/ruff.toml`,
+`migrations/.ruff.toml`, or nested `pyproject.toml` therefore cannot weaken lint or
+format without first changing the hashed Makefile command.
 Generation and both verification paths also require this recomputed default-branch
 hash to equal the hash produced by the separate trusted checkout, preventing a
 candidate-supplied hash or a changing fetch baseline from becoming the trust anchor.

@@ -19,12 +19,13 @@ typecheck:
 
 lint:
 	mkdir -p reports
-	$(UV) run ruff check --output-format junit --output-file reports/ruff.xml .
-	$(UV) run ruff format --check .
+	$(UV) run ruff check --config pyproject.toml \
+		--output-format junit --output-file reports/ruff.xml .
+	$(UV) run ruff format --config pyproject.toml --check .
 
 format:
-	$(UV) run ruff check --fix .
-	$(UV) run ruff format .
+	$(UV) run ruff check --config pyproject.toml --fix .
+	$(UV) run ruff format --config pyproject.toml .
 
 test:
 	mkdir -p reports

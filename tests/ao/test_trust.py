@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -41,6 +43,7 @@ NO_OP_CI = (
     )
     .replace("docker compose build", "true")
 )
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_matching_gate_definition_is_trusted(tmp_path: Path) -> None:
@@ -114,6 +117,66 @@ def test_new_auto_discovered_gate_config_requires_re_review(tmp_path: Path) -> N
     assert comparison.differing_paths == (".coveragerc",)
 
 
+def test_nested_ruff_config_cannot_weaken_pinned_root_config(tmp_path: Path) -> None:
+    trusted, candidate = _repositories(tmp_path)
+    nested_config = candidate / "src/ruff.toml"
+    nested_config.parent.mkdir(parents=True)
+    nested_config.write_text(
+        '[lint]\nignore = ["F401"]\n[format]\nquote-style = "single"\n',
+        encoding="utf-8",
+    )
+    bad_source = candidate / "src/bad.py"
+    bad_source.write_text("import os\n\nvalue = 'nested single'\n", encoding="utf-8")
+    candidate_sha = commit_paths(
+        candidate,
+        "test: simulate nested Ruff bypass",
+        ["src/ruff.toml", "src/bad.py"],
+    )
+
+    # Product source remains the subject of the gate, not part of its definition.
+    # Safety comes from the hashed Makefile pin, not from broad-hashing src/**.
+    assert _compare(trusted, candidate, candidate_sha).status == "trusted"
+    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
+    assert makefile.count("ruff check --config pyproject.toml") == 2
+    assert makefile.count("ruff format --config pyproject.toml") == 2
+
+    ruff = str(Path(sys.executable).with_name("ruff"))
+    discovered_lint = subprocess.run(
+        [ruff, "check", "src/bad.py"],
+        cwd=candidate,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    discovered_format = subprocess.run(
+        [ruff, "format", "--check", "src/bad.py"],
+        cwd=candidate,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    pinned_lint = subprocess.run(
+        [ruff, "check", "--config", "pyproject.toml", "src/bad.py"],
+        cwd=candidate,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    pinned_format = subprocess.run(
+        [ruff, "format", "--config", "pyproject.toml", "--check", "src/bad.py"],
+        cwd=candidate,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert discovered_lint.returncode == 0
+    assert discovered_format.returncode == 0
+    assert pinned_lint.returncode == 1
+    assert "F401" in pinned_lint.stdout
+    assert pinned_format.returncode == 1
+
+
 def test_differently_named_candidate_workflow_cannot_spoof_ci_run(tmp_path: Path) -> None:
     trusted, candidate = _repositories(tmp_path)
     candidate_sha = git(candidate, "rev-parse", "HEAD").stdout.strip()
@@ -169,8 +232,17 @@ def _repositories(tmp_path: Path) -> tuple[Path, Path]:
     git(trusted, "config", "user.email", "ao@example.invalid")
     files = {
         TRUSTED_CI_WORKFLOW_PATH: TRUSTED_CI,
-        "Makefile": "test-unit:\n\tpytest\n",
-        "pyproject.toml": "[tool.coverage.report]\nfail_under = 90\n[tool.mypy]\nstrict = true\n",
+        "Makefile": (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8"),
+        "pyproject.toml": (
+            "[tool.coverage.report]\n"
+            "fail_under = 90\n"
+            "[tool.mypy]\n"
+            "strict = true\n"
+            "[tool.ruff.lint]\n"
+            'select = ["F"]\n'
+            "[tool.ruff.format]\n"
+            'quote-style = "double"\n'
+        ),
         "uv.lock": "version = 1\n",
         "tests/test_gate.py": "def test_gate():\n    assert True\n",
     }

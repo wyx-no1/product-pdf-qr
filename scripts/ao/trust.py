@@ -8,7 +8,9 @@ from scripts.ao.git import GitRepository
 TRUSTED_CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 
 # These fixed files are direct gate commands/configuration or auto-discovered
-# configuration that could override the checked-in policy when newly added.
+# configuration that could override the checked-in policy when newly added. Ruff
+# is explicitly pinned to the root pyproject.toml by these hashed Makefile commands,
+# so its otherwise hierarchical per-file configuration discovery is disabled.
 TRUSTED_CI_EXACT_PATHS = (
     ".coveragerc",
     ".dockerignore",
