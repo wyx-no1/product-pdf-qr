@@ -110,15 +110,25 @@ async def test_concurrent_login_burst_reserves_attempts_before_verification(
     failure_limit = 2
     burst_size = 8
     release_authentication = asyncio.Event()
+    all_requests_entered_verification = asyncio.Event()
+    all_excess_requests_rejected = asyncio.Event()
     authentication_calls = 0
+    rate_limited_audits = 0
 
     async def failed_login(*_args: object, **_kwargs: object) -> None:
         nonlocal authentication_calls
         authentication_calls += 1
+        if authentication_calls == burst_size:
+            all_requests_entered_verification.set()
         await release_authentication.wait()
         return None
 
-    async def audit(_database: object, _event: AuditEvent) -> bool:
+    async def audit(_database: object, event: AuditEvent) -> bool:
+        nonlocal rate_limited_audits
+        if event.detail is not None and event.detail.get("reason") == "rate_limited":
+            rate_limited_audits += 1
+            if rate_limited_audits == burst_size - failure_limit:
+                all_excess_requests_rejected.set()
         return True
 
     app = configured_app()
@@ -146,11 +156,17 @@ async def test_concurrent_login_burst_reserves_attempts_before_verification(
             for _index in range(burst_size)
         ]
         burst = asyncio.gather(*tasks)
-        for _iteration in range(100):
-            await asyncio.sleep(0)
-            completed_without_verification = sum(task.done() for task in tasks)
-            if authentication_calls + completed_without_verification >= burst_size:
-                break
+        shape_waiters = {
+            asyncio.create_task(all_requests_entered_verification.wait()),
+            asyncio.create_task(all_excess_requests_rejected.wait()),
+        }
+        _completed, pending = await asyncio.wait(
+            shape_waiters,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         admitted_before_release = authentication_calls
         release_authentication.set()
         responses = await burst
