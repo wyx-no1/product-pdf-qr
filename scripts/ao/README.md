@@ -43,6 +43,17 @@ fixed files are every direct repository-controlled CI command/configuration inpu
 The recursive roots cover executable test, AO, workflow/action, and Docker helper
 code, including newly added files. Product source, migration revisions, and reviewed
 documents remain the subjects being tested rather than the gate definition.
+
+### Trusted Execution Surface
+
+The Trusted Execution Surface is the repository-controlled execution and
+configuration surface that can influence a gate's result. It is not every file name
+that a tool could conceivably discover under a different invocation or future
+configuration. Gate commands, their active configuration, executable helpers,
+startup hooks, and the configuration that determines discovery boundaries belong to
+the surface; ordinary files that cannot enter the current gate execution path do
+not.
+
 Both CI Ruff invocations pass `--config pyproject.toml`, which makes that hashed root
 file the configuration for every analyzed path and disables Ruff's otherwise
 hierarchical closest-config discovery. A candidate `src/ruff.toml`,
@@ -54,21 +65,56 @@ override is therefore marked `requires-re-review` even though the pinned command
 make it ineffective. Because this scan is basename-based over the complete candidate
 commit, a matching file added under any future directory is covered automatically.
 
-The same full-tree pass treats Python startup hooks as gate inputs. `uv sync`
-installs the project editably, so an otherwise ordinary `src/sitecustomize.py` can
-execute before pytest or mypy starts. Every `sitecustomize` and `usercustomize`
-module form is hashed: the `.py` basenames, extension/bytecode-style basenames, and
-all files below same-named package directories. This is path-wide rather than limited
-to today's `src/` layout; if the hashed project configuration later changes the
-editable source root, the hook scan still covers the new directory.
+### Execution-path boundary
 
-The other CI tools do not leave the same unbounded closest-config path:
+Membership in the Trusted Execution Surface follows the gate's actual execution
+path, not an enumeration of every hypothetical location where a configuration or
+plugin file might be placed. Hypothetical locations are unbounded: arbitrary present
+and future directories could contain a recognized name. Actual execution paths are
+bounded and mechanically verifiable. Hashing files that cannot enter those paths
+would make ordinary product changes continually require manual review and would
+degrade the mechanism into an always-manual gate without increasing protection.
 
-- pytest is invoked from the repository root, whose hashed `pyproject.toml` fixes
-  `testpaths = ["tests"]`; `-c pyproject.toml` pins that config, and its hierarchical
-  `conftest.py` loading is therefore bounded to the hashed root `conftest.py`
-  sentinel and recursive `tests/**` tree. All other pytest 9 root config names are
-  also represented by missing-file sentinels as defense in depth;
+This rule is safe only because the configuration that selects each execution path is
+itself part of the Trusted Execution Surface. If a discovery boundary could be
+changed without changing the trusted definition hash, limiting coverage to the
+current path would be a bypassable assumption. For pytest, the discovery boundary is
+set by `testpaths` in `pyproject.toml`; that file is covered both by the root exact
+manifest and the full-tree `pyproject.toml` scan. A PR therefore cannot silently
+widen pytest discovery while preserving the trusted hash: changing `testpaths`
+produces `requires-re-review`.
+
+Python startup hooks have different loading semantics. `uv sync` installs the project
+editably, so an otherwise ordinary `src/sitecustomize.py` can execute when the
+interpreter starts, before pytest or mypy processes their own discovery settings.
+Every `sitecustomize` and `usercustomize` module form is therefore hashed across the
+full tree: the `.py` basenames, extension/bytecode-style basenames, and all files
+below same-named package directories. This is path-wide rather than limited to
+today's `src/` layout; if the hashed project configuration later changes the editable
+source root, the hook scan still covers the new directory.
+
+### Current pytest discovery boundary
+
+Pytest is invoked from the repository root with `-c pyproject.toml`, and the trusted
+configuration fixes `testpaths = ["tests"]`. The complete `tests/**` tree and the
+root `conftest.py` sentinel are in the trusted definition. A `conftest.py` under
+`src/`, migrations, or another product directory is outside that discovery path and
+is not loaded by the current pytest gate. If `testpaths` changes in the future, the
+trusted `pyproject.toml` changes too, so the candidate is marked
+`requires-re-review` before the expanded discovery path can be trusted.
+
+`sitecustomize` and `conftest` are intentionally handled differently because their
+loaders are different, not because they are held to different trust standards.
+Interpreter startup can load `sitecustomize` independently of pytest's `testpaths`,
+so startup hooks need the recursive module-name coverage above. Pytest loads
+`conftest` only within its configured discovery boundary, so the trusted root
+sentinel and recursive `tests/**` tree cover the actual path without an unbounded
+repository-wide `conftest.py` scan.
+
+Other discovery surfaces are bounded as follows:
+
+- all other pytest 9 root config names are represented by missing-file sentinels as
+  defense in depth;
 - mypy selects one configuration from the invocation directory rather than one per
   analyzed file; `--config-file pyproject.toml` pins it, and every supported root
   candidate (`mypy.ini`, `.mypy.ini`, `pyproject.toml`, and `setup.cfg`) is hashed;
