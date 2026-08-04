@@ -1,0 +1,466 @@
+{% extends "base.html" %}
+
+{% block title %}产品 PDF 管理{% endblock %}
+
+{% block head %}
+  <style>
+    :root {
+      color-scheme: light;
+      font-family:
+        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        sans-serif;
+      color: #172033;
+      background: #f3f6fa;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    button {
+      min-height: 44px;
+      padding: 0.7rem 1rem;
+      border: 0;
+      border-radius: 0.5rem;
+      color: #fff;
+      background: #2457d6;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #1d47b2;
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    a:focus-visible {
+      outline: 3px solid #7aa2ff;
+      outline-offset: 2px;
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
+    input {
+      width: 100%;
+      min-height: 44px;
+      padding: 0.65rem 0.75rem;
+      border: 1px solid #aeb9cb;
+      border-radius: 0.5rem;
+      background: #fff;
+    }
+
+    a {
+      color: #1748bd;
+      overflow-wrap: anywhere;
+    }
+
+    code {
+      overflow-wrap: anywhere;
+    }
+
+    .page-header {
+      padding: 1.1rem max(1rem, calc((100% - 960px) / 2));
+      color: #fff;
+      background: #172033;
+    }
+
+    .page-header h1 {
+      margin: 0;
+      font-size: 1.2rem;
+    }
+
+    main {
+      width: min(100% - 2rem, 960px);
+      margin: 2rem auto;
+    }
+
+    .card {
+      padding: clamp(1.1rem, 3vw, 2rem);
+      border: 1px solid #d9e0ea;
+      border-radius: 0.75rem;
+      background: #fff;
+      box-shadow: 0 8px 24px rgb(23 32 51 / 7%);
+    }
+
+    .card h2,
+    .card h3 {
+      margin-top: 0;
+    }
+
+    .hint {
+      color: #5d687a;
+    }
+
+    .field {
+      margin-bottom: 1rem;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 0.4rem;
+      font-weight: 650;
+    }
+
+    .feedback {
+      min-height: 1.5rem;
+      margin: 1rem 0 0;
+      color: #176138;
+    }
+
+    .feedback[data-kind="error"] {
+      color: #b42318;
+    }
+
+    .details {
+      display: grid;
+      grid-template-columns: minmax(7rem, 0.4fr) minmax(0, 1fr);
+      gap: 0.8rem 1rem;
+      margin: 1.25rem 0 2rem;
+    }
+
+    .details dt {
+      color: #5d687a;
+      font-weight: 650;
+    }
+
+    .details dd {
+      min-width: 0;
+      margin: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(240px, 0.65fr);
+      gap: 1.5rem;
+    }
+
+    .subcard {
+      padding: 1.25rem;
+      border: 1px solid #d9e0ea;
+      border-radius: 0.65rem;
+      background: #fafbfd;
+    }
+
+    .qrcode {
+      display: block;
+      width: min(100%, 320px);
+      height: auto;
+      margin: 1rem auto 0;
+      border: 1px solid #d9e0ea;
+      background: #fff;
+    }
+
+    .secondary-link {
+      display: inline-block;
+      margin-top: 1.25rem;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    @media (max-width: 680px) {
+      .detail-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .details {
+        grid-template-columns: 1fr;
+        gap: 0.25rem;
+      }
+
+      .details dd {
+        margin-bottom: 0.65rem;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+      }
+    }
+  </style>
+{% endblock %}
+
+{% block content %}
+  <header class="page-header">
+    <h1>Product PDF QR 管理</h1>
+  </header>
+
+  <main>
+    <section id="create-view" class="card" aria-labelledby="create-heading">
+      <h2 id="create-heading">创建产品</h2>
+      <p class="hint">创建后可上传 PDF，并查看供手机扫码访问的二维码。</p>
+
+      <form id="create-form">
+        <div class="field">
+          <label for="product-code">产品编码</label>
+          <input
+            id="product-code"
+            name="code"
+            required
+            maxlength="64"
+            autocomplete="off"
+          >
+        </div>
+        <div class="field">
+          <label for="product-name">产品名称</label>
+          <input id="product-name" name="name" required maxlength="120" autocomplete="off">
+        </div>
+        <button id="create-button" type="submit">创建产品</button>
+        <p id="create-feedback" class="feedback" role="status" aria-live="polite"></p>
+      </form>
+    </section>
+
+    <section id="detail-view" class="card" aria-labelledby="detail-heading" hidden>
+      <h2 id="detail-heading">产品详情</h2>
+
+      <div id="missing-product" hidden>
+        <p>当前页面没有产品数据，请先创建产品。</p>
+        <a class="secondary-link" href="/admin" data-action="back-to-create">返回创建页</a>
+      </div>
+
+      <div id="product-content" hidden>
+        <dl class="details">
+          <dt>产品编码</dt>
+          <dd id="detail-code"></dd>
+          <dt>产品名称</dt>
+          <dd id="detail-name"></dd>
+          <dt>Public Token</dt>
+          <dd><code id="detail-token"></code></dd>
+          <dt>产品状态</dt>
+          <dd id="detail-status"></dd>
+          <dt>公开访问地址</dt>
+          <dd><a id="detail-public-url" target="_blank" rel="noopener noreferrer"></a></dd>
+          <dt>操作人 ID</dt>
+          <dd><strong>1</strong>（第一期固定值）</dd>
+        </dl>
+
+        <div class="detail-grid">
+          <section class="subcard" aria-labelledby="upload-heading">
+            <h3 id="upload-heading">上传 PDF</h3>
+            <p class="hint">上传成功后，二维码指向的公开地址将提供当前版本 PDF。</p>
+            <form id="upload-form">
+              <div class="field">
+                <label for="pdf-file">选择 PDF 文件</label>
+                <input
+                  id="pdf-file"
+                  name="file"
+                  type="file"
+                  accept=".pdf,application/pdf"
+                  required
+                >
+              </div>
+              <button id="upload-button" type="submit">上传 PDF</button>
+              <p id="upload-feedback" class="feedback" role="status" aria-live="polite"></p>
+            </form>
+          </section>
+
+          <section class="subcard" aria-labelledby="qrcode-heading">
+            <h3 id="qrcode-heading">产品二维码</h3>
+            <p id="qrcode-hint" class="hint">使用手机扫描二维码访问公开 PDF。</p>
+            <img id="qrcode-image" class="qrcode" alt="产品公开访问二维码">
+            <p id="qrcode-feedback" class="feedback" role="status" aria-live="polite"></p>
+          </section>
+        </div>
+
+        <a class="secondary-link" href="/admin" data-action="back-to-create">创建另一个产品</a>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const ACTOR_ID = "1"; // 第一期为单管理员；无用户体系，按已裁定规格固定传 1。
+      let currentProduct = null;
+
+      const createView = document.querySelector("#create-view");
+      const detailView = document.querySelector("#detail-view");
+      const missingProduct = document.querySelector("#missing-product");
+      const productContent = document.querySelector("#product-content");
+      const createForm = document.querySelector("#create-form");
+      const uploadForm = document.querySelector("#upload-form");
+      const createButton = document.querySelector("#create-button");
+      const uploadButton = document.querySelector("#upload-button");
+      const createFeedback = document.querySelector("#create-feedback");
+      const uploadFeedback = document.querySelector("#upload-feedback");
+      const qrcodeFeedback = document.querySelector("#qrcode-feedback");
+      const qrcodeImage = document.querySelector("#qrcode-image");
+
+      function setFeedback(element, message, kind = "success") {
+        element.textContent = message;
+        element.dataset.kind = kind;
+      }
+
+      async function apiErrorMessage(response) {
+        try {
+          const body = await response.json();
+          if (body?.error?.message) {
+            return body.error.message;
+          }
+          if (typeof body?.detail === "string") {
+            return body.detail;
+          }
+        } catch {
+          // The upload-size middleware or a proxy may return a non-JSON error body.
+        }
+        return `请求失败（HTTP ${response.status}）`;
+      }
+
+      function showCreate() {
+        createView.hidden = false;
+        detailView.hidden = true;
+        document.title = "创建产品 · 产品 PDF 管理";
+      }
+
+      function showDetail(product) {
+        createView.hidden = true;
+        detailView.hidden = false;
+        const hasProduct = product !== null;
+        missingProduct.hidden = hasProduct;
+        productContent.hidden = !hasProduct;
+        document.title = hasProduct
+          ? `${product.code} · 产品详情`
+          : "产品数据不可用 · 产品 PDF 管理";
+
+        if (!hasProduct) {
+          return;
+        }
+
+        document.querySelector("#detail-code").textContent = product.code;
+        document.querySelector("#detail-name").textContent = product.name;
+        document.querySelector("#detail-token").textContent = product.public_token;
+        document.querySelector("#detail-status").textContent = product.status;
+
+        const publicUrl = document.querySelector("#detail-public-url");
+        publicUrl.textContent = product.public_url;
+        publicUrl.href = product.public_url;
+
+        qrcodeImage.hidden = false;
+        qrcodeImage.src = product.qrcode_url;
+        qrcodeImage.alt = `${product.code} 产品公开访问二维码`;
+        setFeedback(qrcodeFeedback, "");
+      }
+
+      function showViewForPath() {
+        if (/^\/admin\/products\/\d+\/?$/.test(window.location.pathname)) {
+          showDetail(currentProduct);
+          return;
+        }
+        showCreate();
+      }
+
+      createForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const formData = new FormData(createForm);
+        const code = String(formData.get("code") ?? "").trim();
+        const name = String(formData.get("name") ?? "").trim();
+
+        createButton.disabled = true;
+        setFeedback(createFeedback, "正在创建…");
+        try {
+          const response = await fetch("/api/products", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({code, name}),
+          });
+          if (!response.ok) {
+            throw new Error(await apiErrorMessage(response));
+          }
+
+          const created = await response.json();
+          currentProduct = {...created, name};
+          window.history.pushState(null, "", `/admin/products/${created.id}`);
+          showDetail(currentProduct);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "创建失败，请重试。";
+          setFeedback(createFeedback, message, "error");
+        } finally {
+          createButton.disabled = false;
+        }
+      });
+
+      uploadForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (currentProduct === null) {
+          setFeedback(uploadFeedback, "产品数据已丢失，请返回创建页重新创建。", "error");
+          return;
+        }
+
+        const file = document.querySelector("#pdf-file").files[0];
+        if (!file) {
+          setFeedback(uploadFeedback, "请选择 PDF 文件。", "error");
+          return;
+        }
+
+        const body = new FormData();
+        body.append("actor_id", ACTOR_ID);
+        body.append("file", file);
+        uploadButton.disabled = true;
+        setFeedback(uploadFeedback, "正在上传…");
+        try {
+          const response = await fetch(`/api/products/${currentProduct.id}/pdf`, {
+            method: "POST",
+            body,
+          });
+          if (!response.ok) {
+            throw new Error(await apiErrorMessage(response));
+          }
+
+          const uploaded = await response.json();
+          setFeedback(
+            uploadFeedback,
+            `上传成功：第 ${uploaded.version_no} 版，${uploaded.original_filename}`,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "上传失败，请重试。";
+          setFeedback(uploadFeedback, message, "error");
+        } finally {
+          uploadButton.disabled = false;
+        }
+      });
+
+      qrcodeImage.addEventListener("error", () => {
+        qrcodeImage.hidden = true;
+        setFeedback(qrcodeFeedback, "二维码加载失败，请稍后重试。", "error");
+      });
+
+      qrcodeImage.addEventListener("load", () => {
+        qrcodeImage.hidden = false;
+        setFeedback(qrcodeFeedback, "");
+      });
+
+      document.querySelectorAll("[data-action='back-to-create']").forEach((link) => {
+        link.addEventListener("click", (event) => {
+          event.preventDefault();
+          currentProduct = null;
+          window.history.pushState(null, "", "/admin");
+          createForm.reset();
+          setFeedback(createFeedback, "");
+          showCreate();
+        });
+      });
+
+      window.addEventListener("popstate", showViewForPath);
+      showViewForPath();
+    })();
+  </script>
+{% endblock %}

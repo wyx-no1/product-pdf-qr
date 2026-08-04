@@ -7,6 +7,7 @@ from typing import cast
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
+from product_pdf_qr.admin import router as admin_router
 from product_pdf_qr.config import get_settings
 from product_pdf_qr.database import Database
 from product_pdf_qr.domains.product.router import router as product_router
@@ -62,6 +63,7 @@ def create_app() -> FastAPI:
     )
     application.add_middleware(UploadRequestLimitMiddleware)
     register_exception_handlers(application)
+    application.include_router(admin_router)
     application.include_router(product_router)
     application.include_router(qrcode_router)
     application.include_router(storage_router)
