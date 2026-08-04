@@ -22,7 +22,11 @@ class OrphanFileResponse(BaseModel):
     modified_at_ns: int
 
 
-@router.get("/orphans", response_model=list[OrphanFileResponse])
+@router.get(
+    "/orphans",
+    response_model=list[OrphanFileResponse],
+    summary="查看孤儿文件记录",
+)
 async def report_orphan_files(
     database: Annotated[Database, Depends(get_database)],
     storage: Annotated[StorageService, Depends(get_storage_service)],

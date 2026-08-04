@@ -56,7 +56,7 @@ def create_app() -> FastAPI:
     """Create the Phase 1-B local-only business-loop application."""
 
     application = FastAPI(
-        title="Product PDF QR",
+        title="产品PDF二维码系统",
         version="0.1.0",
         lifespan=lifespan,
     )

@@ -54,7 +54,7 @@ def _stream_file(path: object) -> Iterator[bytes]:
             yield chunk
 
 
-@router.get("/p/{public_token:path}", response_model=None)
+@router.get("/p/{public_token:path}", response_model=None, summary="公开扫码访问")
 async def public_scan(
     public_token: str,
     request: Request,

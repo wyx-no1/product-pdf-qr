@@ -22,7 +22,11 @@ class QRCodeFailureResponse(BaseModel):
     reason: str | None
 
 
-@router.get("/failures", response_model=list[QRCodeFailureResponse])
+@router.get(
+    "/failures",
+    response_model=list[QRCodeFailureResponse],
+    summary="查看二维码失败记录",
+)
 async def report_qrcode_failures(
     database: Annotated[Database, Depends(get_database)],
     qrcode_service: Annotated[QRCodeService, Depends(get_qrcode_service)],

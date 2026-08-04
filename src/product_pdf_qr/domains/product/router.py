@@ -133,7 +133,12 @@ async def _generate_with_audit(
     return result
 
 
-@router.post("", response_model=ProductCreateResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=ProductCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="创建产品",
+)
 async def create_product_endpoint(
     payload: ProductCreateRequest,
     database: Annotated[Database, Depends(get_database)],
@@ -161,7 +166,7 @@ async def create_product_endpoint(
     )
 
 
-@router.get("/{product_id}/qrcode")
+@router.get("/{product_id}/qrcode", summary="下载二维码")
 async def download_qrcode(
     product_id: int,
     database: Annotated[Database, Depends(get_database)],
@@ -178,7 +183,11 @@ async def download_qrcode(
     )
 
 
-@router.post("/{product_id}/qrcode/retry", response_model=QRCodeRetryResponse)
+@router.post(
+    "/{product_id}/qrcode/retry",
+    response_model=QRCodeRetryResponse,
+    summary="重试生成二维码",
+)
 async def retry_qrcode(
     product_id: int,
     database: Annotated[Database, Depends(get_database)],
@@ -201,6 +210,7 @@ async def retry_qrcode(
     "/{product_id}/pdf",
     response_model=PDFUploadResponse,
     status_code=status.HTTP_201_CREATED,
+    summary="上传PDF",
 )
 async def upload_pdf_endpoint(
     product_id: int,
