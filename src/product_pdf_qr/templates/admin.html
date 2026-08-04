@@ -72,7 +72,7 @@
     }
 
     .page-header {
-      padding: 1.1rem max(1rem, calc((100% - 960px) / 2));
+      padding: 1.1rem max(1rem, calc((100% - 1040px) / 2));
       color: #fff;
       background: #172033;
     }
@@ -83,8 +83,13 @@
     }
 
     main {
-      width: min(100% - 2rem, 960px);
+      width: min(100% - 2rem, 1040px);
       margin: 2rem auto;
+    }
+
+    .stack {
+      display: grid;
+      gap: 1.5rem;
     }
 
     .card {
@@ -100,12 +105,38 @@
       margin-top: 0;
     }
 
-    .hint {
+    .section-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .section-heading button {
+      min-height: 38px;
+      padding: 0.5rem 0.8rem;
+      color: #1748bd;
+      background: #e9efff;
+    }
+
+    .hint,
+    .muted {
       color: #5d687a;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
+      align-items: end;
+      gap: 1rem;
     }
 
     .field {
       margin-bottom: 1rem;
+    }
+
+    .form-grid .field {
+      margin-bottom: 0;
     }
 
     .field label {
@@ -124,9 +155,66 @@
       color: #b42318;
     }
 
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid #d9e0ea;
+      border-radius: 0.65rem;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+
+    th,
+    td {
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid #e6ebf2;
+      vertical-align: top;
+    }
+
+    th {
+      color: #46536a;
+      background: #f7f9fc;
+      font-size: 0.9rem;
+    }
+
+    tbody tr:last-child td {
+      border-bottom: 0;
+    }
+
+    tbody tr:hover {
+      background: #f8faff;
+    }
+
+    .status {
+      display: inline-block;
+      padding: 0.2rem 0.55rem;
+      border-radius: 999px;
+      color: #31513e;
+      background: #e8f5ec;
+      font-size: 0.85rem;
+      font-weight: 650;
+    }
+
+    .status[data-state="empty"] {
+      color: #66531c;
+      background: #fff4cd;
+    }
+
+    .empty-state {
+      margin: 0;
+      padding: 1.5rem;
+      border: 1px dashed #b9c4d5;
+      border-radius: 0.65rem;
+      color: #5d687a;
+      text-align: center;
+    }
+
     .details {
       display: grid;
-      grid-template-columns: minmax(7rem, 0.4fr) minmax(0, 1fr);
+      grid-template-columns: minmax(8rem, 0.4fr) minmax(0, 1fr);
       gap: 0.8rem 1rem;
       margin: 1.25rem 0 2rem;
     }
@@ -173,9 +261,14 @@
       display: none !important;
     }
 
-    @media (max-width: 680px) {
+    @media (max-width: 760px) {
+      .form-grid,
       .detail-grid {
         grid-template-columns: 1fr;
+      }
+
+      .form-grid .field {
+        margin-bottom: 0;
       }
 
       .details {
@@ -204,36 +297,65 @@
   </header>
 
   <main>
-    <section id="create-view" class="card" aria-labelledby="create-heading">
-      <h2 id="create-heading">创建产品</h2>
-      <p class="hint">创建后可上传 PDF，并查看供手机扫码访问的二维码。</p>
+    <div id="index-view" class="stack">
+      <section class="card" aria-labelledby="create-heading">
+        <h2 id="create-heading">创建产品</h2>
+        <p class="hint">产品会保存到数据库，创建后可上传 PDF 并查看公开二维码。</p>
 
-      <form id="create-form">
-        <div class="field">
-          <label for="product-code">产品编码</label>
-          <input
-            id="product-code"
-            name="code"
-            required
-            maxlength="64"
-            autocomplete="off"
-          >
+        <form id="create-form">
+          <div class="form-grid">
+            <div class="field">
+              <label for="product-code">产品编码</label>
+              <input
+                id="product-code"
+                name="code"
+                required
+                maxlength="64"
+                autocomplete="off"
+              >
+            </div>
+            <div class="field">
+              <label for="product-name">产品名称</label>
+              <input id="product-name" name="name" required maxlength="120" autocomplete="off">
+            </div>
+            <button id="create-button" type="submit">创建产品</button>
+          </div>
+          <p id="create-feedback" class="feedback" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <section class="card" aria-labelledby="list-heading">
+        <div class="section-heading">
+          <h2 id="list-heading">产品列表</h2>
+          <button id="reload-list" type="button">刷新列表</button>
         </div>
-        <div class="field">
-          <label for="product-name">产品名称</label>
-          <input id="product-name" name="name" required maxlength="120" autocomplete="off">
+        <p id="list-feedback" class="feedback" role="status" aria-live="polite"></p>
+        <p id="empty-list" class="empty-state" hidden>
+          暂无产品。请使用上方表单创建第一个产品。
+        </p>
+        <div id="product-table" class="table-wrap" hidden>
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">产品</th>
+                <th scope="col">编码</th>
+                <th scope="col">PDF</th>
+                <th scope="col">更新时间</th>
+              </tr>
+            </thead>
+            <tbody id="product-rows"></tbody>
+          </table>
         </div>
-        <button id="create-button" type="submit">创建产品</button>
-        <p id="create-feedback" class="feedback" role="status" aria-live="polite"></p>
-      </form>
-    </section>
+      </section>
+    </div>
 
     <section id="detail-view" class="card" aria-labelledby="detail-heading" hidden>
       <h2 id="detail-heading">产品详情</h2>
+      <p id="detail-loading" class="muted">正在加载产品详情…</p>
 
       <div id="missing-product" hidden>
-        <p>当前页面没有产品数据，请先创建产品。</p>
-        <a class="secondary-link" href="/admin" data-action="back-to-create">返回创建页</a>
+        <p id="missing-message">未找到该产品，可能已被移除。</p>
+        <a class="secondary-link" href="/admin" data-action="back-to-list">返回产品列表</a>
       </div>
 
       <div id="product-content" hidden>
@@ -246,6 +368,16 @@
           <dd><code id="detail-token"></code></dd>
           <dt>产品状态</dt>
           <dd id="detail-status"></dd>
+          <dt>PDF 状态</dt>
+          <dd id="detail-pdf-status"></dd>
+          <dt>当前版本 ID</dt>
+          <dd id="detail-version"></dd>
+          <dt>二维码状态</dt>
+          <dd id="detail-qrcode-status"></dd>
+          <dt>创建时间</dt>
+          <dd id="detail-created-at"></dd>
+          <dt>更新时间</dt>
+          <dd id="detail-updated-at"></dd>
           <dt>公开访问地址</dt>
           <dd><a id="detail-public-url" target="_blank" rel="noopener noreferrer"></a></dd>
           <dt>操作人 ID</dt>
@@ -255,7 +387,7 @@
         <div class="detail-grid">
           <section class="subcard" aria-labelledby="upload-heading">
             <h3 id="upload-heading">上传 PDF</h3>
-            <p class="hint">上传成功后，二维码指向的公开地址将提供当前版本 PDF。</p>
+            <p class="hint">上传成功后，公开地址将提供最新版本 PDF。</p>
             <form id="upload-form">
               <div class="field">
                 <label for="pdf-file">选择 PDF 文件</label>
@@ -274,13 +406,13 @@
 
           <section class="subcard" aria-labelledby="qrcode-heading">
             <h3 id="qrcode-heading">产品二维码</h3>
-            <p id="qrcode-hint" class="hint">使用手机扫描二维码访问公开 PDF。</p>
-            <img id="qrcode-image" class="qrcode" alt="产品公开访问二维码">
+            <p class="hint">使用手机扫描二维码访问公开 PDF。</p>
+            <img id="qrcode-image" class="qrcode" alt="产品公开访问二维码" hidden>
             <p id="qrcode-feedback" class="feedback" role="status" aria-live="polite"></p>
           </section>
         </div>
 
-        <a class="secondary-link" href="/admin" data-action="back-to-create">创建另一个产品</a>
+        <a class="secondary-link" href="/admin" data-action="back-to-list">返回产品列表</a>
       </div>
     </section>
   </main>
@@ -292,18 +424,24 @@
       const ACTOR_ID = "1"; // 第一期为单管理员；无用户体系，按已裁定规格固定传 1。
       let currentProduct = null;
 
-      const createView = document.querySelector("#create-view");
+      const indexView = document.querySelector("#index-view");
       const detailView = document.querySelector("#detail-view");
+      const detailLoading = document.querySelector("#detail-loading");
       const missingProduct = document.querySelector("#missing-product");
+      const missingMessage = document.querySelector("#missing-message");
       const productContent = document.querySelector("#product-content");
       const createForm = document.querySelector("#create-form");
       const uploadForm = document.querySelector("#upload-form");
       const createButton = document.querySelector("#create-button");
       const uploadButton = document.querySelector("#upload-button");
       const createFeedback = document.querySelector("#create-feedback");
+      const listFeedback = document.querySelector("#list-feedback");
       const uploadFeedback = document.querySelector("#upload-feedback");
       const qrcodeFeedback = document.querySelector("#qrcode-feedback");
       const qrcodeImage = document.querySelector("#qrcode-image");
+      const emptyList = document.querySelector("#empty-list");
+      const productTable = document.querySelector("#product-table");
+      const productRows = document.querySelector("#product-rows");
 
       function setFeedback(element, message, kind = "success") {
         element.textContent = message;
@@ -320,35 +458,71 @@
             return body.detail;
           }
         } catch {
-          // The upload-size middleware or a proxy may return a non-JSON error body.
+          // A proxy or request-size middleware may return a non-JSON error body.
         }
         return `请求失败（HTTP ${response.status}）`;
       }
 
-      function showCreate() {
-        createView.hidden = false;
-        detailView.hidden = true;
-        document.title = "创建产品 · 产品 PDF 管理";
+      function formatDate(value) {
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? "—" : parsed.toLocaleString("zh-CN");
       }
 
-      function showDetail(product) {
-        createView.hidden = true;
-        detailView.hidden = false;
-        const hasProduct = product !== null;
-        missingProduct.hidden = hasProduct;
-        productContent.hidden = !hasProduct;
-        document.title = hasProduct
-          ? `${product.code} · 产品详情`
-          : "产品数据不可用 · 产品 PDF 管理";
+      function productName(product) {
+        return product.name || "未命名（历史数据）";
+      }
 
-        if (!hasProduct) {
-          return;
-        }
+      function pdfStatusLabel(status) {
+        return status === "uploaded" ? "已上传" : "未上传";
+      }
+
+      function parseProductId() {
+        const match = window.location.pathname.match(/^\/admin\/products\/(\d+)\/?$/);
+        return match ? Number(match[1]) : null;
+      }
+
+      function showIndex() {
+        currentProduct = null;
+        indexView.hidden = false;
+        detailView.hidden = true;
+        document.title = "产品列表 · 产品 PDF 管理";
+        void loadProducts();
+      }
+
+      function showDetailLoading() {
+        indexView.hidden = true;
+        detailView.hidden = false;
+        detailLoading.hidden = false;
+        missingProduct.hidden = true;
+        productContent.hidden = true;
+        qrcodeImage.hidden = true;
+        qrcodeImage.removeAttribute("src");
+        setFeedback(uploadFeedback, "");
+        setFeedback(qrcodeFeedback, "");
+        document.title = "加载产品详情 · 产品 PDF 管理";
+      }
+
+      function renderProduct(product) {
+        currentProduct = product;
+        detailLoading.hidden = true;
+        missingProduct.hidden = true;
+        productContent.hidden = false;
+        document.title = `${product.code} · 产品详情`;
 
         document.querySelector("#detail-code").textContent = product.code;
-        document.querySelector("#detail-name").textContent = product.name;
+        document.querySelector("#detail-name").textContent = productName(product);
         document.querySelector("#detail-token").textContent = product.public_token;
         document.querySelector("#detail-status").textContent = product.status;
+        document.querySelector("#detail-pdf-status").textContent =
+          pdfStatusLabel(product.pdf_status);
+        document.querySelector("#detail-version").textContent =
+          product.current_version_id ?? "—";
+        document.querySelector("#detail-qrcode-status").textContent =
+          product.qrcode_status === "ready" ? "已生成" : "待生成";
+        document.querySelector("#detail-created-at").textContent =
+          formatDate(product.created_at);
+        document.querySelector("#detail-updated-at").textContent =
+          formatDate(product.updated_at);
 
         const publicUrl = document.querySelector("#detail-public-url");
         publicUrl.textContent = product.public_url;
@@ -357,15 +531,99 @@
         qrcodeImage.hidden = false;
         qrcodeImage.src = product.qrcode_url;
         qrcodeImage.alt = `${product.code} 产品公开访问二维码`;
-        setFeedback(qrcodeFeedback, "");
       }
 
-      function showViewForPath() {
-        if (/^\/admin\/products\/\d+\/?$/.test(window.location.pathname)) {
-          showDetail(currentProduct);
+      function showMissingProduct(message) {
+        currentProduct = null;
+        detailLoading.hidden = true;
+        productContent.hidden = true;
+        missingProduct.hidden = false;
+        missingMessage.textContent = message;
+        document.title = "产品不可用 · 产品 PDF 管理";
+      }
+
+      async function loadProduct(productId) {
+        showDetailLoading();
+        try {
+          const response = await fetch(`/api/products/${productId}`);
+          if (response.status === 404) {
+            showMissingProduct("未找到该产品，可能已被移除。");
+            return;
+          }
+          if (!response.ok) {
+            throw new Error(await apiErrorMessage(response));
+          }
+          renderProduct(await response.json());
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "产品详情加载失败。";
+          showMissingProduct(`${message} 请稍后重试或返回产品列表。`);
+        }
+      }
+
+      function appendTextCell(row, value) {
+        const cell = document.createElement("td");
+        cell.textContent = value;
+        row.append(cell);
+        return cell;
+      }
+
+      function renderProductList(products) {
+        productRows.replaceChildren();
+        emptyList.hidden = products.length !== 0;
+        productTable.hidden = products.length === 0;
+
+        for (const product of products) {
+          const row = document.createElement("tr");
+          const nameCell = document.createElement("td");
+          const link = document.createElement("a");
+          link.href = `/admin/products/${product.id}`;
+          link.dataset.productLink = "true";
+          link.textContent = productName(product);
+          nameCell.append(link);
+          row.append(nameCell);
+          appendTextCell(row, product.code);
+
+          const statusCell = appendTextCell(row, "");
+          const status = document.createElement("span");
+          status.className = "status";
+          status.dataset.state = product.pdf_status === "uploaded" ? "ready" : "empty";
+          status.textContent = pdfStatusLabel(product.pdf_status);
+          statusCell.append(status);
+          appendTextCell(row, formatDate(product.updated_at));
+          productRows.append(row);
+        }
+      }
+
+      async function loadProducts() {
+        setFeedback(listFeedback, "正在加载产品列表…");
+        try {
+          const response = await fetch("/api/products?limit=100&offset=0");
+          if (!response.ok) {
+            throw new Error(await apiErrorMessage(response));
+          }
+          const products = await response.json();
+          renderProductList(products);
+          setFeedback(listFeedback, "");
+        } catch (error) {
+          emptyList.hidden = true;
+          productTable.hidden = true;
+          const message = error instanceof Error ? error.message : "产品列表加载失败。";
+          setFeedback(listFeedback, `${message} 请稍后重试。`, "error");
+        }
+      }
+
+      function route() {
+        const productId = parseProductId();
+        if (productId === null) {
+          showIndex();
           return;
         }
-        showCreate();
+        void loadProduct(productId);
+      }
+
+      function navigate(path) {
+        window.history.pushState(null, "", path);
+        route();
       }
 
       createForm.addEventListener("submit", async (event) => {
@@ -387,9 +645,9 @@
           }
 
           const created = await response.json();
-          currentProduct = {...created, name};
-          window.history.pushState(null, "", `/admin/products/${created.id}`);
-          showDetail(currentProduct);
+          createForm.reset();
+          setFeedback(createFeedback, "");
+          navigate(`/admin/products/${created.id}`);
         } catch (error) {
           const message = error instanceof Error ? error.message : "创建失败，请重试。";
           setFeedback(createFeedback, message, "error");
@@ -401,7 +659,7 @@
       uploadForm.addEventListener("submit", async (event) => {
         event.preventDefault();
         if (currentProduct === null) {
-          setFeedback(uploadFeedback, "产品数据已丢失，请返回创建页重新创建。", "error");
+          setFeedback(uploadFeedback, "产品尚未加载完成，请稍后重试。", "error");
           return;
         }
 
@@ -426,6 +684,11 @@
           }
 
           const uploaded = await response.json();
+          currentProduct.current_version_id = uploaded.version_id;
+          currentProduct.pdf_status = "uploaded";
+          document.querySelector("#detail-pdf-status").textContent = "已上传";
+          document.querySelector("#detail-version").textContent = uploaded.version_id;
+          uploadForm.reset();
           setFeedback(
             uploadFeedback,
             `上传成功：第 ${uploaded.version_no} 版，${uploaded.original_filename}`,
@@ -445,22 +708,32 @@
 
       qrcodeImage.addEventListener("load", () => {
         qrcodeImage.hidden = false;
+        document.querySelector("#detail-qrcode-status").textContent = "已生成";
         setFeedback(qrcodeFeedback, "");
       });
 
-      document.querySelectorAll("[data-action='back-to-create']").forEach((link) => {
+      document.querySelector("#reload-list").addEventListener("click", () => {
+        void loadProducts();
+      });
+
+      productRows.addEventListener("click", (event) => {
+        const link = event.target.closest("[data-product-link]");
+        if (!link) {
+          return;
+        }
+        event.preventDefault();
+        navigate(link.getAttribute("href"));
+      });
+
+      document.querySelectorAll("[data-action='back-to-list']").forEach((link) => {
         link.addEventListener("click", (event) => {
           event.preventDefault();
-          currentProduct = null;
-          window.history.pushState(null, "", "/admin");
-          createForm.reset();
-          setFeedback(createFeedback, "");
-          showCreate();
+          navigate("/admin");
         });
       });
 
-      window.addEventListener("popstate", showViewForPath);
-      showViewForPath();
+      window.addEventListener("popstate", route);
+      route();
     })();
   </script>
 {% endblock %}

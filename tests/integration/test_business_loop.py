@@ -91,11 +91,20 @@ def synthetic_pdf(width: int) -> bytes:
     return output.getvalue()
 
 
-async def create_product(client: httpx.AsyncClient, code: str) -> dict[str, object]:
-    response = await client.post("/api/products", json={"code": code})
+async def create_product(
+    client: httpx.AsyncClient,
+    code: str,
+    name: str | None = None,
+) -> dict[str, object]:
+    product_name = name or f"{code.strip()} 产品"
+    response = await client.post(
+        "/api/products",
+        json={"code": code, "name": product_name},
+    )
     assert response.status_code == 201, response.text
     result = response.json()
     assert isinstance(result, dict)
+    assert result["name"] == product_name.strip()
     return result
 
 
@@ -197,13 +206,54 @@ async def test_minimum_business_loop_and_four_public_states(
         async with lifespan(app):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                created = await create_product(client, " a001_1 ")
+                created = await create_product(client, " a001_1 ", " 一号测试产品 ")
                 product_id = cast(int, created["id"])
                 token = str(created["public_token"])
                 assert created["code"] == "A001_1"
+                assert created["name"] == "一号测试产品"
                 assert created["status"] == "active"
                 assert created["current_version_id"] is None
                 assert created["qrcode_status"] == "ready"
+
+                product_list = await client.get("/api/products?limit=10&offset=0")
+                assert product_list.status_code == 200
+                assert product_list.json()[0]["name"] == "一号测试产品"
+                assert product_list.json()[0]["pdf_status"] == "not_uploaded"
+
+                detail = await client.get(f"/api/products/{product_id}")
+                assert detail.status_code == 200
+                detail_body = detail.json()
+                assert detail_body["name"] == "一号测试产品"
+                assert detail_body["pdf_status"] == "not_uploaded"
+                assert detail_body["qrcode_status"] == "ready"
+                assert detail_body["public_token"] == token
+
+                with psycopg.connect(runtime_url) as connection:
+                    historical_row = connection.execute(
+                        """
+                        INSERT INTO products (
+                            code,
+                            public_token,
+                            created_at,
+                            updated_at
+                        ) VALUES ('HISTORICAL-NULL', 'HHHHHHHHHHHHHHHHHHHHHHHHHH', now(), now())
+                        RETURNING id
+                        """
+                    ).fetchone()
+                    connection.commit()
+                assert historical_row is not None
+                historical_id = int(historical_row[0])
+                historical_detail = await client.get(f"/api/products/{historical_id}")
+                assert historical_detail.status_code == 200
+                assert historical_detail.json()["name"] is None
+                product_list_with_history = await client.get("/api/products")
+                assert any(
+                    product["id"] == historical_id and product["name"] is None
+                    for product in product_list_with_history.json()
+                )
+                missing_detail = await client.get("/api/products/999999")
+                assert missing_detail.status_code == 404
+                assert missing_detail.json()["error"]["code"] == "product_not_found"
 
                 qrcode = await client.get(str(created["qrcode_url"]))
                 assert qrcode.status_code == 200
@@ -224,6 +274,12 @@ async def test_minimum_business_loop_and_four_public_states(
                 )
                 assert uploaded_v1.status_code == 201, uploaded_v1.text
                 assert uploaded_v1.json()["version_no"] == 1
+                refreshed_detail = await client.get(f"/api/products/{product_id}")
+                assert refreshed_detail.json()["pdf_status"] == "uploaded"
+                assert (
+                    refreshed_detail.json()["current_version_id"]
+                    == uploaded_v1.json()["version_id"]
+                )
                 public_v1 = await client.get(f"/p/{token}")
                 assert public_v1.status_code == 200
                 assert public_v1.content == first_pdf
@@ -406,7 +462,10 @@ async def test_concurrent_identical_uploads_create_only_one_version(
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 create_responses = await asyncio.gather(
                     *[
-                        client.post("/api/products", json={"code": "CONCURRENT"})
+                        client.post(
+                            "/api/products",
+                            json={"code": "CONCURRENT", "name": "并发产品"},
+                        )
                         for _index in range(6)
                     ]
                 )

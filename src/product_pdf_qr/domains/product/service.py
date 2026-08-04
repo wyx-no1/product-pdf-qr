@@ -6,6 +6,7 @@ import base64
 import re
 import secrets
 from dataclasses import dataclass
+from datetime import datetime
 from typing import cast
 from uuid import UUID
 
@@ -20,6 +21,7 @@ NORMALIZED_PRODUCT_CODE_PATTERN = re.compile(r"^[A-Z0-9_-]{1,64}$", re.ASCII)
 PUBLIC_TOKEN_BYTES = 16
 PUBLIC_TOKEN_LENGTH = 26
 TOKEN_RETRY_LIMIT = 5
+PRODUCT_NAME_MAX_LENGTH = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,9 +30,12 @@ class Product:
 
     id: int
     code: str
+    name: str | None
     public_token: str
     status: str
     current_version_id: int | None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 def normalize_product_code(raw_code: str) -> str:
@@ -52,6 +57,19 @@ def is_normalized_product_code(code: str) -> bool:
     return NORMALIZED_PRODUCT_CODE_PATTERN.fullmatch(code) is not None
 
 
+def normalize_product_name(raw_name: str) -> str:
+    """Return a required, trimmed product name within the V1 storage limit."""
+
+    name = raw_name.strip()
+    if not name or len(name) > PRODUCT_NAME_MAX_LENGTH:
+        raise AppError(
+            "invalid_product_name",
+            "产品名称须为 1-120 个字符。",
+            422,
+        )
+    return name
+
+
 def generate_public_token() -> str:
     """Generate an unpadded Base32 token with exactly 128 bits of CSPRNG entropy."""
 
@@ -62,26 +80,32 @@ def generate_public_token() -> str:
 
 
 def _product_from_row(row: dict[str, object]) -> Product:
+    raw_name = row.get("name")
     return Product(
         id=cast(int, row["id"]),
         code=str(row["code"]),
+        name=str(raw_name) if raw_name is not None else None,
         public_token=str(row["public_token"]),
         status=str(row["status"]),
         current_version_id=(
             cast(int, row["current_version_id"]) if row["current_version_id"] is not None else None
         ),
+        created_at=cast(datetime | None, row.get("created_at")),
+        updated_at=cast(datetime | None, row.get("updated_at")),
     )
 
 
 async def create_product(
     database: Database,
     raw_code: str,
+    raw_name: str,
     *,
     request_id: UUID | None = None,
 ) -> Product:
     """Atomically create a product and its success audit event."""
 
     code = normalize_product_code(raw_code)
+    name = normalize_product_name(raw_name)
     for _attempt in range(TOKEN_RETRY_LIMIT):
         token = generate_public_token()
         try:
@@ -91,13 +115,22 @@ async def create_product(
                         """
                         INSERT INTO products (
                             code,
+                            name,
                             public_token,
                             created_at,
                             updated_at
-                        ) VALUES (%s, %s, now(), now())
-                        RETURNING id, code, public_token, status, current_version_id
+                        ) VALUES (%s, %s, %s, now(), now())
+                        RETURNING
+                            id,
+                            code,
+                            name,
+                            public_token,
+                            status,
+                            current_version_id,
+                            created_at,
+                            updated_at
                         """,
-                        (code, token),
+                        (code, name, token),
                     )
                     row = await cursor.fetchone()
                     if row is None:
@@ -123,3 +156,54 @@ async def create_product(
                 continue
             raise
     raise AppError("token_generation_failed", "无法生成公开标识, 请重试。", 503)
+
+
+async def list_products(database: Database, *, limit: int, offset: int) -> list[Product]:
+    """Return one stable page ordered by the most recently updated product."""
+
+    async with database.connection() as connection:
+        cursor = await connection.execute(
+            """
+            SELECT
+                id,
+                code,
+                name,
+                public_token,
+                status,
+                current_version_id,
+                created_at,
+                updated_at
+            FROM products
+            ORDER BY updated_at DESC, id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
+        )
+        rows = await cursor.fetchall()
+    return [_product_from_row(row) for row in rows]
+
+
+async def get_product(database: Database, product_id: int) -> Product:
+    """Load one product or raise the shared safe not-found response."""
+
+    async with database.connection() as connection:
+        cursor = await connection.execute(
+            """
+            SELECT
+                id,
+                code,
+                name,
+                public_token,
+                status,
+                current_version_id,
+                created_at,
+                updated_at
+            FROM products
+            WHERE id = %s
+            """,
+            (product_id,),
+        )
+        row = await cursor.fetchone()
+    if row is None:
+        raise AppError("product_not_found", "产品不存在。", 404)
+    return _product_from_row(row)

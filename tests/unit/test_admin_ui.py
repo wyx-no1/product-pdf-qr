@@ -20,6 +20,7 @@ async def test_admin_pages_are_accessible_without_database(path: str) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert 'id="create-form"' in response.text
+    assert 'id="product-table"' in response.text
     assert 'id="detail-view"' in response.text
 
 
@@ -39,8 +40,12 @@ async def test_admin_page_contains_complete_browser_workflow() -> None:
     assert 'body.append("actor_id", ACTOR_ID)' in page
     assert 'body.append("file", file)' in page
     assert "/api/products/${currentProduct.id}/pdf" in page
-    assert "product.qrcode_url" in page
-    assert "当前页面没有产品数据，请先创建产品。" in page  # noqa: RUF001
+    assert 'fetch("/api/products?limit=100&offset=0")' in page
+    assert "fetch(`/api/products/${productId}`)" in page
+    assert "未找到该产品，可能已被移除。" in page  # noqa: RUF001
+    assert "暂无产品。请使用上方表单创建第一个产品。" in page
+    assert "数据已丢失" not in page
+    assert "数据不可用" not in page
 
 
 async def test_admin_page_routes_do_not_expand_openapi_surface() -> None:

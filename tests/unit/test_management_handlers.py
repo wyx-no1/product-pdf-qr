@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Never
@@ -24,6 +25,8 @@ from product_pdf_qr.domains.product.router import (
     ProductCreateRequest,
     create_product_endpoint,
     download_qrcode,
+    get_product_endpoint,
+    list_products_endpoint,
     retry_qrcode,
     upload_pdf_endpoint,
 )
@@ -42,12 +45,16 @@ from tests.unit.test_business_services import (
 
 
 def product_row() -> dict[str, object]:
+    now = datetime(2026, 8, 4, 9, 30, tzinfo=UTC)
     return {
         "id": 5,
         "code": "A001",
+        "name": "测试产品",
         "public_token": "A" * 26,
         "status": "active",
         "current_version_id": None,
+        "created_at": now,
+        "updated_at": now,
     }
 
 
@@ -69,12 +76,13 @@ async def test_create_download_and_retry_qrcode_handlers(tmp_path: Path) -> None
     create_database = as_database(ScriptedDatabase(ScriptedConnection([product_row(), None])))
 
     created = await create_product_endpoint(
-        ProductCreateRequest(code=" a001 "),
+        ProductCreateRequest(code=" a001 ", name=" 测试产品 "),
         create_database,
         qrcode_service,
     )
 
     assert created.code == "A001"
+    assert created.name == "测试产品"
     assert created.public_url.endswith("/p/" + ("A" * 26))
     assert created.qrcode_status == "ready"
 
@@ -115,7 +123,7 @@ async def test_create_survives_qrcode_generation_failure(
     )
 
     created = await create_product_endpoint(
-        ProductCreateRequest(code="A001"),
+        ProductCreateRequest(code="A001", name="测试产品"),
         database,
         qrcode_service,
     )
@@ -123,6 +131,29 @@ async def test_create_survives_qrcode_generation_failure(
     assert created.id == 5
     assert created.qrcode_status == "generation_failed"
     assert not (qrcode_service.cache_root / "A001.png").exists()
+
+
+@pytest.mark.anyio
+async def test_list_and_detail_handlers_expose_persisted_state(tmp_path: Path) -> None:
+    historical = {**product_row(), "id": 4, "code": "OLD", "name": None}
+    uploaded = {**product_row(), "current_version_id": 17}
+    list_database = as_database(ScriptedDatabase(ScriptedConnection([[uploaded, historical]])))
+
+    products = await list_products_endpoint(list_database, limit=25, offset=5)
+
+    assert [product.name for product in products] == ["测试产品", None]
+    assert [product.pdf_status for product in products] == ["uploaded", "not_uploaded"]
+
+    qrcode_service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
+    await qrcode_service.get_or_generate("A001", "A" * 26)
+    detail_database = as_database(ScriptedDatabase(ScriptedConnection([uploaded])))
+
+    detail = await get_product_endpoint(5, detail_database, qrcode_service)
+
+    assert detail.name == "测试产品"
+    assert detail.pdf_status == "uploaded"
+    assert detail.qrcode_status == "ready"
+    assert detail.public_url.endswith("/p/" + ("A" * 26))
 
 
 @pytest.mark.anyio

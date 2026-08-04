@@ -10,6 +10,9 @@ def test_business_loop_routes_are_present_and_out_of_scope_routes_absent() -> No
     paths = schema["paths"]
 
     assert "/api/products" in paths
+    assert set(paths["/api/products"]) == {"get", "post"}
+    assert "/api/products/{product_id}" in paths
+    assert set(paths["/api/products/{product_id}"]) == {"get"}
     assert "/api/products/{product_id}/pdf" in paths
     assert "/api/products/{product_id}/qrcode" in paths
     assert "/api/products/{product_id}/qrcode/retry" in paths
@@ -23,3 +26,16 @@ def test_business_loop_routes_are_present_and_out_of_scope_routes_absent() -> No
     assert "/delete" not in serialized
     assert "/restore" not in serialized
     assert "/disable" not in serialized
+
+
+def test_product_create_and_read_contracts_include_persisted_name() -> None:
+    schema = create_app().openapi()
+    create_schema = schema["components"]["schemas"]["ProductCreateRequest"]
+    detail_schema = schema["components"]["schemas"]["ProductDetailResponse"]
+
+    assert set(create_schema["required"]) == {"code", "name"}
+    assert create_schema["properties"]["name"]["maxLength"] == 120
+    assert "name" in detail_schema["properties"]
+    assert {"created_at", "updated_at", "pdf_status", "qrcode_status"}.issubset(
+        detail_schema["required"]
+    )
