@@ -213,11 +213,45 @@ Validate the resulting record before gate use:
 uv run python -m scripts.ao advisor-validate \
   --repo /absolute/path/to/repository \
   --metadata /absolute/path/to/docs/evidence/pr-123/metadata.md \
-  --record /absolute/path/to/advisor-record.json
+  --record /absolute/path/to/advisor-record.json \
+  --log /absolute/path/to/advisor-validation-events.jsonl
 ```
 
-The record is valid only when the Advisor completed at the Evidence SHA and the PR
-has no later non-Evidence code changes.
+The Resolver record binds the opinion to:
+
+- the PR number, Evidence commit, Evidence metadata path, and Evidence code commit;
+- the actual reviewed commit;
+- a detached workspace lifecycle containing its absolute path, commit, PR,
+  timezone-qualified creation and destruction times, and destruction reason
+  (`normal`, `timeout`, or `exception`).
+
+Validation accepts an opinion only when the Evidence commit exists, is the direct
+child of the bound code commit, contains the supplied `metadata.md` at the expected
+PR path, and remains in the current PR history. The reviewed SHA and lifecycle SHA
+must both equal the Evidence code SHA. The lifecycle must be complete and
+self-consistent, the recorded workspace must use the Resolver naming contract and
+must no longer be registered or present, and a default/current repository workspace
+is always rejected. A current PR head may differ from the reviewed SHA only through
+`docs/evidence/**`; any later code commit invalidates the opinion.
+
+Every rejection is `indeterminate`, never warning or neutral. The JSON result names
+the failed check and reason, and the validator appends the same information to the
+validation event log. Only a result with `valid: true` and `gate_status: valid` may
+enter G-10.
+
+### Advisor record trust boundary
+
+This first version can mechanically verify that the reviewed code SHA, Evidence
+binding, current PR code, and lifecycle fields agree. It prevents process mistakes
+such as reviewing the default workspace, reading `main`, or accepting an opinion for
+the wrong code version.
+
+It cannot prove that the workspace was actually created by the Resolver. The
+lifecycle record is produced locally and has no external notary, cryptographic
+signature, or independently issued attestation; a repository writer can fabricate a
+self-consistent record. This mechanism therefore does not defend against deliberate
+forgery by someone with repository write access. Unforgeable Resolver attestation,
+identity signing, and stronger provenance are separate future enhancements.
 
 ## Stale worktrees
 
