@@ -9,17 +9,17 @@
 | PR URL | https://github.com/wyx-no1/product-pdf-qr/pull/12 |
 | Source branch | `feat/ao-p0-1-evidence-snapshot` |
 | Target branch | `main` |
-| Code commit SHA | `811693afe7e6de4956f5925f830f5e3d75ee3e15` |
+| Code commit SHA | `fbe0bae564f3ed90f8219ca3098812d9b072dcc8` |
 | Merge base | `af82f581c83bd023b4d17ccc4231a2802acf6f2c` |
-| CI run ID | `30799823655` |
+| CI run ID | `30866556420` |
 | CI conclusion | `success` |
-| CI URL | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30799823655 |
+| CI URL | https://github.com/wyx-no1/product-pdf-qr/actions/runs/30866556420 |
 | CI definition status | `requires-re-review` |
 | Trusted CI definition hash | `9e55e4f64d866ad012491e981e9305336bbc73f817052d6152efed541e47a62f` |
-| Candidate CI definition hash | `940367e05420714ab8dc20224ad1f98c05116e807098e27dc8fd653b2ad4f77e` |
-| Created at | `2026-08-03T09:06:39.903010+00:00` |
+| Candidate CI definition hash | `76dcc2b1d4815044d1a3976d558556ddd8bd613893a2e62b537f073adcb5cc1d` |
+| Created at | `2026-08-04T00:47:03.913572+00:00` |
 
-> The CI result above belongs to code commit `811693afe7e6de4956f5925f830f5e3d75ee3e15`, not to the later
+> The CI result above belongs to code commit `fbe0bae564f3ed90f8219ca3098812d9b072dcc8`, not to the later
 > Evidence commit. The Evidence commit must not be used as a new generation trigger;
 > doing so would create a CI/Evidence loop.
 
@@ -33,11 +33,11 @@
 | Metric | Value |
 |---|---:|
 | Changed files | 21 |
-| Added lines | 5003 |
+| Added lines | 5148 |
 | Deleted lines | 8 |
 
 The authoritative patch was generated with the three-dot comparison
-`git diff origin/main...811693afe7e6de4956f5925f830f5e3d75ee3e15 -- . ':(exclude)docs/evidence/**'`.
+`git diff origin/main...fbe0bae564f3ed90f8219ca3098812d9b072dcc8 -- . ':(exclude)docs/evidence/**'`.
 The entire `docs/evidence/**` tree is excluded to prevent self-reference. No source
 files are copied into this directory.
 
@@ -45,6 +45,9 @@ files are copied into this directory.
 
 | Commit | Subject |
 |---|---|
+| `fbe0bae564f3ed90f8219ca3098812d9b072dcc8` | docs: define trusted execution surface |
+| `9c6b95b1af263685e51a6072dabaca710252661c` | fix: trust Python startup hooks |
+| `acf3240b180db0af823839f777585b20b9d5c79c` | docs: add PR12 review evidence |
 | `811693afe7e6de4956f5925f830f5e3d75ee3e15` | fix: reject nested CI config overrides |
 | `862d57d3948d715d127364ae2deb287ba12a7c0d` | fix: pin Ruff CI configuration |
 | `f8f62b8af7ff4baa15387d1eecb1bf9ee9b0c084` | docs: add PR12 review evidence |
@@ -69,6 +72,6 @@ eliminate selection bias or blind spots. `diff.patch` is the complete authoritat
 change record for scope questions, excluding only `docs/evidence/**`.
 
 Evidence does not replace source review. An Advisor must read both this snapshot and
-the source at code commit `811693afe7e6de4956f5925f830f5e3d75ee3e15`. If Evidence and source disagree, source is
+the source at code commit `fbe0bae564f3ed90f8219ca3098812d9b072dcc8`. If Evidence and source disagree, source is
 authoritative and the Evidence error must be reported. The tool cannot mechanically
 prove that an Advisor actually read the source.

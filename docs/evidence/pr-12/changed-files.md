@@ -1,12 +1,12 @@
 # Changed files for PR #12
 
-Comparison: `origin/main...811693afe7e6de4956f5925f830f5e3d75ee3e15` (three-dot)
+Comparison: `origin/main...fbe0bae564f3ed90f8219ca3098812d9b072dcc8` (three-dot)
 
 | Metric | Value |
 |---|---:|
 | Merge base | `af82f581c83bd023b4d17ccc4231a2802acf6f2c` |
 | Changed files | 21 |
-| Added lines | 5003 |
+| Added lines | 5148 |
 | Deleted lines | 8 |
 
 ## Added files
@@ -44,11 +44,11 @@ Run the following command from any worktree for this repository. It must produce
 output; any output means a protected boundary changed:
 
 ```bash
-git diff origin/main...811693afe7e6de4956f5925f830f5e3d75ee3e15 -- migrations/ docs/requirements-v1.md docs/requirements-v2.md CLAUDE.md docs/quality-gates-v1.md docs/advisor-protocol-v1.md docs/decision-register-v1.md docs/test-plan-v1.md
+git diff origin/main...fbe0bae564f3ed90f8219ca3098812d9b072dcc8 -- migrations/ docs/requirements-v1.md docs/requirements-v2.md CLAUDE.md docs/quality-gates-v1.md docs/advisor-protocol-v1.md docs/decision-register-v1.md docs/test-plan-v1.md
 ```
 
 The complete changed-path list can be reproduced without relying on this file:
 
 ```bash
-git diff --name-status origin/main...811693afe7e6de4956f5925f830f5e3d75ee3e15 -- . ':(exclude)docs/evidence/**'
+git diff --name-status origin/main...fbe0bae564f3ed90f8219ca3098812d9b072dcc8 -- . ':(exclude)docs/evidence/**'
 ```

@@ -264,10 +264,10 @@ index 0000000..2bd3938
 +"""Repository automation scripts."""
 diff --git a/scripts/ao/README.md b/scripts/ao/README.md
 new file mode 100644
-index 0000000..501437e
+index 0000000..2d2fb57
 --- /dev/null
 +++ b/scripts/ao/README.md
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,241 @@
 +# AO Evidence and Advisor workspace tools
 +
 +These repository-local Python 3.12 tools implement the two parts of AO P0-1. They
@@ -313,6 +313,17 @@ index 0000000..501437e
 +The recursive roots cover executable test, AO, workflow/action, and Docker helper
 +code, including newly added files. Product source, migration revisions, and reviewed
 +documents remain the subjects being tested rather than the gate definition.
++
++### Trusted Execution Surface
++
++The Trusted Execution Surface is the repository-controlled execution and
++configuration surface that can influence a gate's result. It is not every file name
++that a tool could conceivably discover under a different invocation or future
++configuration. Gate commands, their active configuration, executable helpers,
++startup hooks, and the configuration that determines discovery boundaries belong to
++the surface; ordinary files that cannot enter the current gate execution path do
++not.
++
 +Both CI Ruff invocations pass `--config pyproject.toml`, which makes that hashed root
 +file the configuration for every analyzed path and disables Ruff's otherwise
 +hierarchical closest-config discovery. A candidate `src/ruff.toml`,
@@ -324,13 +335,56 @@ index 0000000..501437e
 +make it ineffective. Because this scan is basename-based over the complete candidate
 +commit, a matching file added under any future directory is covered automatically.
 +
-+The other CI tools do not leave the same unbounded closest-config path:
++### Execution-path boundary
 +
-+- pytest is invoked from the repository root, whose hashed `pyproject.toml` fixes
-+  `testpaths = ["tests"]`; `-c pyproject.toml` pins that config, and its hierarchical
-+  `conftest.py` loading is therefore bounded to the hashed root `conftest.py`
-+  sentinel and recursive `tests/**` tree. All other pytest 9 root config names are
-+  also represented by missing-file sentinels as defense in depth;
++Membership in the Trusted Execution Surface follows the gate's actual execution
++path, not an enumeration of every hypothetical location where a configuration or
++plugin file might be placed. Hypothetical locations are unbounded: arbitrary present
++and future directories could contain a recognized name. Actual execution paths are
++bounded and mechanically verifiable. Hashing files that cannot enter those paths
++would make ordinary product changes continually require manual review and would
++degrade the mechanism into an always-manual gate without increasing protection.
++
++This rule is safe only because the configuration that selects each execution path is
++itself part of the Trusted Execution Surface. If a discovery boundary could be
++changed without changing the trusted definition hash, limiting coverage to the
++current path would be a bypassable assumption. For pytest, the discovery boundary is
++set by `testpaths` in `pyproject.toml`; that file is covered both by the root exact
++manifest and the full-tree `pyproject.toml` scan. A PR therefore cannot silently
++widen pytest discovery while preserving the trusted hash: changing `testpaths`
++produces `requires-re-review`.
++
++Python startup hooks have different loading semantics. `uv sync` installs the project
++editably, so an otherwise ordinary `src/sitecustomize.py` can execute when the
++interpreter starts, before pytest or mypy processes their own discovery settings.
++Every `sitecustomize` and `usercustomize` module form is therefore hashed across the
++full tree: the `.py` basenames, extension/bytecode-style basenames, and all files
++below same-named package directories. This is path-wide rather than limited to
++today's `src/` layout; if the hashed project configuration later changes the editable
++source root, the hook scan still covers the new directory.
++
++### Current pytest discovery boundary
++
++Pytest is invoked from the repository root with `-c pyproject.toml`, and the trusted
++configuration fixes `testpaths = ["tests"]`. The complete `tests/**` tree and the
++root `conftest.py` sentinel are in the trusted definition. A `conftest.py` under
++`src/`, migrations, or another product directory is outside that discovery path and
++is not loaded by the current pytest gate. If `testpaths` changes in the future, the
++trusted `pyproject.toml` changes too, so the candidate is marked
++`requires-re-review` before the expanded discovery path can be trusted.
++
++`sitecustomize` and `conftest` are intentionally handled differently because their
++loaders are different, not because they are held to different trust standards.
++Interpreter startup can load `sitecustomize` independently of pytest's `testpaths`,
++so startup hooks need the recursive module-name coverage above. Pytest loads
++`conftest` only within its configured discovery boundary, so the trusted root
++sentinel and recursive `tests/**` tree cover the actual path without an unbounded
++repository-wide `conftest.py` scan.
++
++Other discovery surfaces are bounded as follows:
++
++- all other pytest 9 root config names are represented by missing-file sentinels as
++  defense in depth;
 +- mypy selects one configuration from the invocation directory rather than one per
 +  analyzed file; `--config-file pyproject.toml` pins it, and every supported root
 +  candidate (`mypy.ini`, `.mypy.ini`, `pyproject.toml`, and `setup.cfg`) is hashed;
@@ -2385,10 +2439,10 @@ index 0000000..5ea505d
 +    target_url: str
 diff --git a/scripts/ao/trust.py b/scripts/ao/trust.py
 new file mode 100644
-index 0000000..943c7cb
+index 0000000..37aac40
 --- /dev/null
 +++ b/scripts/ao/trust.py
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,225 @@
 +from __future__ import annotations
 +
 +import hashlib
@@ -2462,6 +2516,18 @@ index 0000000..943c7cb
 +        ".ruff.toml",
 +        "pyproject.toml",
 +        "ruff.toml",
++        "sitecustomize.py",
++        "usercustomize.py",
++    }
++)
++
++# Python imports these optional modules during site initialization. Hash every
++# importable file form and every file below a same-named package anywhere in the
++# Git tree; the editable source root is itself controlled by hashed pyproject.toml.
++TRUSTED_CI_RECURSIVE_MODULE_NAMES = frozenset(
++    {
++        "sitecustomize",
++        "usercustomize",
 +    }
 +)
 +
@@ -2531,7 +2597,7 @@ index 0000000..943c7cb
 +    all_files = repository.git("ls-tree", "-r", commit_sha, "--", ".").stdout
 +    for line in all_files.splitlines():
 +        path, value = _parse_tree_entry(line)
-+        if PurePosixPath(path).name in TRUSTED_CI_RECURSIVE_FILE_NAMES:
++        if _is_recursive_trust_path(path):
 +            _record_entry(entries, path, value)
 +    for root in TRUSTED_CI_TREE_PATHS:
 +        output = repository.git("ls-tree", "-r", commit_sha, "--", root).stdout
@@ -2539,6 +2605,18 @@ index 0000000..943c7cb
 +            path, value = _parse_tree_entry(line)
 +            _record_entry(entries, path, value)
 +    return entries
++
++
++def _is_recursive_trust_path(path: str) -> bool:
++    parsed = PurePosixPath(path)
++    file_name = parsed.name
++    if file_name in TRUSTED_CI_RECURSIVE_FILE_NAMES:
++        return True
++    if any(
++        file_name.startswith(f"{module_name}.") for module_name in TRUSTED_CI_RECURSIVE_MODULE_NAMES
++    ):
++        return True
++    return any(part in TRUSTED_CI_RECURSIVE_MODULE_NAMES for part in parsed.parts[:-1])
 +
 +
 +def _record_entry(entries: dict[str, str], path: str, value: str) -> None:
@@ -4250,12 +4328,13 @@ index 0000000..5dbcc85
 +    assert attestation.target_url.endswith("/actions/runs/88")
 diff --git a/tests/ao/test_trust.py b/tests/ao/test_trust.py
 new file mode 100644
-index 0000000..e2a2e08
+index 0000000..f4b1c64
 --- /dev/null
 +++ b/tests/ao/test_trust.py
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,396 @@
 +from __future__ import annotations
 +
++import os
 +import subprocess
 +import sys
 +from pathlib import Path
@@ -4266,6 +4345,7 @@ index 0000000..e2a2e08
 +from scripts.ao.trust import (
 +    TRUSTED_CI_EXACT_PATHS,
 +    TRUSTED_CI_RECURSIVE_FILE_NAMES,
++    TRUSTED_CI_RECURSIVE_MODULE_NAMES,
 +    TRUSTED_CI_TREE_PATHS,
 +    TRUSTED_CI_WORKFLOW_PATH,
 +    CIDefinitionComparison,
@@ -4492,6 +4572,65 @@ index 0000000..e2a2e08
 +    assert comparison.differing_paths == ("pyproject.toml",)
 +
 +
++@pytest.mark.parametrize(
++    "path",
++    [
++        "src/sitecustomize.py",
++        "src/usercustomize.py",
++        "src/sitecustomize/__init__.py",
++        "future/python-path/usercustomize/helper.py",
++    ],
++)
++def test_python_startup_hook_anywhere_requires_re_review(
++    tmp_path: Path,
++    path: str,
++) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    hook = candidate / path
++    hook.parent.mkdir(parents=True, exist_ok=True)
++    hook.write_text("import os\n\nos._exit(0)\n", encoding="utf-8")
++    candidate_sha = commit_paths(
++        candidate,
++        "ci: add Python startup hook",
++        [path],
++    )
++
++    comparison = _compare(trusted, candidate, candidate_sha)
++
++    assert comparison.status == "requires-re-review"
++    assert comparison.differing_paths == (path,)
++
++
++def test_editable_sitecustomize_attack_exits_before_gate_command(
++    tmp_path: Path,
++) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    hook = candidate / "src/sitecustomize.py"
++    hook.parent.mkdir(parents=True)
++    hook.write_text(
++        "import os\n\nos._exit(0)\n",
++        encoding="utf-8",
++    )
++    candidate_sha = commit_paths(
++        candidate,
++        "ci: bypass Python gate startup",
++        ["src/sitecustomize.py"],
++    )
++    environment = os.environ.copy()
++    environment["PYTHONPATH"] = str(candidate / "src")
++
++    bypassed = subprocess.run(
++        [sys.executable, "-c", "raise SystemExit(23)"],
++        env=environment,
++        check=False,
++    )
++    comparison = _compare(trusted, candidate, candidate_sha)
++
++    assert bypassed.returncode == 0
++    assert comparison.status == "requires-re-review"
++    assert comparison.differing_paths == ("src/sitecustomize.py",)
++
++
 +def test_differently_named_candidate_workflow_cannot_spoof_ci_run(tmp_path: Path) -> None:
 +    trusted, candidate = _repositories(tmp_path)
 +    candidate_sha = git(candidate, "rev-parse", "HEAD").stdout.strip()
@@ -4532,6 +4671,12 @@ index 0000000..e2a2e08
 +        ".ruff.toml",
 +        "pyproject.toml",
 +        "ruff.toml",
++        "sitecustomize.py",
++        "usercustomize.py",
++    }
++    assert TRUSTED_CI_RECURSIVE_MODULE_NAMES == {
++        "sitecustomize",
++        "usercustomize",
 +    }
 +    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
 +    assert "mypy --config-file pyproject.toml" in makefile
