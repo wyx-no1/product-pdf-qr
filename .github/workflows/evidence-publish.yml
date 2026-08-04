@@ -1,0 +1,173 @@
+name: Evidence Publish
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].number > 0
+    runs-on: ubuntu-latest
+    concurrency:
+      group: evidence-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+      statuses: write
+    steps:
+      # workflow_run loads this workflow from the default branch. Executable AO
+      # code is checked out from that trusted branch, never from the PR.
+      - name: Check out trusted publisher code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+
+      # This checkout is untrusted data. No module, script, action, or hook from
+      # it is executed while the write token is available.
+      - name: Check out candidate data
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_branch }}
+          path: candidate
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Publish and attest Evidence Snapshot
+        working-directory: trusted
+        env:
+          CODE_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          status_context="AO / evidence-snapshot"
+
+          post_status() {
+            gh api \
+              --method POST \
+              "repos/${GITHUB_REPOSITORY}/statuses/$1" \
+              -f state="$2" \
+              -f context="$status_context" \
+              -f description="$3" \
+              -f target_url="$RUN_URL" >/dev/null
+          }
+
+          record_failure() {
+            current_sha="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
+            current_sha="${current_sha:-$CODE_SHA}"
+            post_status "$current_sha" failure "Evidence publish/verification failed; source CI $RUN_ID"
+            if [[ "$current_sha" != "$CODE_SHA" ]]; then
+              post_status "$CODE_SHA" failure "Evidence child verification failed; source CI $RUN_ID"
+            fi
+          }
+          trap record_failure ERR
+
+          # workflow_run identifies a GitHub-authenticated run, but the candidate
+          # controls repository gate inputs. Compare the complete trusted manifest
+          # (workflow/actions, Make/config/lock, tests, and validation helpers)
+          # against the default-branch checkout before accepting the conclusion.
+          source_workflow_path="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq .path
+          )"
+          definition="$(
+            python -m scripts.ao ci-verify-definition \
+              --trusted-repo . \
+              --candidate-repo ../candidate \
+              --candidate-sha "$CODE_SHA" \
+              --source-run-path "$source_workflow_path"
+          )"
+          definition_status="$(
+            python -c 'import json,sys; print(json.load(sys.stdin)["status"])' \
+              <<<"$definition"
+          )"
+          trusted_definition_hash="$(
+            python -c 'import json,sys; print(json.load(sys.stdin)["trusted_definition_hash"])' \
+              <<<"$definition"
+          )"
+          if [[ "$definition_status" != "trusted" ]]; then
+            post_status "$CODE_SHA" failure \
+              "Trusted CI definition changed; re-review required"
+            trap - ERR
+            exit 1
+          fi
+
+          gh auth setup-git
+          git -C ../candidate config user.name "github-actions[bot]"
+          git -C ../candidate config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          result="$(
+            python -m scripts.ao evidence \
+              --repo ../candidate \
+              --pr "$PR_NUMBER" \
+              --ci-run-id "$RUN_ID" \
+              --trusted-ci-definition-hash "$trusted_definition_hash"
+          )"
+          evidence_sha="$(
+            python -c 'import json,sys; data=json.load(sys.stdin); print(data.get("evidence_commit_sha") or data.get("head_sha") or "")' \
+              <<<"$result"
+          )"
+          generation_result="$(
+            python -c 'import json,sys; print(json.load(sys.stdin)["result"])' \
+              <<<"$result"
+          )"
+          test -n "$evidence_sha"
+
+          if [[ "$generation_result" == "skipped" ]]; then
+            # The generator already verified all five files plus the exact-SHA,
+            # server-authenticated publisher attestation before returning skip.
+            # Repeat that trusted verification here as defense in depth. A skip
+            # may preserve an existing green status but may never mint one.
+            python -m scripts.ao evidence-verify-head \
+              --repo ../candidate \
+              --pr "$PR_NUMBER" \
+              --evidence-sha "$evidence_sha" \
+              --trusted-ci-definition-hash "$trusted_definition_hash" \
+              --require-prior-attestation
+            trap - ERR
+            exit 0
+          fi
+          test "$generation_result" = "success"
+
+          verification="$(
+            python -m scripts.ao evidence-verify-head \
+              --repo ../candidate \
+              --pr "$PR_NUMBER" \
+              --evidence-sha "$evidence_sha" \
+              --trusted-ci-definition-hash "$trusted_definition_hash"
+          )"
+          verified_parent="$(
+            python -c 'import json,sys; print(json.load(sys.stdin)["code_commit_sha"])' \
+              <<<"$verification"
+          )"
+          verified_run="$(
+            python -c 'import json,sys; print(json.load(sys.stdin)["ci_run_id"])' \
+              <<<"$verification"
+          )"
+
+          # Only the same trusted invocation that generated all five files may
+          # mint the first green attestation for this immutable Evidence SHA.
+          post_status "$evidence_sha" success \
+            "Evidence-only child of ${verified_parent:0:12}; source CI $verified_run"
+          post_status "$CODE_SHA" success \
+            "Verified Evidence ${evidence_sha:0:12}; source CI $verified_run"
+          trap - ERR

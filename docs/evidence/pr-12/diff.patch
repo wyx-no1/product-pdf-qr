@@ -1,0 +1,5322 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 9f2358e..a881d01 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -14,6 +14,8 @@ jobs:
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
+       - uses: astral-sh/setup-uv@v6
+         with:
+           version: "0.12.1"
+@@ -37,6 +39,8 @@ jobs:
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
+       - uses: astral-sh/setup-uv@v6
+         with:
+           version: "0.12.1"
+@@ -66,6 +70,8 @@ jobs:
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
+       - run: cp .env.example .env
+       - run: docker compose build --pull app migrate
+       - name: Verify repeated clean-volume startup ordering
+diff --git a/.github/workflows/evidence-publish.yml b/.github/workflows/evidence-publish.yml
+new file mode 100644
+index 0000000..3c807b9
+--- /dev/null
++++ b/.github/workflows/evidence-publish.yml
+@@ -0,0 +1,173 @@
++name: Evidence Publish
++
++on:
++  workflow_run:
++    workflows:
++      - CI
++    types:
++      - completed
++
++permissions:
++  contents: read
++
++jobs:
++  publish:
++    if: >-
++      github.event.workflow_run.event == 'pull_request' &&
++      github.event.workflow_run.conclusion == 'success' &&
++      github.event.workflow_run.head_repository.full_name == github.repository &&
++      github.event.workflow_run.pull_requests[0].number > 0
++    runs-on: ubuntu-latest
++    concurrency:
++      group: evidence-${{ github.event.workflow_run.head_branch }}
++      cancel-in-progress: false
++    permissions:
++      actions: read
++      contents: write
++      pull-requests: read
++      statuses: write
++    steps:
++      # workflow_run loads this workflow from the default branch. Executable AO
++      # code is checked out from that trusted branch, never from the PR.
++      - name: Check out trusted publisher code
++        uses: actions/checkout@v4
++        with:
++          ref: ${{ github.event.repository.default_branch }}
++          path: trusted
++          persist-credentials: false
++
++      # This checkout is untrusted data. No module, script, action, or hook from
++      # it is executed while the write token is available.
++      - name: Check out candidate data
++        uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++          ref: ${{ github.event.workflow_run.head_branch }}
++          path: candidate
++          persist-credentials: false
++
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.12"
++
++      - name: Publish and attest Evidence Snapshot
++        working-directory: trusted
++        env:
++          CODE_SHA: ${{ github.event.workflow_run.head_sha }}
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
++          RUN_ID: ${{ github.event.workflow_run.id }}
++          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
++        run: |
++          set -euo pipefail
++          status_context="AO / evidence-snapshot"
++
++          post_status() {
++            gh api \
++              --method POST \
++              "repos/${GITHUB_REPOSITORY}/statuses/$1" \
++              -f state="$2" \
++              -f context="$status_context" \
++              -f description="$3" \
++              -f target_url="$RUN_URL" >/dev/null
++          }
++
++          record_failure() {
++            current_sha="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
++            current_sha="${current_sha:-$CODE_SHA}"
++            post_status "$current_sha" failure "Evidence publish/verification failed; source CI $RUN_ID"
++            if [[ "$current_sha" != "$CODE_SHA" ]]; then
++              post_status "$CODE_SHA" failure "Evidence child verification failed; source CI $RUN_ID"
++            fi
++          }
++          trap record_failure ERR
++
++          # workflow_run identifies a GitHub-authenticated run, but the candidate
++          # controls repository gate inputs. Compare the complete trusted manifest
++          # (workflow/actions, Make/config/lock, tests, and validation helpers)
++          # against the default-branch checkout before accepting the conclusion.
++          source_workflow_path="$(
++            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq .path
++          )"
++          definition="$(
++            python -m scripts.ao ci-verify-definition \
++              --trusted-repo . \
++              --candidate-repo ../candidate \
++              --candidate-sha "$CODE_SHA" \
++              --source-run-path "$source_workflow_path"
++          )"
++          definition_status="$(
++            python -c 'import json,sys; print(json.load(sys.stdin)["status"])' \
++              <<<"$definition"
++          )"
++          trusted_definition_hash="$(
++            python -c 'import json,sys; print(json.load(sys.stdin)["trusted_definition_hash"])' \
++              <<<"$definition"
++          )"
++          if [[ "$definition_status" != "trusted" ]]; then
++            post_status "$CODE_SHA" failure \
++              "Trusted CI definition changed; re-review required"
++            trap - ERR
++            exit 1
++          fi
++
++          gh auth setup-git
++          git -C ../candidate config user.name "github-actions[bot]"
++          git -C ../candidate config user.email "41898282+github-actions[bot]@users.noreply.github.com"
++
++          result="$(
++            python -m scripts.ao evidence \
++              --repo ../candidate \
++              --pr "$PR_NUMBER" \
++              --ci-run-id "$RUN_ID" \
++              --trusted-ci-definition-hash "$trusted_definition_hash"
++          )"
++          evidence_sha="$(
++            python -c 'import json,sys; data=json.load(sys.stdin); print(data.get("evidence_commit_sha") or data.get("head_sha") or "")' \
++              <<<"$result"
++          )"
++          generation_result="$(
++            python -c 'import json,sys; print(json.load(sys.stdin)["result"])' \
++              <<<"$result"
++          )"
++          test -n "$evidence_sha"
++
++          if [[ "$generation_result" == "skipped" ]]; then
++            # The generator already verified all five files plus the exact-SHA,
++            # server-authenticated publisher attestation before returning skip.
++            # Repeat that trusted verification here as defense in depth. A skip
++            # may preserve an existing green status but may never mint one.
++            python -m scripts.ao evidence-verify-head \
++              --repo ../candidate \
++              --pr "$PR_NUMBER" \
++              --evidence-sha "$evidence_sha" \
++              --trusted-ci-definition-hash "$trusted_definition_hash" \
++              --require-prior-attestation
++            trap - ERR
++            exit 0
++          fi
++          test "$generation_result" = "success"
++
++          verification="$(
++            python -m scripts.ao evidence-verify-head \
++              --repo ../candidate \
++              --pr "$PR_NUMBER" \
++              --evidence-sha "$evidence_sha" \
++              --trusted-ci-definition-hash "$trusted_definition_hash"
++          )"
++          verified_parent="$(
++            python -c 'import json,sys; print(json.load(sys.stdin)["code_commit_sha"])' \
++              <<<"$verification"
++          )"
++          verified_run="$(
++            python -c 'import json,sys; print(json.load(sys.stdin)["ci_run_id"])' \
++              <<<"$verification"
++          )"
++
++          # Only the same trusted invocation that generated all five files may
++          # mint the first green attestation for this immutable Evidence SHA.
++          post_status "$evidence_sha" success \
++            "Evidence-only child of ${verified_parent:0:12}; source CI $verified_run"
++          post_status "$CODE_SHA" success \
++            "Verified Evidence ${evidence_sha:0:12}; source CI $verified_run"
++          trap - ERR
+diff --git a/Makefile b/Makefile
+index 1edb20d..f7ab7f4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -15,30 +15,34 @@ build-reproducible:
+ 
+ typecheck:
+ 	mkdir -p reports
+-	$(UV) run mypy
++	$(UV) run mypy --config-file pyproject.toml
+ 
+ lint:
+ 	mkdir -p reports
+-	$(UV) run ruff check --output-format junit --output-file reports/ruff.xml .
+-	$(UV) run ruff format --check .
++	$(UV) run ruff check --config pyproject.toml \
++		--output-format junit --output-file reports/ruff.xml .
++	$(UV) run ruff format --config pyproject.toml --check .
+ 
+ format:
+-	$(UV) run ruff check --fix .
+-	$(UV) run ruff format .
++	$(UV) run ruff check --config pyproject.toml --fix .
++	$(UV) run ruff format --config pyproject.toml .
+ 
+ test:
+ 	mkdir -p reports
+-	$(UV) run pytest --cov --cov-report=term-missing --cov-report=xml:reports/coverage.xml \
++	$(UV) run pytest -c pyproject.toml --cov --cov-config=pyproject.toml \
++		--cov-report=term-missing --cov-report=xml:reports/coverage.xml \
+ 		--junitxml=reports/pytest.xml
+ 
+ test-unit:
+ 	mkdir -p reports
+-	$(UV) run pytest -m "not integration" --cov --cov-report=term-missing \
++	$(UV) run pytest -c pyproject.toml -m "not integration" --cov \
++		--cov-config=pyproject.toml --cov-report=term-missing \
+ 		--cov-report=xml:reports/coverage-unit.xml --junitxml=reports/pytest-unit.xml
+ 
+ test-integration:
+ 	mkdir -p reports
+-	$(UV) run pytest -m integration --junitxml=reports/pytest-integration.xml
++	$(UV) run pytest -c pyproject.toml -m integration \
++		--junitxml=reports/pytest-integration.xml
+ 
+ migration-upgrade:
+ 	DATABASE_URL="$(MIGRATION_DATABASE_URL)" $(UV) run alembic upgrade head
+diff --git a/scripts/__init__.py b/scripts/__init__.py
+new file mode 100644
+index 0000000..2bd3938
+--- /dev/null
++++ b/scripts/__init__.py
+@@ -0,0 +1 @@
++"""Repository automation scripts."""
+diff --git a/scripts/ao/README.md b/scripts/ao/README.md
+new file mode 100644
+index 0000000..2d2fb57
+--- /dev/null
++++ b/scripts/ao/README.md
+@@ -0,0 +1,241 @@
++# AO Evidence and Advisor workspace tools
++
++These repository-local Python 3.12 tools implement the two parts of AO P0-1. They
++live under `scripts/ao/` so every PR worktree can read them, while setuptools still
++packages only `src/` and the runtime Docker stage does not copy `scripts/`.
++
++## Evidence workflow
++
++`.github/workflows/ci.yml` runs PR-controlled code with read-only permissions and
++non-persistent checkout credentials. After its `quality`, `database`, and
++`container` jobs succeed, the separate `.github/workflows/evidence-publish.yml`
++workflow is triggered by `workflow_run` and automatically runs:
++
++```bash
++python -m scripts.ao evidence --repo . --pr 123 --ci-run-id 456
++```
++
++The privileged publisher is loaded from and checks out the default branch as
++`trusted/`. It loads Python only from that checkout. The candidate PR checkout is a
++separate `candidate/` data directory; no module, script, action, or hook from it is
++executed with the write token. Both checkouts use `persist-credentials: false`, and
++the write token exists only in the trusted publish step.
++
++Before treating a successful source run as CI evidence, the publisher retrieves the
++run's workflow path from GitHub and requires exactly `.github/workflows/ci.yml`. It
++then computes a canonical SHA-256 definition hash from Git tree entries in the
++candidate code SHA and the checked-out default branch. The manifest includes:
++
++- all `.github/**` files, including every third-party `uses:` reference and the
++  privileged publisher itself;
++- `Makefile`, `pyproject.toml`, `uv.lock`, the build/test/link/clean-start scripts,
++  and every `tests/**` and `scripts/**` file;
++- `Dockerfile`, `.dockerignore`, `.env.example`, Compose files, all `docker/**`
++  helpers, `alembic.ini`, and the Alembic environment/template;
++- absent-or-present markers for auto-discovered override files such as
++  `.coveragerc`, `.coveragerc.toml`, all root pytest config names, `mypy.ini`,
++  `setup.cfg`, `tox.ini`, `uv.toml`, Compose overrides, and Dockerfile-specific
++  ignore files.
++
++Each entry records path, Git mode, object type, and blob SHA; additions, removals,
++renames, permission changes, and content changes all alter the definition hash. The
++fixed files are every direct repository-controlled CI command/configuration input.
++The recursive roots cover executable test, AO, workflow/action, and Docker helper
++code, including newly added files. Product source, migration revisions, and reviewed
++documents remain the subjects being tested rather than the gate definition.
++
++### Trusted Execution Surface
++
++The Trusted Execution Surface is the repository-controlled execution and
++configuration surface that can influence a gate's result. It is not every file name
++that a tool could conceivably discover under a different invocation or future
++configuration. Gate commands, their active configuration, executable helpers,
++startup hooks, and the configuration that determines discovery boundaries belong to
++the surface; ordinary files that cannot enter the current gate execution path do
++not.
++
++Both CI Ruff invocations pass `--config pyproject.toml`, which makes that hashed root
++file the configuration for every analyzed path and disables Ruff's otherwise
++hierarchical closest-config discovery. A candidate `src/ruff.toml`,
++`migrations/.ruff.toml`, or nested `pyproject.toml` therefore cannot weaken lint or
++format without first changing the hashed Makefile command. As defense in depth, the
++definition builder also scans the entire Git tree—not a directory allowlist—for
++every `ruff.toml`, `.ruff.toml`, and `pyproject.toml` basename. An attempted nested
++override is therefore marked `requires-re-review` even though the pinned commands
++make it ineffective. Because this scan is basename-based over the complete candidate
++commit, a matching file added under any future directory is covered automatically.
++
++### Execution-path boundary
++
++Membership in the Trusted Execution Surface follows the gate's actual execution
++path, not an enumeration of every hypothetical location where a configuration or
++plugin file might be placed. Hypothetical locations are unbounded: arbitrary present
++and future directories could contain a recognized name. Actual execution paths are
++bounded and mechanically verifiable. Hashing files that cannot enter those paths
++would make ordinary product changes continually require manual review and would
++degrade the mechanism into an always-manual gate without increasing protection.
++
++This rule is safe only because the configuration that selects each execution path is
++itself part of the Trusted Execution Surface. If a discovery boundary could be
++changed without changing the trusted definition hash, limiting coverage to the
++current path would be a bypassable assumption. For pytest, the discovery boundary is
++set by `testpaths` in `pyproject.toml`; that file is covered both by the root exact
++manifest and the full-tree `pyproject.toml` scan. A PR therefore cannot silently
++widen pytest discovery while preserving the trusted hash: changing `testpaths`
++produces `requires-re-review`.
++
++Python startup hooks have different loading semantics. `uv sync` installs the project
++editably, so an otherwise ordinary `src/sitecustomize.py` can execute when the
++interpreter starts, before pytest or mypy processes their own discovery settings.
++Every `sitecustomize` and `usercustomize` module form is therefore hashed across the
++full tree: the `.py` basenames, extension/bytecode-style basenames, and all files
++below same-named package directories. This is path-wide rather than limited to
++today's `src/` layout; if the hashed project configuration later changes the editable
++source root, the hook scan still covers the new directory.
++
++### Current pytest discovery boundary
++
++Pytest is invoked from the repository root with `-c pyproject.toml`, and the trusted
++configuration fixes `testpaths = ["tests"]`. The complete `tests/**` tree and the
++root `conftest.py` sentinel are in the trusted definition. A `conftest.py` under
++`src/`, migrations, or another product directory is outside that discovery path and
++is not loaded by the current pytest gate. If `testpaths` changes in the future, the
++trusted `pyproject.toml` changes too, so the candidate is marked
++`requires-re-review` before the expanded discovery path can be trusted.
++
++`sitecustomize` and `conftest` are intentionally handled differently because their
++loaders are different, not because they are held to different trust standards.
++Interpreter startup can load `sitecustomize` independently of pytest's `testpaths`,
++so startup hooks need the recursive module-name coverage above. Pytest loads
++`conftest` only within its configured discovery boundary, so the trusted root
++sentinel and recursive `tests/**` tree cover the actual path without an unbounded
++repository-wide `conftest.py` scan.
++
++Other discovery surfaces are bounded as follows:
++
++- all other pytest 9 root config names are represented by missing-file sentinels as
++  defense in depth;
++- mypy selects one configuration from the invocation directory rather than one per
++  analyzed file; `--config-file pyproject.toml` pins it, and every supported root
++  candidate (`mypy.ini`, `.mypy.ini`, `pyproject.toml`, and `setup.cfg`) is hashed;
++- coverage likewise selects one root configuration (`.coveragerc`, `setup.cfg`,
++  `tox.ini`, `.coveragerc.toml`, or `pyproject.toml`) for this invocation;
++  `--cov-config=pyproject.toml` pins it and all alternatives are represented by
++  exact entries or missing-file sentinels;
++- `uv sync` runs at the repository root, so its project/config discovery is anchored
++  to the hashed root `pyproject.toml`, `uv.toml`, and `uv.lock`; it does not select a
++  separate project configuration for each installed source file.
++
++Generation and both verification paths also require this recomputed default-branch
++hash to equal the hash produced by the separate trusted checkout, preventing a
++candidate-supplied hash or a changing fetch baseline from becoming the trust anchor.
++
++External runner images and upstream implementations behind movable action major
++tags remain platform supply-chain risks. Their reference strings are protected by
++the workflow hash, and image/action pins already present in the repository are
++protected, but this tool does not independently snapshot GitHub-hosted runner images
++or resolve movable tags to immutable commits.
++
++Changes to `.github/workflows/ci.yml` intentionally fail this automatic check. That
++also applies to every manifest entry above, including legitimate gate maintenance.
++Evidence records the trusted hash, candidate hash, and `requires-re-review` status;
++trusted skip is forbidden. A maintainer must review the trust-root change, verify
++the latest-head checks, and use the repository's explicit human
++bootstrap/branch-protection override process. The publisher does not downgrade the
++mismatch, create a trusted success status, or silently adopt the candidate
++definition. After the reviewed definition reaches the default branch, a restored or
++later matching PR is trusted again. PR #12 itself changes workflow/AO trust-root
++files, so its expected self-assessment is `requires-re-review`; it has no exemption.
++
++The command fetches the PR branches, requires the exact completed three-job CI run,
++writes exactly five files under `docs/evidence/pr-123/`, creates a separate
++`docs: add PR123 review evidence` commit, and pushes it normally. A concurrent PR
++update makes the push fail instead of overwriting newer code.
++
++Before publishing a successful `AO / evidence-snapshot` status on the new head, the
++trusted verifier proves that the commit changes exactly those five regular Evidence
++files and that the remote PR head is that exact commit. It reconstructs
++`metadata.md`, `changed-files.md`, `diff.patch`, `validation.md`, and
++`advisor-context.md` from the bound parent, three-dot Git diff, current PR metadata,
++the exact successful CI run, and scoped GitHub review records. The creation time is
++the only reference-only metadata value: it must be a timezone-qualified ISO-8601
++value and is reused while reconstructing both files that record it. All binding,
++merge-base, change-count, file-list, patch, CI, job, branch, URL, and Advisor
++instructions are compared to independently retrieved facts. The status description
++names the parent SHA and source run. Failure posts a failure status and records an
++indeterminate event; there is no warning, neutral, or unconditional green path.
++
++A `GITHUB_TOKEN` PR update may create an approval-required, zero-job run. That record
++is neither success nor test failure and remains indeterminate. The independent
++content-based skip keeps the publisher finite if that run is approved or the
++credential later changes to a PAT or deploy key. Path shape only identifies a skip
++candidate; before returning `skipped`, the generator itself runs the complete
++verification above and requires a pre-existing successful `AO / evidence-snapshot`
++status on the exact immutable SHA. Generator identity comes from the GitHub Status
++API's server-authenticated creator object: numeric account ID `41898282`, login
++`github-actions[bot]`, and type `Bot`, plus the exact parent/source-CI description
++and repository workflow-run URL. These are not Git committer strings and cannot be
++set by PR content or `git config`. The workflow repeats the verification and never
++posts success on the skip branch. Therefore an author-supplied, incomplete, or
++tampered Evidence-only commit fails closed.
++
++Generation uses `origin/<base>...<code-sha>` and excludes all of
++`docs/evidence/**`. Failure exits nonzero, records an `indeterminate` gate event in
++the repository's common Git directory at `ao/evidence-events.jsonl`, and does not
++enter review.
++
++## Advisor workspace workflow
++
++The commit argument is intentionally absent. The resolver reads it only from the
++Evidence metadata:
++
++```bash
++uv run python -m scripts.ao advisor-run \
++  --repo /absolute/path/to/repository \
++  --metadata /absolute/path/to/docs/evidence/pr-123/metadata.md \
++  --record /absolute/path/to/advisor-record.json \
++  --timeout-seconds 1800 \
++  -- advisor-command --its-arguments
++```
++
++The resolver unconditionally fetches first, creates a uniquely named detached
++worktree containing the PR number and SHA prefix, exports the bound SHA to the
++Advisor process, and removes/prunes the worktree in a `finally` path. SIGINT,
++SIGTERM, and SIGHUP are converted into cleanup-capable interruptions. A timeout
++terminates the entire Advisor process group, escalates to SIGKILL when it ignores
++SIGTERM, confirms exit, then removes the worktree and releases the lock before
++recording an indeterminate result. Fetch or checkout failure pauses review; there
++is no fallback to `main` or another commit.
++
++Validate the resulting record before gate use:
++
++```bash
++uv run python -m scripts.ao advisor-validate \
++  --repo /absolute/path/to/repository \
++  --metadata /absolute/path/to/docs/evidence/pr-123/metadata.md \
++  --record /absolute/path/to/advisor-record.json
++```
++
++The record is valid only when the Advisor completed at the Evidence SHA and the PR
++has no later non-Evidence code changes.
++
++## Stale worktrees
++
++Detection is read-only and recognizes both current AO names and the legacy
++`advisor`/`g01` names that motivated this tool:
++
++```bash
++uv run python -m scripts.ao stale-list --repo . --older-than-hours 24
++```
++
++Reclamation requires an explicit command and confirmation flag:
++
++```bash
++uv run python -m scripts.ao stale-reclaim \
++  --repo . --older-than-hours 24 --confirm
++```
++
++Only registered Git worktrees inside the configured temporary root whose names
++match the known Advisor patterns are eligible. The wrapper PID, Advisor PID, and
++Advisor process group are all checked; any live marker prevents an active modern
++workspace from being reported as stale.
+diff --git a/scripts/ao/__init__.py b/scripts/ao/__init__.py
+new file mode 100644
+index 0000000..7367ef7
+--- /dev/null
++++ b/scripts/ao/__init__.py
+@@ -0,0 +1 @@
++"""Repository-local Agent Orchestrator tooling."""
+diff --git a/scripts/ao/__main__.py b/scripts/ao/__main__.py
+new file mode 100644
+index 0000000..4443fdd
+--- /dev/null
++++ b/scripts/ao/__main__.py
+@@ -0,0 +1,3 @@
++from scripts.ao.cli import main
++
++raise SystemExit(main())
+diff --git a/scripts/ao/cli.py b/scripts/ao/cli.py
+new file mode 100644
+index 0000000..b374e17
+--- /dev/null
++++ b/scripts/ao/cli.py
+@@ -0,0 +1,306 @@
++from __future__ import annotations
++
++import argparse
++import json
++import signal
++import sys
++from collections.abc import Callable, Iterator, Sequence
++from contextlib import contextmanager
++from dataclasses import asdict
++from pathlib import Path
++from types import FrameType
++from typing import Never
++
++from scripts.ao.evidence import EvidenceGenerator, verify_evidence_head
++from scripts.ao.git import GitRepository
++from scripts.ao.github import GhGitHubData
++from scripts.ao.models import EvidenceSkip
++from scripts.ao.trust import compare_ci_definition
++from scripts.ao.workspace import (
++    WorkspaceResolver,
++    detect_stale_worktrees,
++    reclaim_stale_worktrees,
++    validate_advisor_opinion,
++)
++
++type SignalHandler = Callable[[int, FrameType | None], object] | int | None
++
++
++class AdvisorInterrupted(RuntimeError):
++    """A handled signal interrupted an Advisor command."""
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(prog="python -m scripts.ao")
++    commands = parser.add_subparsers(dest="command", required=True)
++
++    verify_ci = commands.add_parser(
++        "ci-verify-definition",
++        help="verify that source CI used the trusted default-branch workflow definition",
++    )
++    verify_ci.add_argument("--trusted-repo", type=Path, required=True)
++    verify_ci.add_argument("--candidate-repo", type=Path, required=True)
++    verify_ci.add_argument("--candidate-sha", required=True)
++    verify_ci.add_argument("--source-run-path", required=True)
++
++    evidence = commands.add_parser("evidence", help="generate a bound Evidence Snapshot")
++    evidence.add_argument("--repo", type=Path, required=True)
++    evidence.add_argument("--pr", type=int, required=True)
++    evidence.add_argument("--log", type=Path)
++    evidence.add_argument(
++        "--ci-run-id",
++        type=int,
++        help="current workflow run whose required code jobs have completed",
++    )
++    evidence.add_argument(
++        "--trusted-ci-definition-hash",
++        help="default-branch CI definition hash computed by the trusted publisher",
++    )
++
++    verify_evidence = commands.add_parser(
++        "evidence-verify-head",
++        help="verify an Evidence-only PR head before publishing its status",
++    )
++    verify_evidence.add_argument("--repo", type=Path, required=True)
++    verify_evidence.add_argument("--pr", type=int, required=True)
++    verify_evidence.add_argument("--evidence-sha", required=True)
++    verify_evidence.add_argument(
++        "--trusted-ci-definition-hash",
++        help="default-branch CI definition hash computed by the trusted publisher",
++    )
++    verify_evidence.add_argument(
++        "--require-prior-attestation",
++        action="store_true",
++        help="allow a skipped Evidence head only when the trusted publisher attested it earlier",
++    )
++
++    advisor = commands.add_parser("advisor-run", help="run Advisor in a bound worktree")
++    advisor.add_argument("--repo", type=Path, required=True)
++    advisor.add_argument("--metadata", type=Path, required=True)
++    advisor.add_argument("--record", type=Path, required=True)
++    advisor.add_argument("--temp-root", type=Path)
++    advisor.add_argument("--log", type=Path)
++    advisor.add_argument("--timeout-seconds", type=float, default=1800.0)
++    advisor.add_argument("advisor_command", nargs=argparse.REMAINDER)
++
++    validate = commands.add_parser(
++        "advisor-validate",
++        help="validate an Advisor record against Evidence and current PR code",
++    )
++    validate.add_argument("--repo", type=Path, required=True)
++    validate.add_argument("--metadata", type=Path, required=True)
++    validate.add_argument("--record", type=Path, required=True)
++
++    stale = commands.add_parser("stale-list", help="detect stale Advisor worktrees")
++    _add_stale_arguments(stale)
++
++    reclaim = commands.add_parser("stale-reclaim", help="reclaim detected stale worktrees")
++    _add_stale_arguments(reclaim)
++    reclaim.add_argument("--log", type=Path)
++    reclaim.add_argument(
++        "--confirm",
++        action="store_true",
++        required=True,
++        help="explicitly authorize removal of the detected temporary worktrees",
++    )
++    return parser
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    arguments = build_parser().parse_args(argv)
++    try:
++        if arguments.command == "ci-verify-definition":
++            return _ci_verify_definition(arguments)
++        if arguments.command == "evidence":
++            return _evidence(arguments)
++        if arguments.command == "evidence-verify-head":
++            return _evidence_verify_head(arguments)
++        if arguments.command == "advisor-run":
++            return _advisor_run(arguments)
++        if arguments.command == "advisor-validate":
++            return _advisor_validate(arguments)
++        if arguments.command == "stale-list":
++            return _stale_list(arguments)
++        if arguments.command == "stale-reclaim":
++            return _stale_reclaim(arguments)
++        raise AssertionError(f"unhandled command {arguments.command}")
++    except Exception as error:
++        print(
++            json.dumps(
++                {
++                    "error": str(error),
++                    "gate_status": "indeterminate",
++                    "result": "failure",
++                },
++                ensure_ascii=False,
++                sort_keys=True,
++            ),
++            file=sys.stderr,
++        )
++        return 1
++
++
++def _evidence(arguments: argparse.Namespace) -> int:
++    repository = GitRepository(arguments.repo)
++    github = GhGitHubData(repository.remote_slug())
++    generator = EvidenceGenerator(
++        repository,
++        github,
++        log_path=arguments.log,
++    )
++    result = generator.generate(
++        arguments.pr,
++        ci_run_id=arguments.ci_run_id,
++        trusted_ci_definition_hash=arguments.trusted_ci_definition_hash,
++    )
++    if isinstance(result, EvidenceSkip):
++        _print_json(
++            {
++                "head_sha": result.head_sha,
++                "reason": result.reason,
++                "result": "skipped",
++            }
++        )
++        return 0
++    _print_json(
++        {
++            "ci_run_id": result.ci_run_id,
++            "ci_definition_status": result.ci_definition_status,
++            "trusted_ci_definition_hash": result.trusted_ci_definition_hash,
++            "candidate_ci_definition_hash": result.candidate_ci_definition_hash,
++            "code_commit_sha": result.code_commit_sha,
++            "directory": str(result.directory),
++            "evidence_commit_sha": result.evidence_commit_sha,
++            "result": "success",
++        }
++    )
++    return 0
++
++
++def _ci_verify_definition(arguments: argparse.Namespace) -> int:
++    result = compare_ci_definition(
++        GitRepository(arguments.trusted_repo),
++        GitRepository(arguments.candidate_repo),
++        arguments.candidate_sha,
++        arguments.source_run_path,
++    )
++    _print_json(asdict(result))
++    return 0
++
++
++def _advisor_run(arguments: argparse.Namespace) -> int:
++    command = tuple(arguments.advisor_command)
++    if command and command[0] == "--":
++        command = command[1:]
++    repository = GitRepository(arguments.repo)
++    resolver = WorkspaceResolver(
++        repository,
++        temp_root=arguments.temp_root,
++        log_path=arguments.log,
++    )
++    with _handled_termination_signals():
++        return resolver.run_advisor(
++            arguments.metadata,
++            command,
++            arguments.record,
++            timeout_seconds=arguments.timeout_seconds,
++        )
++
++
++def _evidence_verify_head(arguments: argparse.Namespace) -> int:
++    repository = GitRepository(arguments.repo)
++    github = GhGitHubData(repository.remote_slug())
++    result = verify_evidence_head(
++        repository,
++        github,
++        arguments.pr,
++        arguments.evidence_sha,
++        require_prior_attestation=arguments.require_prior_attestation,
++        trusted_ci_definition_hash=arguments.trusted_ci_definition_hash,
++    )
++    _print_json(asdict(result))
++    return 0
++
++
++def _advisor_validate(arguments: argparse.Namespace) -> int:
++    repository = GitRepository(arguments.repo)
++    github = GhGitHubData(repository.remote_slug())
++    result = validate_advisor_opinion(
++        repository,
++        github,
++        arguments.metadata,
++        arguments.record,
++    )
++    _print_json(asdict(result))
++    return 0 if result.valid else 2
++
++
++def _stale_list(arguments: argparse.Namespace) -> int:
++    repository = GitRepository(arguments.repo)
++    stale = detect_stale_worktrees(
++        repository,
++        temp_root=arguments.temp_root,
++        older_than_seconds=arguments.older_than_hours * 3600,
++    )
++    _print_json(
++        {
++            "count": len(stale),
++            "worktrees": [
++                {
++                    **asdict(item),
++                    "path": str(item.path),
++                }
++                for item in stale
++            ],
++        }
++    )
++    return 0
++
++
++def _stale_reclaim(arguments: argparse.Namespace) -> int:
++    repository = GitRepository(arguments.repo)
++    stale = detect_stale_worktrees(
++        repository,
++        temp_root=arguments.temp_root,
++        older_than_seconds=arguments.older_than_hours * 3600,
++    )
++    reclaimed = reclaim_stale_worktrees(
++        repository,
++        stale,
++        log_path=arguments.log,
++    )
++    _print_json(
++        {
++            "count": len(reclaimed),
++            "reclaimed": [str(path) for path in reclaimed],
++        }
++    )
++    return 0
++
++
++def _add_stale_arguments(parser: argparse.ArgumentParser) -> None:
++    parser.add_argument("--repo", type=Path, required=True)
++    parser.add_argument("--temp-root", type=Path)
++    parser.add_argument("--older-than-hours", type=float, default=24.0)
++
++
++def _print_json(value: object) -> None:
++    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
++
++
++@contextmanager
++def _handled_termination_signals() -> Iterator[None]:
++    previous: dict[signal.Signals, SignalHandler] = {}
++
++    def interrupt(signum: int, frame: FrameType | None) -> Never:
++        del frame
++        raise AdvisorInterrupted(f"Advisor interrupted by signal {signum}")
++
++    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
++        previous[signum] = signal.getsignal(signum)
++        signal.signal(signum, interrupt)
++    try:
++        yield
++    finally:
++        for signum, handler in previous.items():
++            signal.signal(signum, handler)
+diff --git a/scripts/ao/evidence.py b/scripts/ao/evidence.py
+new file mode 100644
+index 0000000..5c9a31b
+--- /dev/null
++++ b/scripts/ao/evidence.py
+@@ -0,0 +1,1126 @@
++from __future__ import annotations
++
++import re
++import shutil
++import tempfile
++import time
++from collections.abc import Callable
++from dataclasses import dataclass, replace
++from datetime import UTC, datetime
++from pathlib import Path
++
++from scripts.ao.git import GitRepository, append_json_event
++from scripts.ao.github import GitHubData, GitHubError
++from scripts.ao.models import CIRun, EvidenceBinding, EvidenceSkip, PullRequest, ReviewEvidence
++from scripts.ao.trust import (
++    TRUSTED_CI_WORKFLOW_PATH,
++    CIDefinitionComparison,
++    compare_ci_definition,
++)
++
++EVIDENCE_FILES = {
++    "metadata.md",
++    "changed-files.md",
++    "diff.patch",
++    "validation.md",
++    "advisor-context.md",
++}
++EVIDENCE_EXCLUSION = ":(exclude)docs/evidence/**"
++EVIDENCE_STATUS_CONTEXT = "AO / evidence-snapshot"
++PROTECTED_PATHS = (
++    "migrations/",
++    "docs/requirements-v1.md",
++    "docs/requirements-v2.md",
++    "CLAUDE.md",
++    "docs/quality-gates-v1.md",
++    "docs/advisor-protocol-v1.md",
++    "docs/decision-register-v1.md",
++    "docs/test-plan-v1.md",
++)
++
++
++class EvidenceError(RuntimeError):
++    """Evidence generation cannot safely continue."""
++
++
++@dataclass(frozen=True)
++class SnapshotResult:
++    directory: Path
++    code_commit_sha: str
++    ci_run_id: int
++    evidence_commit_sha: str | None
++    ci_definition_status: str
++    trusted_ci_definition_hash: str
++    candidate_ci_definition_hash: str
++
++
++@dataclass(frozen=True)
++class VerifiedEvidenceHead:
++    evidence_commit_sha: str
++    code_commit_sha: str
++    ci_run_id: int
++    ci_url: str
++    prior_attestation: bool
++    ci_definition_status: str
++    trusted_ci_definition_hash: str
++    candidate_ci_definition_hash: str
++
++
++@dataclass(frozen=True)
++class ChangedFile:
++    status: str
++    path: str
++
++
++class EvidenceGenerator:
++    def __init__(
++        self,
++        repository: GitRepository,
++        github: GitHubData,
++        *,
++        log_path: Path | None = None,
++        now: Callable[[], datetime] | None = None,
++    ) -> None:
++        self.repository = repository
++        self.github = github
++        self.log_path = log_path or repository.common_git_dir() / "ao" / "evidence-events.jsonl"
++        self.now = now or (lambda: datetime.now(UTC))
++
++    def generate(
++        self,
++        pr_number: int,
++        *,
++        commit: bool = True,
++        push: bool | None = None,
++        ci_run_id: int | None = None,
++        trusted_ci_definition_hash: str | None = None,
++    ) -> SnapshotResult | EvidenceSkip:
++        should_push = commit if push is None else push
++        if should_push and not commit:
++            raise ValueError("Evidence cannot be pushed without a separate commit")
++        started = time.monotonic()
++        started_at = self.now()
++        pull_request: PullRequest | None = None
++        ci_run: CIRun | None = None
++        try:
++            self._require_clean_worktree()
++            evidence_only = self._evidence_only_head()
++            if evidence_only is not None:
++                verified = verify_evidence_head(
++                    self.repository,
++                    self.github,
++                    pr_number,
++                    evidence_only.head_sha,
++                    require_prior_attestation=True,
++                    trusted_ci_definition_hash=trusted_ci_definition_hash,
++                )
++                append_json_event(
++                    self.log_path,
++                    {
++                        "action": "evidence.generate",
++                        "ci_run_id": verified.ci_run_id,
++                        "code_commit_sha": verified.code_commit_sha,
++                        "duration_seconds": round(time.monotonic() - started, 6),
++                        "finished_at": self.now().isoformat(),
++                        "gate_status": "already-attested",
++                        "head_sha": evidence_only.head_sha,
++                        "pr_number": pr_number,
++                        "reason": evidence_only.reason,
++                        "result": "skipped",
++                        "started_at": started_at.isoformat(),
++                    },
++                )
++                return evidence_only
++            pull_request = self.github.pull_request(pr_number)
++            self._validate_pr_number(pr_number, pull_request)
++            self.repository.fetch(
++                "origin",
++                pull_request.target_branch,
++                pull_request.source_branch,
++            )
++            self._require_checked_out_code_commit(pull_request)
++            ci_definition = compare_ci_definition(
++                self.repository,
++                self.repository,
++                pull_request.head_sha,
++                TRUSTED_CI_WORKFLOW_PATH,
++                trusted_ref=f"origin/{pull_request.target_branch}",
++            )
++            if (
++                trusted_ci_definition_hash is not None
++                and trusted_ci_definition_hash != ci_definition.trusted_definition_hash
++            ):
++                raise EvidenceError(
++                    "trusted checkout CI definition hash does not match fetched default branch"
++                )
++            ci_run = self.github.successful_ci_run(pull_request.head_sha, ci_run_id)
++            self._validate_ci_binding(pull_request, ci_run)
++            reviews = self.github.review_evidence(
++                pull_request.number,
++                pull_request.review_decision,
++            )
++            result = self._write_snapshot(
++                pull_request,
++                ci_run,
++                reviews,
++                ci_definition,
++                started_at,
++            )
++            evidence_commit = self._commit_snapshot(pull_request) if commit else None
++            if should_push:
++                self.repository.git(
++                    "push",
++                    "origin",
++                    f"HEAD:{pull_request.source_branch}",
++                )
++            duration = round(time.monotonic() - started, 6)
++            append_json_event(
++                self.log_path,
++                {
++                    "action": "evidence.generate",
++                    "ci_run_id": ci_run.run_id,
++                    "code_commit_sha": pull_request.head_sha,
++                    "duration_seconds": duration,
++                    "evidence_commit_sha": evidence_commit,
++                    "finished_at": self.now().isoformat(),
++                    "gate_status": (
++                        "ready-for-review"
++                        if ci_definition.status == "trusted"
++                        else "requires-re-review"
++                    ),
++                    "ci_definition_status": ci_definition.status,
++                    "trusted_ci_definition_hash": ci_definition.trusted_definition_hash,
++                    "candidate_ci_definition_hash": ci_definition.candidate_definition_hash,
++                    "pr_number": pull_request.number,
++                    "pushed": should_push,
++                    "result": "success",
++                    "started_at": started_at.isoformat(),
++                },
++            )
++            return SnapshotResult(
++                directory=result,
++                code_commit_sha=pull_request.head_sha,
++                ci_run_id=ci_run.run_id,
++                evidence_commit_sha=evidence_commit,
++                ci_definition_status=ci_definition.status,
++                trusted_ci_definition_hash=ci_definition.trusted_definition_hash,
++                candidate_ci_definition_hash=ci_definition.candidate_definition_hash,
++            )
++        except BaseException as error:
++            duration = round(time.monotonic() - started, 6)
++            append_json_event(
++                self.log_path,
++                {
++                    "action": "evidence.generate",
++                    "ci_run_id": ci_run.run_id if ci_run else None,
++                    "code_commit_sha": pull_request.head_sha if pull_request else None,
++                    "duration_seconds": duration,
++                    "error": str(error),
++                    "finished_at": self.now().isoformat(),
++                    "gate_status": "indeterminate",
++                    "pr_number": pr_number,
++                    "push_requested": should_push,
++                    "result": "failure",
++                    "started_at": started_at.isoformat(),
++                },
++            )
++            raise
++
++    def _evidence_only_head(self) -> EvidenceSkip | None:
++        head_sha = self.repository.git("rev-parse", "HEAD").stdout.strip()
++        paths = tuple(
++            path
++            for path in self.repository.git(
++                "diff-tree",
++                "--root",
++                "--no-commit-id",
++                "--name-only",
++                "-r",
++                "HEAD",
++            ).stdout.splitlines()
++            if path
++        )
++        if paths and all(path.startswith("docs/evidence/") for path in paths):
++            return EvidenceSkip(
++                head_sha=head_sha,
++                reason=(
++                    "HEAD is a fully verified, previously attested AO Evidence commit; "
++                    "generation loop prevented"
++                ),
++            )
++        return None
++
++    def _require_clean_worktree(self) -> None:
++        status = self.repository.git("status", "--porcelain").stdout
++        if status:
++            raise EvidenceError(
++                "Evidence must be generated from a clean code commit; "
++                "commit or remove working-tree changes first"
++            )
++
++    @staticmethod
++    def _validate_pr_number(requested: int, pull_request: PullRequest) -> None:
++        if pull_request.number != requested:
++            raise EvidenceError(
++                f"GitHub returned PR #{pull_request.number} for requested PR #{requested}"
++            )
++
++    def _require_checked_out_code_commit(self, pull_request: PullRequest) -> None:
++        branch = self.repository.git("branch", "--show-current").stdout.strip()
++        head = self.repository.git("rev-parse", "HEAD").stdout.strip()
++        remote_head = self.repository.git(
++            "rev-parse",
++            f"origin/{pull_request.source_branch}",
++        ).stdout.strip()
++        if branch != pull_request.source_branch:
++            raise EvidenceError(
++                f"Evidence must be committed on PR branch {pull_request.source_branch}; "
++                f"current branch is {branch or 'detached HEAD'}"
++            )
++        if head != pull_request.head_sha:
++            raise EvidenceError(
++                f"local HEAD {head} does not equal PR code commit {pull_request.head_sha}"
++            )
++        if remote_head != pull_request.head_sha:
++            raise EvidenceError(
++                f"remote PR branch moved to {remote_head} after GitHub metadata was read; "
++                "restart generation for the new code commit"
++            )
++
++    @staticmethod
++    def _validate_ci_binding(pull_request: PullRequest, ci_run: CIRun) -> None:
++        if ci_run.commit_sha != pull_request.head_sha:
++            raise EvidenceError(
++                f"CI run {ci_run.run_id} belongs to {ci_run.commit_sha}, "
++                f"not PR code commit {pull_request.head_sha}"
++            )
++        if (
++            ci_run.status not in {"completed", "required-jobs-completed"}
++            or ci_run.conclusion != "success"
++        ):
++            raise EvidenceError(
++                f"CI run {ci_run.run_id} is not completed successfully; "
++                "gate status is indeterminate"
++            )
++
++    def _write_snapshot(
++        self,
++        pull_request: PullRequest,
++        ci_run: CIRun,
++        reviews: ReviewEvidence,
++        ci_definition: CIDefinitionComparison,
++        created_at: datetime,
++    ) -> Path:
++        base_ref = f"origin/{pull_request.target_branch}"
++        comparison = f"{base_ref}...{pull_request.head_sha}"
++        merge_base = self.repository.git(
++            "merge-base",
++            base_ref,
++            pull_request.head_sha,
++        ).stdout.strip()
++        diff_args = (
++            "diff",
++            comparison,
++            "--",
++            ".",
++            EVIDENCE_EXCLUSION,
++        )
++        patch = self.repository.git(*diff_args).stdout
++        changed_files = _parse_name_status(
++            self.repository.git(
++                "diff",
++                "--name-status",
++                comparison,
++                "--",
++                ".",
++                EVIDENCE_EXCLUSION,
++            ).stdout
++        )
++        additions, deletions = _parse_numstat(
++            self.repository.git(
++                "diff",
++                "--numstat",
++                comparison,
++                "--",
++                ".",
++                EVIDENCE_EXCLUSION,
++            ).stdout
++        )
++        commits = _parse_commits(
++            self.repository.git(
++                "log",
++                "--format=%H%x09%s",
++                f"{merge_base}..{pull_request.head_sha}",
++            ).stdout
++        )
++        contents = {
++            "metadata.md": _metadata_markdown(
++                pull_request,
++                ci_run,
++                merge_base,
++                changed_files,
++                additions,
++                deletions,
++                commits,
++                ci_definition,
++                created_at,
++            ),
++            "changed-files.md": _changed_files_markdown(
++                pull_request,
++                merge_base,
++                changed_files,
++                additions,
++                deletions,
++            ),
++            "diff.patch": patch,
++            "validation.md": _validation_markdown(
++                pull_request,
++                ci_run,
++                reviews,
++                merge_base,
++                created_at,
++            ),
++            "advisor-context.md": _advisor_context_markdown(pull_request),
++        }
++        return _replace_evidence_directory(
++            self.repository.root,
++            pull_request.number,
++            contents,
++        )
++
++    def _commit_snapshot(self, pull_request: PullRequest) -> str:
++        relative = f"docs/evidence/pr-{pull_request.number}"
++        self.repository.git("add", "-A", "--", relative)
++        staged = tuple(
++            line
++            for line in self.repository.git(
++                "diff",
++                "--cached",
++                "--name-only",
++            ).stdout.splitlines()
++            if line
++        )
++        if not staged:
++            raise EvidenceError("Evidence generation produced no staged changes")
++        prefix = f"{relative}/"
++        if any(not path.startswith(prefix) for path in staged):
++            raise EvidenceError(
++                "refusing to commit because the index contains non-Evidence changes"
++            )
++        self.repository.git(
++            "commit",
++            "-m",
++            f"docs: add PR{pull_request.number} review evidence",
++        )
++        return self.repository.git("rev-parse", "HEAD").stdout.strip()
++
++
++def parse_evidence_binding(metadata_path: Path) -> EvidenceBinding:
++    text = metadata_path.read_text(encoding="utf-8")
++    values = {
++        "pr_number": _metadata_value(text, "PR number"),
++        "source_branch": _metadata_value(text, "Source branch"),
++        "target_branch": _metadata_value(text, "Target branch"),
++        "code_commit_sha": _metadata_value(text, "Code commit SHA"),
++        "ci_run_id": _metadata_value(text, "CI run ID"),
++        "ci_conclusion": _metadata_value(text, "CI conclusion"),
++    }
++    sha = values["code_commit_sha"]
++    if len(sha) != 40 or any(character not in "0123456789abcdef" for character in sha):
++        raise EvidenceError("metadata Code commit SHA must be a full lowercase SHA")
++    try:
++        pr_number = int(values["pr_number"].removeprefix("#"))
++        ci_run_id = int(values["ci_run_id"])
++    except ValueError as error:
++        raise EvidenceError("metadata contains an invalid PR number or CI run ID") from error
++    if values["ci_conclusion"] != "success":
++        raise EvidenceError("metadata CI conclusion is not success")
++    return EvidenceBinding(
++        pr_number=pr_number,
++        source_branch=values["source_branch"],
++        target_branch=values["target_branch"],
++        code_commit_sha=sha,
++        ci_run_id=ci_run_id,
++        ci_conclusion=values["ci_conclusion"],
++    )
++
++
++def verify_evidence_head(
++    repository: GitRepository,
++    github: GitHubData,
++    pr_number: int,
++    evidence_sha: str,
++    *,
++    require_prior_attestation: bool = False,
++    trusted_ci_definition_hash: str | None = None,
++) -> VerifiedEvidenceHead:
++    """Prove a head is an Evidence-only child of an exactly bound successful CI run."""
++    _require_full_sha(evidence_sha, "Evidence commit SHA")
++    head_sha = repository.git("rev-parse", "HEAD").stdout.strip()
++    if head_sha != evidence_sha:
++        raise EvidenceError(
++            f"candidate HEAD {head_sha} does not equal Evidence commit {evidence_sha}"
++        )
++
++    relative = Path("docs") / "evidence" / f"pr-{pr_number}"
++    directory = repository.root / relative
++    if directory.is_symlink() or not directory.is_dir():
++        raise EvidenceError("Evidence directory must be a real directory inside the repository")
++    expected_paths = {str(relative / name) for name in EVIDENCE_FILES}
++    actual_paths = {
++        path
++        for path in repository.git(
++            "diff-tree",
++            "--root",
++            "--no-commit-id",
++            "--name-only",
++            "-r",
++            evidence_sha,
++        ).stdout.splitlines()
++        if path
++    }
++    if actual_paths != expected_paths:
++        raise EvidenceError(
++            "Evidence head must change exactly the five files under "
++            f"{relative}; got {', '.join(sorted(actual_paths)) or 'no paths'}"
++        )
++    for name in EVIDENCE_FILES:
++        path = directory / name
++        if path.is_symlink() or not path.is_file():
++            raise EvidenceError(f"Evidence entry must be a regular file: {path}")
++
++    metadata_path = directory / "metadata.md"
++    metadata_text = metadata_path.read_text(encoding="utf-8")
++    binding = parse_evidence_binding(metadata_path)
++    created_at = _metadata_created_at(metadata_text)
++    if binding.pr_number != pr_number:
++        raise EvidenceError(
++            f"Evidence metadata binds PR #{binding.pr_number}, not requested PR #{pr_number}"
++        )
++    parent_sha = repository.git("rev-parse", f"{evidence_sha}^").stdout.strip()
++    if parent_sha != binding.code_commit_sha:
++        raise EvidenceError(
++            f"Evidence parent {parent_sha} does not equal bound code commit "
++            f"{binding.code_commit_sha}"
++        )
++
++    pull_request = github.pull_request(pr_number)
++    if (
++        pull_request.number != binding.pr_number
++        or pull_request.source_branch != binding.source_branch
++        or pull_request.target_branch != binding.target_branch
++    ):
++        raise EvidenceError("current PR identity or branches do not match Evidence metadata")
++    if pull_request.head_sha != evidence_sha:
++        raise EvidenceError(
++            f"current PR head {pull_request.head_sha} does not equal Evidence commit {evidence_sha}"
++        )
++    repository.fetch("origin", pull_request.target_branch, pull_request.source_branch)
++    remote_head = repository.git(
++        "rev-parse",
++        f"origin/{pull_request.source_branch}",
++    ).stdout.strip()
++    if remote_head != evidence_sha:
++        raise EvidenceError(
++            f"remote PR branch is {remote_head}, not verified Evidence commit {evidence_sha}"
++        )
++
++    ci_run = github.successful_ci_run(binding.code_commit_sha, binding.ci_run_id)
++    if (
++        ci_run.run_id != binding.ci_run_id
++        or ci_run.commit_sha != binding.code_commit_sha
++        or ci_run.status != "completed"
++        or ci_run.conclusion != "success"
++    ):
++        raise EvidenceError("Evidence metadata does not bind an exact completed successful CI run")
++
++    code_pull_request = replace(pull_request, head_sha=binding.code_commit_sha)
++    base_ref = f"origin/{binding.target_branch}"
++    comparison = f"{base_ref}...{binding.code_commit_sha}"
++    merge_base = repository.git(
++        "merge-base",
++        base_ref,
++        binding.code_commit_sha,
++    ).stdout.strip()
++    changed_files = _parse_name_status(
++        repository.git(
++            "diff",
++            "--name-status",
++            comparison,
++            "--",
++            ".",
++            EVIDENCE_EXCLUSION,
++        ).stdout
++    )
++    additions, deletions = _parse_numstat(
++        repository.git(
++            "diff",
++            "--numstat",
++            comparison,
++            "--",
++            ".",
++            EVIDENCE_EXCLUSION,
++        ).stdout
++    )
++    commits = _parse_commits(
++        repository.git(
++            "log",
++            "--format=%H%x09%s",
++            f"{merge_base}..{binding.code_commit_sha}",
++        ).stdout
++    )
++    ci_definition = compare_ci_definition(
++        repository,
++        repository,
++        binding.code_commit_sha,
++        TRUSTED_CI_WORKFLOW_PATH,
++        trusted_ref=base_ref,
++    )
++    if (
++        trusted_ci_definition_hash is not None
++        and trusted_ci_definition_hash != ci_definition.trusted_definition_hash
++    ):
++        raise EvidenceError(
++            "trusted checkout CI definition hash does not match fetched default branch"
++        )
++
++    expected_metadata = _metadata_markdown(
++        code_pull_request,
++        ci_run,
++        merge_base,
++        changed_files,
++        additions,
++        deletions,
++        commits,
++        ci_definition,
++        created_at,
++    )
++    if metadata_text != expected_metadata:
++        raise EvidenceError(
++            "Evidence metadata.md is incomplete or does not match the bound PR, "
++            "commit, merge base, CI, and change metrics"
++        )
++
++    expected_changed_files = _changed_files_markdown(
++        code_pull_request,
++        merge_base,
++        changed_files,
++        additions,
++        deletions,
++    )
++    actual_changed_files = (directory / "changed-files.md").read_text(encoding="utf-8")
++    if actual_changed_files != expected_changed_files:
++        raise EvidenceError(
++            "Evidence changed-files.md does not match the recomputed three-dot "
++            "name-status and line counts"
++        )
++
++    expected_patch = repository.git(
++        "diff",
++        comparison,
++        "--",
++        ".",
++        EVIDENCE_EXCLUSION,
++    ).stdout
++    actual_patch = (directory / "diff.patch").read_text(encoding="utf-8")
++    if actual_patch != expected_patch:
++        raise EvidenceError("Evidence diff.patch does not match the bound three-dot code diff")
++
++    validation_text = (directory / "validation.md").read_text(encoding="utf-8")
++    recorded_reviews = _validation_review_evidence(validation_text, code_pull_request)
++    current_reviews = github.review_evidence(
++        pull_request.number,
++        pull_request.review_decision,
++    )
++    if not set(recorded_reviews.line_comment_urls).issubset(
++        current_reviews.line_comment_urls
++    ) or not set(recorded_reviews.review_urls).issubset(current_reviews.review_urls):
++        raise EvidenceError(
++            "Evidence validation.md contains review URLs not present in GitHub's current PR records"
++        )
++    expected_validation = _validation_markdown(
++        code_pull_request,
++        ci_run,
++        recorded_reviews,
++        merge_base,
++        created_at,
++    )
++    if validation_text != expected_validation:
++        raise EvidenceError(
++            "Evidence validation.md does not match the bound timestamp, CI run, "
++            "required jobs, merge base, and generated review-record format"
++        )
++
++    expected_advisor_context = _advisor_context_markdown(code_pull_request)
++    actual_advisor_context = (directory / "advisor-context.md").read_text(encoding="utf-8")
++    if actual_advisor_context != expected_advisor_context:
++        raise EvidenceError(
++            "Evidence advisor-context.md does not match the bound PR, branch, and code commit"
++        )
++
++    if require_prior_attestation:
++        if ci_definition.status != "trusted":
++            raise EvidenceError(
++                "Evidence skip path is blocked because the CI definition changed; "
++                "re-review is required"
++            )
++        try:
++            attestation = github.evidence_attestation(
++                evidence_sha,
++                EVIDENCE_STATUS_CONTEXT,
++            )
++        except GitHubError as error:
++            raise EvidenceError(
++                "Evidence skip path lacks a prior trusted publisher attestation"
++            ) from error
++        expected_description = (
++            f"Evidence-only child of {binding.code_commit_sha[:12]}; source CI {binding.ci_run_id}"
++        )
++        expected_target_prefix = f"https://github.com/{pull_request.repository}/actions/runs/"
++        if (
++            attestation.context != EVIDENCE_STATUS_CONTEXT
++            or attestation.state != "success"
++            or attestation.creator_id != 41898282
++            or attestation.creator_login != "github-actions[bot]"
++            or attestation.creator_type != "Bot"
++            or attestation.description != expected_description
++            or re.fullmatch(
++                rf"{re.escape(expected_target_prefix)}[1-9][0-9]*",
++                attestation.target_url,
++            )
++            is None
++        ):
++            raise EvidenceError(
++                "Evidence skip path attestation does not match its parent, CI, "
++                "publisher identity, and workflow provenance"
++            )
++
++    return VerifiedEvidenceHead(
++        evidence_commit_sha=evidence_sha,
++        code_commit_sha=binding.code_commit_sha,
++        ci_run_id=binding.ci_run_id,
++        ci_url=ci_run.url,
++        prior_attestation=require_prior_attestation,
++        ci_definition_status=ci_definition.status,
++        trusted_ci_definition_hash=ci_definition.trusted_definition_hash,
++        candidate_ci_definition_hash=ci_definition.candidate_definition_hash,
++    )
++
++
++def _require_full_sha(value: str, label: str) -> None:
++    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
++        raise EvidenceError(f"{label} must be a full lowercase SHA")
++
++
++def _metadata_value(text: str, label: str) -> str:
++    match = re.search(
++        rf"^\|\s*{re.escape(label)}\s*\|\s*`?([^|`]+?)`?\s*\|$",
++        text,
++        re.MULTILINE,
++    )
++    if not match:
++        raise EvidenceError(f"metadata is missing required binding field {label}")
++    return match.group(1).strip()
++
++
++def _metadata_created_at(text: str) -> datetime:
++    raw = _metadata_value(text, "Created at")
++    try:
++        created_at = datetime.fromisoformat(raw)
++    except ValueError as error:
++        raise EvidenceError("metadata Created at must be an ISO-8601 timestamp") from error
++    if created_at.tzinfo is None or created_at.utcoffset() is None:
++        raise EvidenceError("metadata Created at must include a timezone")
++    return created_at
++
++
++def _validation_review_evidence(text: str, pr: PullRequest) -> ReviewEvidence:
++    decision_match = re.search(
++        r"^GitHub review decision at generation time: `([^`\r\n]+)`$",
++        text,
++        re.MULTILINE,
++    )
++    if decision_match is None:
++        raise EvidenceError("validation.md is missing the generated review decision")
++    comments = _validation_url_section(
++        text,
++        "Line-level comment URLs:",
++        "Review record URLs:",
++        f"{pr.url}#discussion_r",
++    )
++    reviews = _validation_url_section(
++        text,
++        "Review record URLs:",
++        "Independent retrieval:",
++        f"{pr.url}#pullrequestreview-",
++    )
++    return ReviewEvidence(
++        decision=decision_match.group(1),
++        line_comment_urls=comments,
++        review_urls=reviews,
++    )
++
++
++def _validation_url_section(
++    text: str,
++    heading: str,
++    next_heading: str,
++    required_prefix: str,
++) -> tuple[str, ...]:
++    match = re.search(
++        rf"^{re.escape(heading)}\n\n(?P<body>.*?)(?=\n\n^{re.escape(next_heading)}$)",
++        text,
++        re.MULTILINE | re.DOTALL,
++    )
++    if match is None:
++        raise EvidenceError(f"validation.md is missing generated section {heading}")
++    lines = tuple(line for line in match.group("body").splitlines() if line)
++    if lines == ("- None",):
++        return ()
++    if not lines or any(not line.startswith("- ") for line in lines):
++        raise EvidenceError(f"validation.md has malformed entries in {heading}")
++    urls = tuple(line.removeprefix("- ") for line in lines)
++    if any(not url.startswith(required_prefix) for url in urls):
++        raise EvidenceError(f"validation.md has an out-of-scope URL in {heading}")
++    if len(set(urls)) != len(urls):
++        raise EvidenceError(f"validation.md has duplicate URLs in {heading}")
++    return urls
++
++
++def _replace_evidence_directory(
++    repository_root: Path,
++    pr_number: int,
++    contents: dict[str, str],
++) -> Path:
++    if set(contents) != EVIDENCE_FILES:
++        raise EvidenceError("Evidence Snapshot must contain exactly the five required files")
++    docs = repository_root / "docs"
++    parent = docs / "evidence"
++    if docs.is_symlink() or parent.is_symlink():
++        raise EvidenceError("Evidence parent directories must not be symbolic links")
++    parent.mkdir(parents=True, exist_ok=True)
++    target = parent / f"pr-{pr_number}"
++    if target.is_symlink():
++        raise EvidenceError("Evidence target directory must not be a symbolic link")
++    if target.exists():
++        existing = {path.name for path in target.iterdir()}
++        unexpected = existing - EVIDENCE_FILES
++        if unexpected:
++            raise EvidenceError(
++                f"refusing to replace Evidence directory containing unexpected files: "
++                f"{', '.join(sorted(unexpected))}"
++            )
++    temporary = Path(tempfile.mkdtemp(prefix=f".pr-{pr_number}-", dir=parent))
++    backup = parent / f".pr-{pr_number}-backup"
++    try:
++        for name, content in contents.items():
++            (temporary / name).write_text(content, encoding="utf-8")
++        if backup.exists():
++            raise EvidenceError(f"stale Evidence backup exists: {backup}")
++        if target.exists():
++            target.rename(backup)
++        temporary.rename(target)
++        if backup.exists():
++            shutil.rmtree(backup)
++    except Exception:
++        if target.exists() and backup.exists():
++            shutil.rmtree(target)
++        if backup.exists():
++            backup.rename(target)
++        if temporary.exists():
++            shutil.rmtree(temporary)
++        raise
++    return target
++
++
++def _parse_name_status(output: str) -> tuple[ChangedFile, ...]:
++    files: list[ChangedFile] = []
++    for line in output.splitlines():
++        fields = line.split("\t")
++        if len(fields) < 2:
++            continue
++        raw_status = fields[0]
++        status = raw_status[0]
++        path = " → ".join(fields[1:]) if status in {"R", "C"} else fields[-1]
++        normalized = status if status in {"A", "D"} else "M"
++        files.append(ChangedFile(normalized, path))
++    return tuple(files)
++
++
++def _parse_numstat(output: str) -> tuple[int, int]:
++    additions = 0
++    deletions = 0
++    for line in output.splitlines():
++        fields = line.split("\t", maxsplit=2)
++        if len(fields) < 3:
++            continue
++        if fields[0].isdigit():
++            additions += int(fields[0])
++        if fields[1].isdigit():
++            deletions += int(fields[1])
++    return additions, deletions
++
++
++def _parse_commits(output: str) -> tuple[tuple[str, str], ...]:
++    commits: list[tuple[str, str]] = []
++    for line in output.splitlines():
++        sha, separator, subject = line.partition("\t")
++        if separator:
++            commits.append((sha, subject))
++    return tuple(commits)
++
++
++def _escape(value: str) -> str:
++    return value.replace("|", "\\|").replace("\n", " ")
++
++
++def _metadata_markdown(
++    pr: PullRequest,
++    ci: CIRun,
++    merge_base: str,
++    files: tuple[ChangedFile, ...],
++    additions: int,
++    deletions: int,
++    commits: tuple[tuple[str, str], ...],
++    ci_definition: CIDefinitionComparison,
++    created_at: datetime,
++) -> str:
++    commit_rows = (
++        "\n".join(f"| `{sha}` | {_escape(subject)} |" for sha, subject in commits)
++        or "| — | No commits in comparison range |"
++    )
++    ci_timing_note = (
++        "\n> The automatic Evidence job runs after the `quality`, `database`, and "
++        "`container`\n> jobs succeed. At snapshot time the enclosing workflow is "
++        "still active only because\n> this blocking Evidence job is its final job."
++        if ci.status == "required-jobs-completed"
++        else ""
++    )
++    definition_note = (
++        "\n> **Re-review required:** repository-controlled CI gate inputs differ from "
++        "the trusted\n> default-branch definition. This Evidence must not receive or "
++        "preserve a trusted\n> green status."
++        if ci_definition.status == "requires-re-review"
++        else ""
++    )
++    return f"""# Evidence Snapshot for PR #{pr.number}
++
++## Binding
++
++| Field | Value |
++|---|---|
++| PR number | `#{pr.number}` |
++| PR title | {_escape(pr.title)} |
++| PR URL | {pr.url} |
++| Source branch | `{pr.source_branch}` |
++| Target branch | `{pr.target_branch}` |
++| Code commit SHA | `{pr.head_sha}` |
++| Merge base | `{merge_base}` |
++| CI run ID | `{ci.run_id}` |
++| CI conclusion | `{ci.conclusion}` |
++| CI URL | {ci.url} |
++| CI definition status | `{ci_definition.status}` |
++| Trusted CI definition hash | `{ci_definition.trusted_definition_hash}` |
++| Candidate CI definition hash | `{ci_definition.candidate_definition_hash}` |
++| Created at | `{created_at.isoformat()}` |
++
++> The CI result above belongs to code commit `{pr.head_sha}`, not to the later
++> Evidence commit. The Evidence commit must not be used as a new generation trigger;
++> doing so would create a CI/Evidence loop.
++{ci_timing_note}
++{definition_note}
++
++## Change overview
++
++| Metric | Value |
++|---|---:|
++| Changed files | {len(files)} |
++| Added lines | {additions} |
++| Deleted lines | {deletions} |
++
++The authoritative patch was generated with the three-dot comparison
++`git diff origin/{pr.target_branch}...{pr.head_sha} -- . ':(exclude)docs/evidence/**'`.
++The entire `docs/evidence/**` tree is excluded to prevent self-reference. No source
++files are copied into this directory.
++
++## Code commits
++
++| Commit | Subject |
++|---|---|
++{commit_rows}
++
++## Position and known limitations
++
++This directory is a factual index and snapshot for PR #{pr.number}. It records a
++fixed field set chosen by the tool's designers, so automatic generation does not
++eliminate selection bias or blind spots. `diff.patch` is the complete authoritative
++change record for scope questions, excluding only `docs/evidence/**`.
++
++Evidence does not replace source review. An Advisor must read both this snapshot and
++the source at code commit `{pr.head_sha}`. If Evidence and source disagree, source is
++authoritative and the Evidence error must be reported. The tool cannot mechanically
++prove that an Advisor actually read the source.
++"""
++
++
++def _changed_files_markdown(
++    pr: PullRequest,
++    merge_base: str,
++    files: tuple[ChangedFile, ...],
++    additions: int,
++    deletions: int,
++) -> str:
++    labels = {"A": "Added", "M": "Modified", "D": "Deleted"}
++    sections: list[str] = []
++    for status in ("A", "M", "D"):
++        matching = [item for item in files if item.status == status]
++        rows = "\n".join(f"- `{_escape(item.path)}`" for item in matching) or "- None"
++        sections.append(f"## {labels[status]} files\n\n{rows}")
++    protected = " ".join(PROTECTED_PATHS)
++    return f"""# Changed files for PR #{pr.number}
++
++Comparison: `origin/{pr.target_branch}...{pr.head_sha}` (three-dot)
++
++| Metric | Value |
++|---|---:|
++| Merge base | `{merge_base}` |
++| Changed files | {len(files)} |
++| Added lines | {additions} |
++| Deleted lines | {deletions} |
++
++{chr(10).join(sections)}
++
++## Unmodified-boundary verification
++
++Run the following command from any worktree for this repository. It must produce no
++output; any output means a protected boundary changed:
++
++```bash
++git diff origin/{pr.target_branch}...{pr.head_sha} -- {protected}
++```
++
++The complete changed-path list can be reproduced without relying on this file:
++
++```bash
++git diff --name-status origin/{pr.target_branch}...{pr.head_sha} -- . ':(exclude)docs/evidence/**'
++```
++"""
++
++
++def _validation_markdown(
++    pr: PullRequest,
++    ci: CIRun,
++    reviews: ReviewEvidence,
++    merge_base: str,
++    created_at: datetime,
++) -> str:
++    job_rows = "\n".join(
++        f"| {_escape(job.name)} | `{job.conclusion}` | {job.url} |"
++        for job in sorted(ci.jobs, key=lambda item: item.name)
++    )
++    comment_rows = "\n".join(f"- {url}" for url in reviews.line_comment_urls) or "- None"
++    review_rows = "\n".join(f"- {url}" for url in reviews.review_urls) or "- None"
++    ci_timing_note = (
++        "\nThe automatic Evidence job observed all three required code jobs as "
++        "successful. The\nworkflow status was still active solely because the "
++        "blocking Evidence job had not yet\nfinished."
++        if ci.status == "required-jobs-completed"
++        else ""
++    )
++    return f"""# Validation record for PR #{pr.number}
++
++Created at: `{created_at.isoformat()}`
++
++This file records evidence locations and results, not an evaluation of their
++correctness. When a record disagrees with its original source, the original source
++is authoritative.
++
++## CI status
++
++| Field | Value |
++|---|---|
++| Run ID | `{ci.run_id}` |
++| Code commit | `{ci.commit_sha}` |
++| Status | `{ci.status}` |
++| Conclusion | `{ci.conclusion}` |
++| URL | {ci.url} |
++| Merge base | `{merge_base}` |
++
++> This CI result applies to code commit `{pr.head_sha}`, not to the Evidence commit
++> that contains this directory. Do not regenerate Evidence to describe its own
++> commit. A later code change requires a new successful CI run and a regenerated
++> snapshot.
++{ci_timing_note}
++
++| Job | Conclusion | URL |
++|---|---|---|
++{job_rows}
++
++CI retrieval:
++
++```bash
++gh run view {ci.run_id} --json jobs
++gh run view {ci.run_id} --log
++gh run download {ci.run_id} --name quality-reports
++gh run download {ci.run_id} --name database-reports
++gh run download {ci.run_id} --name clean-start-evidence
++```
++
++## Test evidence
++
++Test result locations are the `quality-reports` and `database-reports` artifacts
++from run `{ci.run_id}`. Reproduce the repository checks with:
++
++```bash
++make build-reproducible
++make typecheck
++make lint
++make test-unit
++make test-integration
++```
++
++## Reviewer status
++
++GitHub review decision at generation time: `{_escape(reviews.decision)}`
++
++Line-level comment URLs:
++
++{comment_rows}
++
++Review record URLs:
++
++{review_rows}
++
++Independent retrieval:
++
++```bash
++gh api repos/{pr.repository}/pulls/{pr.number}/comments
++gh api repos/{pr.repository}/pulls/{pr.number}/reviews
++```
++"""
++
++
++def _advisor_context_markdown(pr: PullRequest) -> str:
++    return f"""# Advisor context for PR #{pr.number}
++
++## Required review order
++
++1. Read `metadata.md` and verify the PR, branch, code commit, and CI binding.
++2. Run the boundary command in `changed-files.md`.
++3. Read `validation.md` and follow its original evidence links.
++4. Inspect `diff.patch` for the complete three-dot change record.
++5. Use the Advisor Workspace Resolver to inspect the source at code commit
++   `{pr.head_sha}` in detached HEAD state.
++
++The original Evidence files are in `docs/evidence/pr-{pr.number}/` on branch
++`{pr.source_branch}`. The source of record is the repository at code commit
++`{pr.head_sha}`.
++
++## Non-substitution rule
++
++This directory cannot replace source judgment. Evidence and the corresponding
++source commit are both required. If they disagree, source is authoritative and the
++Evidence error must be called out in the Advisor opinion. An opinion must record the
++actual reviewed commit SHA so that the gate can invalidate it after a later code
++change.
++"""
+diff --git a/scripts/ao/git.py b/scripts/ao/git.py
+new file mode 100644
+index 0000000..d9f96c6
+--- /dev/null
++++ b/scripts/ao/git.py
+@@ -0,0 +1,91 @@
++from __future__ import annotations
++
++import json
++import subprocess
++from collections.abc import Sequence
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++
++class CommandFailed(RuntimeError):
++    """A subprocess failed."""
++
++    def __init__(self, args: Sequence[str], returncode: int, stderr: str) -> None:
++        command = " ".join(args)
++        detail = stderr.strip() or "no stderr"
++        super().__init__(f"command failed ({returncode}): {command}: {detail}")
++        self.args_list = tuple(args)
++        self.returncode = returncode
++        self.stderr = stderr
++
++
++@dataclass(frozen=True)
++class CommandResult:
++    stdout: str
++    stderr: str
++    returncode: int
++
++
++class CommandRunner:
++    def run(
++        self,
++        args: Sequence[str],
++        *,
++        cwd: Path | None = None,
++        check: bool = True,
++    ) -> CommandResult:
++        completed = subprocess.run(
++            list(args),
++            cwd=cwd,
++            check=False,
++            capture_output=True,
++            text=True,
++        )
++        result = CommandResult(completed.stdout, completed.stderr, completed.returncode)
++        if check and result.returncode != 0:
++            raise CommandFailed(args, result.returncode, result.stderr)
++        return result
++
++
++class GitRepository:
++    def __init__(self, path: Path, runner: CommandRunner | None = None) -> None:
++        self.path = path.resolve()
++        self.runner = runner or CommandRunner()
++        top_level = self.git("rev-parse", "--show-toplevel").stdout.strip()
++        self.root = Path(top_level).resolve()
++
++    def git(self, *args: str, check: bool = True) -> CommandResult:
++        return self.runner.run(("git", "-C", str(self.path), *args), check=check)
++
++    def fetch(self, remote: str = "origin", *refspecs: str) -> None:
++        self.git("fetch", "--prune", remote, *refspecs)
++
++    def remote_slug(self, remote: str = "origin") -> str:
++        url = self.git("remote", "get-url", remote).stdout.strip()
++        if url.startswith("git@github.com:"):
++            slug = url.removeprefix("git@github.com:")
++        elif "github.com/" in url:
++            slug = url.split("github.com/", maxsplit=1)[1]
++        else:
++            raise ValueError(f"{remote} is not a GitHub remote: {url}")
++        return slug.removesuffix(".git").strip("/")
++
++    def common_git_dir(self) -> Path:
++        raw = self.git("rev-parse", "--git-common-dir").stdout.strip()
++        path = Path(raw)
++        if not path.is_absolute():
++            path = self.root / path
++        return path.resolve()
++
++    def project_name(self) -> str:
++        first_line = self.git("worktree", "list", "--porcelain").stdout.partition("\n")[0]
++        if not first_line.startswith("worktree "):
++            raise ValueError("git worktree list did not return a primary worktree")
++        return Path(first_line.removeprefix("worktree ")).name
++
++
++def append_json_event(path: Path, event: dict[str, Any]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("a", encoding="utf-8") as stream:
++        stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+diff --git a/scripts/ao/github.py b/scripts/ao/github.py
+new file mode 100644
+index 0000000..dccff15
+--- /dev/null
++++ b/scripts/ao/github.py
+@@ -0,0 +1,293 @@
++from __future__ import annotations
++
++import json
++from typing import Protocol, cast
++
++from scripts.ao.git import CommandRunner
++from scripts.ao.models import (
++    CIJob,
++    CIRun,
++    EvidenceAttestation,
++    PullRequest,
++    ReviewEvidence,
++)
++
++REQUIRED_CI_JOBS = {"quality", "database", "container"}
++
++
++class GitHubData(Protocol):
++    def pull_request(self, number: int) -> PullRequest: ...
++
++    def successful_ci_run(
++        self,
++        commit_sha: str,
++        run_id: int | None = None,
++    ) -> CIRun: ...
++
++    def review_evidence(self, number: int, decision: str) -> ReviewEvidence: ...
++
++    def evidence_attestation(
++        self,
++        commit_sha: str,
++        context: str,
++    ) -> EvidenceAttestation: ...
++
++
++class GitHubError(RuntimeError):
++    """Required GitHub evidence is missing or not successful."""
++
++
++class CINotRunError(GitHubError):
++    """A CI record exists, but its required jobs did not execute."""
++
++
++class CIFailedError(GitHubError):
++    """CI executed and reached a non-successful conclusion."""
++
++
++class GhGitHubData:
++    def __init__(
++        self,
++        repository: str,
++        runner: CommandRunner | None = None,
++        workflow: str = "CI",
++    ) -> None:
++        self.repository = repository
++        self.runner = runner or CommandRunner()
++        self.workflow = workflow
++
++    def _json(self, *args: str) -> object:
++        result = self.runner.run(("gh", *args))
++        try:
++            return json.loads(result.stdout)
++        except json.JSONDecodeError as error:
++            raise GitHubError(f"gh returned invalid JSON for {' '.join(args)}") from error
++
++    def pull_request(self, number: int) -> PullRequest:
++        fields = "number,title,headRefName,baseRefName,headRefOid,url,reviewDecision"
++        raw = self._json(
++            "pr",
++            "view",
++            str(number),
++            "--repo",
++            self.repository,
++            "--json",
++            fields,
++        )
++        data = cast(dict[str, object], raw)
++        return PullRequest(
++            number=_required_int(data, "number"),
++            repository=self.repository,
++            title=_required_str(data, "title"),
++            source_branch=_required_str(data, "headRefName"),
++            target_branch=_required_str(data, "baseRefName"),
++            head_sha=_required_sha(data, "headRefOid"),
++            url=_required_str(data, "url"),
++            review_decision=str(data.get("reviewDecision") or "not-reviewed"),
++        )
++
++    def successful_ci_run(
++        self,
++        commit_sha: str,
++        run_id: int | None = None,
++    ) -> CIRun:
++        if run_id is not None:
++            return self._successful_current_run(commit_sha, run_id)
++        raw = self._json(
++            "run",
++            "list",
++            "--repo",
++            self.repository,
++            "--workflow",
++            self.workflow,
++            "--commit",
++            commit_sha,
++            "--limit",
++            "100",
++            "--json",
++            "databaseId,headSha,status,conclusion,url,createdAt",
++        )
++        runs = cast(list[dict[str, object]], raw)
++        matching = [run for run in runs if run.get("headSha") == commit_sha]
++        if not matching:
++            raise GitHubError(f"no {self.workflow} CI run found for code commit {commit_sha}")
++        latest = max(matching, key=lambda run: str(run.get("createdAt") or ""))
++        run_id = _required_int(latest, "databaseId")
++        return self._validated_run(latest, run_id)
++
++    def _successful_current_run(self, commit_sha: str, run_id: int) -> CIRun:
++        raw = self._json(
++            "run",
++            "view",
++            str(run_id),
++            "--repo",
++            self.repository,
++            "--json",
++            "headSha,status,conclusion,url,jobs",
++        )
++        data = cast(dict[str, object], raw)
++        if _required_sha(data, "headSha") != commit_sha:
++            raise GitHubError(f"CI run {run_id} does not belong to code commit {commit_sha}")
++        return self._validated_run(data, run_id, allow_active=True)
++
++    def _validated_run(
++        self,
++        data: dict[str, object],
++        run_id: int,
++        *,
++        allow_active: bool = False,
++    ) -> CIRun:
++        status = _required_str(data, "status")
++        conclusion = str(data.get("conclusion") or "")
++        jobs_value = data.get("jobs")
++        if not isinstance(jobs_value, list):
++            jobs_raw = self._json(
++                "run",
++                "view",
++                str(run_id),
++                "--repo",
++                self.repository,
++                "--json",
++                "jobs",
++            )
++            jobs_value = cast(dict[str, object], jobs_raw).get("jobs")
++        if not isinstance(jobs_value, list):
++            raise GitHubError(f"CI run {run_id} did not return jobs")
++        jobs_data = cast(list[dict[str, object]], jobs_value)
++        jobs = tuple(
++            CIJob(
++                name=_required_str(job, "name"),
++                conclusion=str(job.get("conclusion") or ""),
++                url=_required_str(job, "url"),
++            )
++            for job in jobs_data
++        )
++        if conclusion == "action_required" or not jobs:
++            raise CINotRunError(
++                f"CI run {run_id} did not execute required jobs "
++                f"(status={status}, conclusion={conclusion or 'none'}, jobs={len(jobs)}); "
++                "this is not a success or a test failure, so gate status is indeterminate"
++            )
++        if not allow_active and status != "completed":
++            raise GitHubError(
++                f"CI run {run_id} is not completed "
++                f"(status={status}, conclusion={conclusion or 'none'}); "
++                "gate status is indeterminate"
++            )
++        if allow_active and status not in {"in_progress", "completed"}:
++            raise GitHubError(
++                f"CI run {run_id} is not active or completed "
++                f"(status={status}, conclusion={conclusion or 'none'}); "
++                "gate status is indeterminate"
++            )
++        if status == "completed" and conclusion != "success":
++            raise CIFailedError(
++                f"CI run {run_id} executed but failed "
++                f"(status={status}, conclusion={conclusion or 'none'})"
++            )
++        required_jobs = tuple(job for job in jobs if job.name in REQUIRED_CI_JOBS)
++        unsuccessful = [job.name for job in required_jobs if job.conclusion != "success"]
++        missing = REQUIRED_CI_JOBS - {job.name for job in required_jobs}
++        if not required_jobs or unsuccessful or missing:
++            details: list[str] = []
++            if unsuccessful:
++                details.append(f"unsuccessful: {', '.join(unsuccessful)}")
++            if missing:
++                details.append(f"missing: {', '.join(sorted(missing))}")
++            detail = "; ".join(details) if details else "no jobs returned"
++            raise GitHubError(
++                f"CI run {run_id} lacks an all-successful job set ({detail}); "
++                "Evidence must not be generated"
++            )
++        return CIRun(
++            run_id=run_id,
++            commit_sha=_required_sha(data, "headSha"),
++            status="required-jobs-completed" if status == "in_progress" else status,
++            conclusion="success",
++            url=_required_str(data, "url"),
++            jobs=required_jobs,
++        )
++
++    def review_evidence(self, number: int, decision: str) -> ReviewEvidence:
++        comments_raw = self._json(
++            "api",
++            f"repos/{self.repository}/pulls/{number}/comments",
++        )
++        reviews_raw = self._json(
++            "api",
++            f"repos/{self.repository}/pulls/{number}/reviews",
++        )
++        comments = cast(list[dict[str, object]], comments_raw)
++        reviews = cast(list[dict[str, object]], reviews_raw)
++        return ReviewEvidence(
++            decision=decision,
++            line_comment_urls=tuple(
++                url for item in comments if (url := str(item.get("html_url") or ""))
++            ),
++            review_urls=tuple(url for item in reviews if (url := str(item.get("html_url") or ""))),
++        )
++
++    def evidence_attestation(
++        self,
++        commit_sha: str,
++        context: str,
++    ) -> EvidenceAttestation:
++        raw = self._json(
++            "api",
++            f"repos/{self.repository}/commits/{commit_sha}/status",
++        )
++        data = cast(dict[str, object], raw)
++        statuses_value = data.get("statuses")
++        if not isinstance(statuses_value, list):
++            raise GitHubError(f"commit {commit_sha} did not return status records")
++        statuses = cast(list[dict[str, object]], statuses_value)
++        status = next(
++            (item for item in statuses if item.get("context") == context),
++            None,
++        )
++        if status is None:
++            raise GitHubError(f"commit {commit_sha} has no prior trusted {context} attestation")
++        creator = status.get("creator")
++        creator_login = (
++            str(cast(dict[str, object], creator).get("login") or "")
++            if isinstance(creator, dict)
++            else ""
++        )
++        return EvidenceAttestation(
++            context=_required_str(status, "context"),
++            state=_required_str(status, "state"),
++            creator_id=(
++                _required_int(cast(dict[str, object], creator), "id")
++                if isinstance(creator, dict)
++                else 0
++            ),
++            creator_login=creator_login,
++            creator_type=(
++                _required_str(cast(dict[str, object], creator), "type")
++                if isinstance(creator, dict)
++                else ""
++            ),
++            description=_required_str(status, "description"),
++            target_url=_required_str(status, "target_url"),
++        )
++
++
++def _required_str(data: dict[str, object], key: str) -> str:
++    value = data.get(key)
++    if not isinstance(value, str) or not value:
++        raise GitHubError(f"GitHub response is missing required field {key}")
++    return value
++
++
++def _required_int(data: dict[str, object], key: str) -> int:
++    value = data.get(key)
++    if not isinstance(value, int):
++        raise GitHubError(f"GitHub response is missing required integer field {key}")
++    return value
++
++
++def _required_sha(data: dict[str, object], key: str) -> str:
++    value = _required_str(data, key)
++    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
++        raise GitHubError(f"GitHub field {key} is not a full lowercase commit SHA")
++    return value
+diff --git a/scripts/ao/models.py b/scripts/ao/models.py
+new file mode 100644
+index 0000000..5ea505d
+--- /dev/null
++++ b/scripts/ao/models.py
+@@ -0,0 +1,66 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class PullRequest:
++    number: int
++    repository: str
++    title: str
++    source_branch: str
++    target_branch: str
++    head_sha: str
++    url: str
++    review_decision: str
++
++
++@dataclass(frozen=True)
++class CIJob:
++    name: str
++    conclusion: str
++    url: str
++
++
++@dataclass(frozen=True)
++class CIRun:
++    run_id: int
++    commit_sha: str
++    status: str
++    conclusion: str
++    url: str
++    jobs: tuple[CIJob, ...]
++
++
++@dataclass(frozen=True)
++class ReviewEvidence:
++    decision: str
++    line_comment_urls: tuple[str, ...]
++    review_urls: tuple[str, ...]
++
++
++@dataclass(frozen=True)
++class EvidenceBinding:
++    pr_number: int
++    source_branch: str
++    target_branch: str
++    code_commit_sha: str
++    ci_run_id: int
++    ci_conclusion: str
++
++
++@dataclass(frozen=True)
++class EvidenceSkip:
++    head_sha: str
++    reason: str
++
++
++@dataclass(frozen=True)
++class EvidenceAttestation:
++    context: str
++    state: str
++    creator_id: int
++    creator_login: str
++    creator_type: str
++    description: str
++    target_url: str
+diff --git a/scripts/ao/trust.py b/scripts/ao/trust.py
+new file mode 100644
+index 0000000..37aac40
+--- /dev/null
++++ b/scripts/ao/trust.py
+@@ -0,0 +1,225 @@
++from __future__ import annotations
++
++import hashlib
++from dataclasses import dataclass
++from pathlib import PurePosixPath
++
++from scripts.ao.git import GitRepository
++
++TRUSTED_CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
++
++# These fixed files are direct gate commands/configuration or auto-discovered
++# configuration that could override the checked-in policy when newly added. Ruff
++# is explicitly pinned to the root pyproject.toml by these hashed Makefile commands,
++# so its otherwise hierarchical per-file configuration discovery is disabled.
++TRUSTED_CI_EXACT_PATHS = (
++    ".coveragerc",
++    ".coveragerc.toml",
++    ".dockerignore",
++    ".env.example",
++    ".mypy.ini",
++    ".pytest.ini",
++    ".pytest.toml",
++    ".python-version",
++    ".ruff.toml",
++    "Dockerfile",
++    "Dockerfile.dockerignore",
++    "GNUmakefile",
++    "MANIFEST.in",
++    "Makefile",
++    "alembic.ini",
++    "compose.override.yml",
++    "compose.override.yaml",
++    "compose.yaml",
++    "compose.yml",
++    "conftest.py",
++    "docker-compose.override.yaml",
++    "docker-compose.override.yml",
++    "docker-compose.yaml",
++    "docker-compose.yml",
++    "makefile",
++    "migrations/env.py",
++    "migrations/script.py.mako",
++    "mypy.ini",
++    "pyproject.toml",
++    "pytest.ini",
++    "pytest.toml",
++    "ruff.toml",
++    "setup.cfg",
++    "setup.py",
++    "sitecustomize.py",
++    "tox.ini",
++    "usercustomize.py",
++    "uv.lock",
++    "uv.toml",
++)
++
++# Every Git entry below these roots is part of the gate implementation. New,
++# removed, renamed, or mode-changed files therefore alter the definition hash.
++TRUSTED_CI_TREE_PATHS = (
++    ".github",
++    "docker",
++    "scripts",
++    "tests",
++)
++
++# Ruff is structurally pinned to the root pyproject.toml in Makefile. Scan the
++# complete Git tree as defense in depth so an attempted nested closest-config
++# override is still an explicit trust-root change, including in future directories.
++TRUSTED_CI_RECURSIVE_FILE_NAMES = frozenset(
++    {
++        ".ruff.toml",
++        "pyproject.toml",
++        "ruff.toml",
++        "sitecustomize.py",
++        "usercustomize.py",
++    }
++)
++
++# Python imports these optional modules during site initialization. Hash every
++# importable file form and every file below a same-named package anywhere in the
++# Git tree; the editable source root is itself controlled by hashed pyproject.toml.
++TRUSTED_CI_RECURSIVE_MODULE_NAMES = frozenset(
++    {
++        "sitecustomize",
++        "usercustomize",
++    }
++)
++
++
++class CIWorkflowTrustError(RuntimeError):
++    """The source CI run did not use a comparable trusted workflow definition."""
++
++
++@dataclass(frozen=True)
++class CIDefinitionComparison:
++    source_run_path: str
++    trusted_definition_hash: str
++    candidate_definition_hash: str
++    status: str
++    differing_paths: tuple[str, ...]
++    trusted_commit_sha: str
++    candidate_commit_sha: str
++
++
++def compare_ci_definition(
++    trusted_repository: GitRepository,
++    candidate_repository: GitRepository,
++    candidate_sha: str,
++    source_run_path: str,
++    *,
++    trusted_ref: str = "HEAD",
++) -> CIDefinitionComparison:
++    """Compare every repository-controlled CI gate input against a trusted ref."""
++    _require_full_sha(candidate_sha, "candidate CI commit SHA")
++    if source_run_path != TRUSTED_CI_WORKFLOW_PATH:
++        raise CIWorkflowTrustError(
++            f"source CI run path {source_run_path!r} is not trusted {TRUSTED_CI_WORKFLOW_PATH!r}"
++        )
++
++    trusted_sha = trusted_repository.git("rev-parse", trusted_ref).stdout.strip()
++    _require_full_sha(trusted_sha, "trusted CI commit SHA")
++    trusted_entries = _definition_entries(trusted_repository, trusted_sha)
++    candidate_entries = _definition_entries(candidate_repository, candidate_sha)
++    differing_paths = tuple(
++        path
++        for path in sorted(trusted_entries.keys() | candidate_entries.keys())
++        if trusted_entries.get(path) != candidate_entries.get(path)
++    )
++    trusted_hash = _definition_hash(trusted_entries)
++    candidate_hash = _definition_hash(candidate_entries)
++    status = (
++        "trusted"
++        if not differing_paths and trusted_hash == candidate_hash
++        else "requires-re-review"
++    )
++    return CIDefinitionComparison(
++        source_run_path=source_run_path,
++        trusted_definition_hash=trusted_hash,
++        candidate_definition_hash=candidate_hash,
++        status=status,
++        differing_paths=differing_paths,
++        trusted_commit_sha=trusted_sha,
++        candidate_commit_sha=candidate_sha,
++    )
++
++
++def _definition_entries(repository: GitRepository, commit_sha: str) -> dict[str, str]:
++    entries: dict[str, str] = {}
++    for path in TRUSTED_CI_EXACT_PATHS:
++        entry = _single_tree_entry(repository, commit_sha, path)
++        entries[path] = entry or "missing"
++    all_files = repository.git("ls-tree", "-r", commit_sha, "--", ".").stdout
++    for line in all_files.splitlines():
++        path, value = _parse_tree_entry(line)
++        if _is_recursive_trust_path(path):
++            _record_entry(entries, path, value)
++    for root in TRUSTED_CI_TREE_PATHS:
++        output = repository.git("ls-tree", "-r", commit_sha, "--", root).stdout
++        for line in output.splitlines():
++            path, value = _parse_tree_entry(line)
++            _record_entry(entries, path, value)
++    return entries
++
++
++def _is_recursive_trust_path(path: str) -> bool:
++    parsed = PurePosixPath(path)
++    file_name = parsed.name
++    if file_name in TRUSTED_CI_RECURSIVE_FILE_NAMES:
++        return True
++    if any(
++        file_name.startswith(f"{module_name}.") for module_name in TRUSTED_CI_RECURSIVE_MODULE_NAMES
++    ):
++        return True
++    return any(part in TRUSTED_CI_RECURSIVE_MODULE_NAMES for part in parsed.parts[:-1])
++
++
++def _record_entry(entries: dict[str, str], path: str, value: str) -> None:
++    existing = entries.get(path)
++    if existing is not None and existing != value:
++        raise CIWorkflowTrustError(
++            f"trusted CI definition path has conflicting Git entries: {path}"
++        )
++    entries[path] = value
++
++
++def _single_tree_entry(
++    repository: GitRepository,
++    commit_sha: str,
++    path: str,
++) -> str | None:
++    output = repository.git("ls-tree", commit_sha, "--", path).stdout.rstrip("\n")
++    if not output:
++        return None
++    parsed_path, value = _parse_tree_entry(output)
++    if parsed_path != path:
++        raise CIWorkflowTrustError(
++            f"commit {commit_sha} returned unexpected tree path {parsed_path!r} for {path!r}"
++        )
++    return value
++
++
++def _parse_tree_entry(line: str) -> tuple[str, str]:
++    metadata, separator, path = line.partition("\t")
++    fields = metadata.split()
++    if not separator or len(fields) != 3 or not path:
++        raise CIWorkflowTrustError(f"malformed trusted CI Git tree entry: {line!r}")
++    mode, object_type, object_sha = fields
++    if object_type != "blob":
++        raise CIWorkflowTrustError(f"trusted CI definition entry must be a blob: {path}")
++    return path, f"{mode} {object_type} {object_sha}"
++
++
++def _definition_hash(entries: dict[str, str]) -> str:
++    digest = hashlib.sha256()
++    for path, value in sorted(entries.items()):
++        digest.update(path.encode())
++        digest.update(b"\0")
++        digest.update(value.encode())
++        digest.update(b"\n")
++    return digest.hexdigest()
++
++
++def _require_full_sha(value: str, label: str) -> None:
++    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
++        raise CIWorkflowTrustError(f"{label} must be a full lowercase SHA")
+diff --git a/scripts/ao/workspace.py b/scripts/ao/workspace.py
+new file mode 100644
+index 0000000..f581512
+--- /dev/null
++++ b/scripts/ao/workspace.py
+@@ -0,0 +1,702 @@
++from __future__ import annotations
++
++import fcntl
++import json
++import os
++import re
++import shutil
++import signal
++import subprocess
++import tempfile
++import time
++from collections.abc import Callable, Sequence
++from dataclasses import dataclass
++from datetime import UTC, datetime
++from pathlib import Path
++
++from scripts.ao.evidence import parse_evidence_binding
++from scripts.ao.git import GitRepository, append_json_event
++from scripts.ao.github import GitHubData
++from scripts.ao.models import EvidenceBinding
++
++
++class WorkspaceError(RuntimeError):
++    """An Advisor workspace cannot be created or safely managed."""
++
++
++@dataclass(frozen=True)
++class StaleWorktree:
++    path: Path
++    commit_sha: str
++    age_seconds: float
++    pattern: str
++    active_process: bool
++
++
++@dataclass(frozen=True)
++class OpinionValidation:
++    valid: bool
++    gate_status: str
++    reviewed_commit_sha: str
++    evidence_commit_sha: str
++    current_pr_head_sha: str
++    reason: str
++
++
++class WorkspaceLease:
++    def __init__(
++        self,
++        repository: GitRepository,
++        path: Path,
++        binding: EvidenceBinding,
++        log_path: Path,
++        now: Callable[[], datetime],
++        lock_fd: int,
++    ) -> None:
++        self.repository = repository
++        self.path = path
++        self.binding = binding
++        self.log_path = log_path
++        self.now = now
++        self.closed = False
++        self.marker_path = _marker_path(path)
++        self.lock_fd: int | None = lock_fd
++
++    def __enter__(self) -> WorkspaceLease:
++        return self
++
++    def __exit__(
++        self,
++        exception_type: type[BaseException] | None,
++        exception: BaseException | None,
++        traceback: object,
++    ) -> None:
++        self.close()
++
++    def close(self) -> None:
++        if self.closed:
++            return
++        removed = self.repository.git(
++            "worktree",
++            "remove",
++            "--force",
++            str(self.path),
++            check=False,
++        )
++        pruned = self.repository.git("worktree", "prune", check=False)
++        if removed.returncode != 0 and self.path.exists():
++            if self._marker_matches():
++                shutil.rmtree(self.path)
++                pruned = self.repository.git("worktree", "prune", check=False)
++        if not self.path.exists():
++            self.marker_path.unlink(missing_ok=True)
++        if self.path.exists() or self.marker_path.exists() or pruned.returncode != 0:
++            append_json_event(
++                self.log_path,
++                {
++                    "action": "advisor.workspace.destroy",
++                    "commit_sha": self.binding.code_commit_sha,
++                    "error": removed.stderr.strip() or pruned.stderr.strip(),
++                    "finished_at": self.now().isoformat(),
++                    "path": str(self.path),
++                    "pr_number": self.binding.pr_number,
++                    "result": "failure",
++                },
++            )
++            raise WorkspaceError(f"failed to clean Advisor worktree {self.path}")
++        self.closed = True
++        self._release_lock()
++        append_json_event(
++            self.log_path,
++            {
++                "action": "advisor.workspace.destroy",
++                "commit_sha": self.binding.code_commit_sha,
++                "destroyed_at": self.now().isoformat(),
++                "path": str(self.path),
++                "pr_number": self.binding.pr_number,
++                "result": "success",
++            },
++        )
++
++    def _marker_matches(self) -> bool:
++        try:
++            data = json.loads(self.marker_path.read_text(encoding="utf-8"))
++        except (OSError, json.JSONDecodeError):
++            return False
++        return bool(
++            data.get("pr_number") == self.binding.pr_number
++            and data.get("commit_sha") == self.binding.code_commit_sha
++        )
++
++    def record_advisor_process(self, process_id: int) -> None:
++        try:
++            marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
++        except (OSError, json.JSONDecodeError) as error:
++            raise WorkspaceError("cannot update Advisor workspace lifecycle marker") from error
++        if not isinstance(marker, dict):
++            raise WorkspaceError("Advisor workspace lifecycle marker is invalid")
++        marker["advisor_pid"] = process_id
++        marker["advisor_process_group_id"] = process_id
++        self.marker_path.write_text(
++            json.dumps(marker, sort_keys=True) + "\n",
++            encoding="utf-8",
++        )
++
++    def _release_lock(self) -> None:
++        if self.lock_fd is not None:
++            os.close(self.lock_fd)
++            self.lock_fd = None
++
++
++class WorkspaceResolver:
++    def __init__(
++        self,
++        repository: GitRepository,
++        *,
++        temp_root: Path | None = None,
++        log_path: Path | None = None,
++        now: Callable[[], datetime] | None = None,
++    ) -> None:
++        self.repository = repository
++        self.temp_root = (temp_root or Path(tempfile.gettempdir())).resolve()
++        self.log_path = log_path or repository.common_git_dir() / "ao" / "workspace-events.jsonl"
++        self.now = now or (lambda: datetime.now(UTC))
++
++    def acquire(self, metadata_path: Path) -> WorkspaceLease:
++        started_at = self.now()
++        started = time.monotonic()
++        binding: EvidenceBinding | None = None
++        path: Path | None = None
++        lock_fd: int | None = None
++        try:
++            binding = parse_evidence_binding(metadata_path)
++            # Fetch is deliberately unconditional. A failure pauses review; there is
++            # no fallback to main, another branch, or an already-present object.
++            self.repository.fetch("origin")
++            self.repository.git("cat-file", "-e", f"{binding.code_commit_sha}^{{commit}}")
++            lock_fd = self._acquire_lock(binding)
++            prefix = _workspace_prefix(self.repository, binding)
++            existing = [
++                existing_path
++                for existing_path, _ in _worktree_entries(self.repository)
++                if existing_path.name.startswith(prefix)
++            ]
++            if existing:
++                raise WorkspaceError(
++                    f"Advisor worktree already exists for PR #{binding.pr_number} "
++                    f"at {existing[0]}; reclaim it before retrying"
++                )
++            path = self._allocate_path(binding)
++            self.repository.git(
++                "worktree",
++                "add",
++                "--detach",
++                str(path),
++                binding.code_commit_sha,
++            )
++            actual = self.repository.runner.run(
++                ("git", "-C", str(path), "rev-parse", "HEAD")
++            ).stdout.strip()
++            branch = self.repository.runner.run(
++                ("git", "-C", str(path), "branch", "--show-current")
++            ).stdout.strip()
++            if actual != binding.code_commit_sha or branch:
++                raise WorkspaceError("Advisor worktree is not detached at the Evidence code commit")
++            marker = {
++                "commit_sha": binding.code_commit_sha,
++                "created_at": started_at.isoformat(),
++                "pid": os.getpid(),
++                "pr_number": binding.pr_number,
++            }
++            _marker_path(path).write_text(
++                json.dumps(marker, sort_keys=True) + "\n",
++                encoding="utf-8",
++            )
++            append_json_event(
++                self.log_path,
++                {
++                    "action": "advisor.workspace.create",
++                    "commit_sha": binding.code_commit_sha,
++                    "created_at": started_at.isoformat(),
++                    "duration_seconds": round(time.monotonic() - started, 6),
++                    "path": str(path),
++                    "pr_number": binding.pr_number,
++                    "result": "success",
++                },
++            )
++            return WorkspaceLease(
++                self.repository,
++                path,
++                binding,
++                self.log_path,
++                self.now,
++                lock_fd,
++            )
++        except BaseException as error:
++            if path is not None and path.exists():
++                self.repository.git(
++                    "worktree",
++                    "remove",
++                    "--force",
++                    str(path),
++                    check=False,
++                )
++                if path.exists():
++                    shutil.rmtree(path)
++                self.repository.git("worktree", "prune", check=False)
++            if path is not None:
++                _marker_path(path).unlink(missing_ok=True)
++            if lock_fd is not None:
++                os.close(lock_fd)
++            append_json_event(
++                self.log_path,
++                {
++                    "action": "advisor.workspace.create",
++                    "commit_sha": binding.code_commit_sha if binding else None,
++                    "duration_seconds": round(time.monotonic() - started, 6),
++                    "error": str(error),
++                    "finished_at": self.now().isoformat(),
++                    "gate_status": "indeterminate",
++                    "path": str(path) if path else None,
++                    "pr_number": binding.pr_number if binding else None,
++                    "result": "failure",
++                    "started_at": started_at.isoformat(),
++                },
++            )
++            raise
++
++    def _allocate_path(self, binding: EvidenceBinding) -> Path:
++        self.temp_root.mkdir(parents=True, exist_ok=True)
++        prefix = _workspace_prefix(self.repository, binding)
++        allocated = Path(tempfile.mkdtemp(prefix=prefix, dir=self.temp_root))
++        allocated.rmdir()
++        return allocated
++
++    def _acquire_lock(self, binding: EvidenceBinding) -> int:
++        prefix = _workspace_prefix(self.repository, binding).removesuffix("-")
++        lock_path = self.repository.common_git_dir() / "ao" / "locks" / f"{prefix}.lock"
++        lock_path.parent.mkdir(parents=True, exist_ok=True)
++        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
++        try:
++            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except BlockingIOError as error:
++            os.close(lock_fd)
++            raise WorkspaceError(
++                f"Advisor workspace for PR #{binding.pr_number} is already active"
++            ) from error
++        return lock_fd
++
++    def run_advisor(
++        self,
++        metadata_path: Path,
++        command: Sequence[str],
++        record_path: Path,
++        *,
++        timeout_seconds: float,
++        terminate_grace_seconds: float = 5.0,
++    ) -> int:
++        if not command:
++            raise WorkspaceError("Advisor command must not be empty")
++        if timeout_seconds <= 0:
++            raise WorkspaceError("Advisor timeout must be greater than zero")
++        if terminate_grace_seconds <= 0:
++            raise WorkspaceError("Advisor termination grace period must be greater than zero")
++        lease = self.acquire(metadata_path)
++        process: subprocess.Popen[str] | None = None
++        started_at = self.now()
++        status = "interrupted"
++        exit_code: int | None = None
++        process_return_code: int | None = None
++        termination_method: str | None = None
++        failure_reason: str | None = None
++        cleanup_succeeded = False
++        try:
++            environment = os.environ.copy()
++            environment.update(
++                {
++                    "AO_ADVISOR_COMMIT_SHA": lease.binding.code_commit_sha,
++                    "AO_ADVISOR_PR_NUMBER": str(lease.binding.pr_number),
++                    "AO_EVIDENCE_METADATA": str(metadata_path.resolve()),
++                }
++            )
++            process = subprocess.Popen(
++                list(command),
++                cwd=lease.path,
++                env=environment,
++                start_new_session=True,
++                text=True,
++            )
++            lease.record_advisor_process(process.pid)
++            try:
++                process_return_code = process.wait(timeout=timeout_seconds)
++            except subprocess.TimeoutExpired:
++                status = "timed-out"
++                exit_code = 124
++                failure_reason = f"Advisor exceeded timeout of {timeout_seconds} seconds"
++                termination_method = _terminate_process_group(
++                    process,
++                    terminate_grace_seconds,
++                )
++            else:
++                exit_code = process_return_code
++                status = "completed" if exit_code == 0 else "command-failed"
++                if exit_code != 0:
++                    failure_reason = f"Advisor command exited with status {exit_code}"
++        except BaseException as error:
++            failure_reason = f"{type(error).__name__}: {error}"
++            if process is not None and process.poll() is None:
++                termination_method = _terminate_process_group(
++                    process,
++                    terminate_grace_seconds,
++                )
++            raise
++        finally:
++            if process is not None and process.poll() is None:
++                termination_method = _terminate_process_group(
++                    process,
++                    terminate_grace_seconds,
++                )
++            try:
++                lease.close()
++                cleanup_succeeded = True
++            finally:
++                record = {
++                    "cleanup_succeeded": cleanup_succeeded,
++                    "evidence_metadata": str(metadata_path.resolve()),
++                    "exit_code": exit_code,
++                    "failure_reason": failure_reason,
++                    "finished_at": self.now().isoformat(),
++                    "pr_number": lease.binding.pr_number,
++                    "process_return_code": (
++                        process.returncode if process is not None else process_return_code
++                    ),
++                    "reviewed_commit_sha": lease.binding.code_commit_sha,
++                    "started_at": started_at.isoformat(),
++                    "status": status,
++                    "termination_method": termination_method,
++                    "timeout_seconds": timeout_seconds,
++                    "workspace_path": str(lease.path),
++                }
++                _write_json_atomic(record_path, record)
++                append_json_event(
++                    self.log_path,
++                    {
++                        "action": "advisor.run",
++                        "cleanup_succeeded": cleanup_succeeded,
++                        "commit_sha": lease.binding.code_commit_sha,
++                        "failure_reason": failure_reason,
++                        "finished_at": self.now().isoformat(),
++                        "gate_status": (
++                            "valid"
++                            if status == "completed" and cleanup_succeeded
++                            else "indeterminate"
++                        ),
++                        "path": str(lease.path),
++                        "pr_number": lease.binding.pr_number,
++                        "result": (
++                            "success" if status == "completed" and cleanup_succeeded else "failure"
++                        ),
++                        "status": status,
++                        "termination_method": termination_method,
++                        "timeout_seconds": timeout_seconds,
++                    },
++                )
++        if exit_code is None:
++            raise WorkspaceError("Advisor process finished without an exit status")
++        return exit_code
++
++
++def detect_stale_worktrees(
++    repository: GitRepository,
++    *,
++    temp_root: Path | None = None,
++    older_than_seconds: float,
++    now: Callable[[], datetime] | None = None,
++) -> tuple[StaleWorktree, ...]:
++    if older_than_seconds < 0:
++        raise ValueError("older_than_seconds must be non-negative")
++    root = (temp_root or Path(tempfile.gettempdir())).resolve()
++    current_time = (now or (lambda: datetime.now(UTC)))().timestamp()
++    entries = _worktree_entries(repository)
++    project_name = repository.project_name()
++    modern = re.compile(rf"^{re.escape(project_name)}-advisor-pr-\d+-[0-9a-f]{{7,40}}-")
++    legacy = re.compile(rf"^{re.escape(project_name)}-(?:advisor|g01(?:-final)?)\.")
++    stale: list[StaleWorktree] = []
++    for path, commit in entries:
++        try:
++            if path.resolve().parent != root:
++                continue
++            name = path.name
++            if modern.match(name):
++                pattern = "advisor"
++            elif legacy.match(name):
++                pattern = "legacy-advisor-review"
++            else:
++                continue
++            marker = _read_marker(path)
++            created_at = _marker_timestamp(marker)
++            timestamp = created_at if created_at is not None else path.stat().st_mtime
++            age = max(0.0, current_time - timestamp)
++            active = _marker_pid_active(marker)
++            if age >= older_than_seconds and not active:
++                stale.append(StaleWorktree(path, commit, age, pattern, active))
++        except FileNotFoundError:
++            continue
++    return tuple(sorted(stale, key=lambda item: str(item.path)))
++
++
++def reclaim_stale_worktrees(
++    repository: GitRepository,
++    stale: Sequence[StaleWorktree],
++    *,
++    log_path: Path | None = None,
++    now: Callable[[], datetime] | None = None,
++) -> tuple[Path, ...]:
++    event_log = log_path or repository.common_git_dir() / "ao" / "workspace-events.jsonl"
++    clock = now or (lambda: datetime.now(UTC))
++    reclaimed: list[Path] = []
++    for item in stale:
++        if item.active_process:
++            raise WorkspaceError(f"refusing to reclaim active worktree {item.path}")
++        result = repository.git(
++            "worktree",
++            "remove",
++            "--force",
++            str(item.path),
++            check=False,
++        )
++        if result.returncode != 0 or item.path.exists():
++            append_json_event(
++                event_log,
++                {
++                    "action": "advisor.workspace.reclaim",
++                    "commit_sha": item.commit_sha,
++                    "error": result.stderr.strip(),
++                    "finished_at": clock().isoformat(),
++                    "path": str(item.path),
++                    "result": "failure",
++                },
++            )
++            raise WorkspaceError(f"failed to reclaim stale worktree {item.path}")
++        _marker_path(item.path).unlink(missing_ok=True)
++        reclaimed.append(item.path)
++        append_json_event(
++            event_log,
++            {
++                "action": "advisor.workspace.reclaim",
++                "commit_sha": item.commit_sha,
++                "finished_at": clock().isoformat(),
++                "path": str(item.path),
++                "result": "success",
++            },
++        )
++    repository.git("worktree", "prune")
++    return tuple(reclaimed)
++
++
++def validate_advisor_opinion(
++    repository: GitRepository,
++    github: GitHubData,
++    metadata_path: Path,
++    record_path: Path,
++) -> OpinionValidation:
++    binding = parse_evidence_binding(metadata_path)
++    try:
++        raw = json.loads(record_path.read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError) as error:
++        raise WorkspaceError(f"cannot read Advisor opinion record {record_path}") from error
++    if not isinstance(raw, dict):
++        raise WorkspaceError("Advisor opinion record must be a JSON object")
++    reviewed = raw.get("reviewed_commit_sha")
++    if not isinstance(reviewed, str):
++        raise WorkspaceError("Advisor opinion record lacks reviewed_commit_sha")
++    pull_request = github.pull_request(binding.pr_number)
++    if (
++        pull_request.number != binding.pr_number
++        or pull_request.source_branch != binding.source_branch
++        or pull_request.target_branch != binding.target_branch
++    ):
++        raise WorkspaceError("current PR identity or branches do not match Evidence")
++    repository.fetch("origin", pull_request.source_branch)
++    current_head = pull_request.head_sha
++    fetched_head = repository.git(
++        "rev-parse",
++        f"origin/{pull_request.source_branch}",
++    ).stdout.strip()
++    if fetched_head != current_head:
++        raise WorkspaceError("PR head moved while validating the Advisor opinion")
++    if reviewed != binding.code_commit_sha:
++        return OpinionValidation(
++            False,
++            "indeterminate",
++            reviewed,
++            binding.code_commit_sha,
++            current_head,
++            "Advisor opinion commit does not match Evidence code commit",
++        )
++    if (
++        raw.get("status") != "completed"
++        or raw.get("exit_code") != 0
++        or raw.get("cleanup_succeeded") is not True
++    ):
++        return OpinionValidation(
++            False,
++            "indeterminate",
++            reviewed,
++            binding.code_commit_sha,
++            current_head,
++            "Advisor command or workspace cleanup did not complete successfully",
++        )
++    ancestor = repository.git(
++        "merge-base",
++        "--is-ancestor",
++        binding.code_commit_sha,
++        current_head,
++        check=False,
++    )
++    if ancestor.returncode != 0:
++        return OpinionValidation(
++            False,
++            "indeterminate",
++            reviewed,
++            binding.code_commit_sha,
++            current_head,
++            "Evidence code commit is no longer an ancestor of the PR head",
++        )
++    later_code_commits = repository.git(
++        "log",
++        "--format=%H",
++        f"{binding.code_commit_sha}..{current_head}",
++        "--",
++        ".",
++        ":(exclude)docs/evidence/**",
++    )
++    if later_code_commits.stdout.strip():
++        return OpinionValidation(
++            False,
++            "indeterminate",
++            reviewed,
++            binding.code_commit_sha,
++            current_head,
++            "PR has code changes after the reviewed commit; re-review is required",
++        )
++    return OpinionValidation(
++        True,
++        "valid",
++        reviewed,
++        binding.code_commit_sha,
++        current_head,
++        "PR head differs, if at all, only by Evidence files",
++    )
++
++
++def _worktree_entries(repository: GitRepository) -> tuple[tuple[Path, str], ...]:
++    output = repository.git("worktree", "list", "--porcelain").stdout
++    entries: list[tuple[Path, str]] = []
++    path: Path | None = None
++    commit = ""
++    for line in (*output.splitlines(), ""):
++        if line.startswith("worktree "):
++            path = Path(line.removeprefix("worktree "))
++        elif line.startswith("HEAD "):
++            commit = line.removeprefix("HEAD ")
++        elif not line and path is not None:
++            entries.append((path, commit))
++            path = None
++            commit = ""
++    return tuple(entries)
++
++
++def _read_marker(path: Path) -> dict[str, object] | None:
++    try:
++        raw = json.loads(_marker_path(path).read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError):
++        return None
++    return raw if isinstance(raw, dict) else None
++
++
++def _marker_timestamp(marker: dict[str, object] | None) -> float | None:
++    if marker is None:
++        return None
++    value = marker.get("created_at")
++    if not isinstance(value, str):
++        return None
++    try:
++        return datetime.fromisoformat(value).timestamp()
++    except ValueError:
++        return None
++
++
++def _marker_pid_active(marker: dict[str, object] | None) -> bool:
++    if marker is None:
++        return False
++    for key in ("pid", "advisor_pid"):
++        if _pid_active(marker.get(key)):
++            return True
++    process_group_id = marker.get("advisor_process_group_id")
++    if not isinstance(process_group_id, int) or process_group_id <= 0:
++        return False
++    try:
++        os.killpg(process_group_id, 0)
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    return True
++
++
++def _pid_active(value: object) -> bool:
++    pid = value
++    if not isinstance(pid, int) or pid <= 0:
++        return False
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    return True
++
++
++def _write_json_atomic(path: Path, value: dict[str, object]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_suffix(f"{path.suffix}.tmp")
++    temporary.write_text(
++        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
++        encoding="utf-8",
++    )
++    temporary.replace(path)
++
++
++def _marker_path(worktree_path: Path) -> Path:
++    return worktree_path.with_name(f".{worktree_path.name}.ao-workspace.json")
++
++
++def _terminate_process_group(
++    process: subprocess.Popen[str],
++    grace_seconds: float,
++) -> str:
++    if process.poll() is not None:
++        return "already-exited"
++    try:
++        os.killpg(process.pid, signal.SIGTERM)
++    except ProcessLookupError:
++        process.wait()
++        return "already-exited"
++    try:
++        process.wait(timeout=grace_seconds)
++        return "sigterm"
++    except subprocess.TimeoutExpired:
++        try:
++            os.killpg(process.pid, signal.SIGKILL)
++        except ProcessLookupError:
++            pass
++        process.wait()
++        return "sigkill"
++
++
++def _workspace_prefix(repository: GitRepository, binding: EvidenceBinding) -> str:
++    return (
++        f"{repository.project_name()}-advisor-pr-{binding.pr_number}-"
++        f"{binding.code_commit_sha[:12]}-"
++    )
+diff --git a/tests/ao/__init__.py b/tests/ao/__init__.py
+new file mode 100644
+index 0000000..0c46cfe
+--- /dev/null
++++ b/tests/ao/__init__.py
+@@ -0,0 +1 @@
++"""Tests for repository-local AO tooling."""
+diff --git a/tests/ao/helpers.py b/tests/ao/helpers.py
+new file mode 100644
+index 0000000..80e4ee9
+--- /dev/null
++++ b/tests/ao/helpers.py
+@@ -0,0 +1,161 @@
++from __future__ import annotations
++
++import subprocess
++from collections.abc import Sequence
++from dataclasses import dataclass
++from pathlib import Path
++
++from scripts.ao.github import GitHubError
++from scripts.ao.models import (
++    CIJob,
++    CIRun,
++    EvidenceAttestation,
++    PullRequest,
++    ReviewEvidence,
++)
++
++
++def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
++    return subprocess.run(
++        ("git", "-C", str(path), *args),
++        check=check,
++        capture_output=True,
++        text=True,
++    )
++
++
++@dataclass(frozen=True)
++class GitFixture:
++    repository: Path
++    origin: Path
++    base_sha: str
++    code_sha: str
++
++
++def make_diverged_repository(tmp_path: Path) -> GitFixture:
++    origin = tmp_path / "origin.git"
++    repository = tmp_path / "repository"
++    git(tmp_path, "init", "--bare", str(origin))
++    git(tmp_path, "init", "-b", "main", str(repository))
++    git(repository, "config", "user.name", "AO Test")
++    git(repository, "config", "user.email", "ao@example.invalid")
++    (repository / "base.txt").write_text("base\n", encoding="utf-8")
++    git(repository, "add", "base.txt")
++    git(repository, "commit", "-m", "base")
++    base_sha = git(repository, "rev-parse", "HEAD").stdout.strip()
++    git(repository, "remote", "add", "origin", str(origin))
++    git(repository, "push", "-u", "origin", "main")
++
++    git(repository, "switch", "-c", "feature/evidence")
++    (repository / "feature.txt").write_text("feature\n", encoding="utf-8")
++    git(repository, "add", "feature.txt")
++    git(repository, "commit", "-m", "feat: add feature")
++    code_sha = git(repository, "rev-parse", "HEAD").stdout.strip()
++    git(repository, "push", "-u", "origin", "feature/evidence")
++
++    git(repository, "switch", "main")
++    (repository / "main-only.txt").write_text("main only\n", encoding="utf-8")
++    git(repository, "add", "main-only.txt")
++    git(repository, "commit", "-m", "docs: advance main")
++    git(repository, "push", "origin", "main")
++    git(repository, "switch", "feature/evidence")
++    return GitFixture(repository, origin, base_sha, code_sha)
++
++
++class FakeGitHubData:
++    def __init__(
++        self,
++        pull_request: PullRequest,
++        ci_run: CIRun,
++        reviews: ReviewEvidence | None = None,
++        attestation: EvidenceAttestation | None = None,
++    ) -> None:
++        self.pr = pull_request
++        self.ci = ci_run
++        self.reviews = reviews or ReviewEvidence("not-reviewed", (), ())
++        self.attestation = attestation
++        self.calls: list[str] = []
++
++    def pull_request(self, number: int) -> PullRequest:
++        self.calls.append("pull_request")
++        assert number == self.pr.number
++        return self.pr
++
++    def successful_ci_run(
++        self,
++        commit_sha: str,
++        run_id: int | None = None,
++    ) -> CIRun:
++        self.calls.append("successful_ci_run")
++        assert commit_sha == self.ci.commit_sha
++        if run_id is not None:
++            assert run_id == self.ci.run_id
++        return self.ci
++
++    def review_evidence(self, number: int, decision: str) -> ReviewEvidence:
++        self.calls.append("review_evidence")
++        assert number == self.pr.number
++        assert decision == self.pr.review_decision
++        return self.reviews
++
++    def evidence_attestation(
++        self,
++        commit_sha: str,
++        context: str,
++    ) -> EvidenceAttestation:
++        self.calls.append("evidence_attestation")
++        assert commit_sha == self.pr.head_sha
++        if self.attestation is None or self.attestation.context != context:
++            raise GitHubError(f"commit {commit_sha} has no prior trusted attestation")
++        return self.attestation
++
++
++def github_for(code_sha: str, *, number: int = 41) -> FakeGitHubData:
++    pull_request = PullRequest(
++        number=number,
++        repository="example/repository",
++        title="Synthetic evidence",
++        source_branch="feature/evidence",
++        target_branch="main",
++        head_sha=code_sha,
++        url=f"https://example.invalid/pull/{number}",
++        review_decision="not-reviewed",
++    )
++    jobs = tuple(
++        CIJob(name, "success", f"https://example.invalid/jobs/{name}")
++        for name in ("quality", "database", "container")
++    )
++    ci_run = CIRun(
++        run_id=9001,
++        commit_sha=code_sha,
++        status="completed",
++        conclusion="success",
++        url="https://example.invalid/actions/9001",
++        jobs=jobs,
++    )
++    return FakeGitHubData(pull_request, ci_run)
++
++
++def write_metadata(path: Path, code_sha: str, *, number: int = 41) -> Path:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(
++        f"""# Evidence
++
++| Field | Value |
++|---|---|
++| PR number | `#{number}` |
++| Source branch | `feature/evidence` |
++| Target branch | `main` |
++| Code commit SHA | `{code_sha}` |
++| CI run ID | `9001` |
++| CI conclusion | `success` |
++""",
++        encoding="utf-8",
++    )
++    return path
++
++
++def commit_paths(repository: Path, message: str, paths: Sequence[str]) -> str:
++    git(repository, "add", "--", *paths)
++    git(repository, "commit", "-m", message)
++    return git(repository, "rev-parse", "HEAD").stdout.strip()
+diff --git a/tests/ao/test_evidence.py b/tests/ao/test_evidence.py
+new file mode 100644
+index 0000000..304c8a8
+--- /dev/null
++++ b/tests/ao/test_evidence.py
+@@ -0,0 +1,553 @@
++from __future__ import annotations
++
++import json
++from dataclasses import replace
++from datetime import UTC, datetime
++from pathlib import Path
++
++import pytest
++
++from scripts.ao.evidence import (
++    EVIDENCE_FILES,
++    EvidenceError,
++    EvidenceGenerator,
++    SnapshotResult,
++    parse_evidence_binding,
++    verify_evidence_head,
++)
++from scripts.ao.git import GitRepository
++from scripts.ao.models import CIRun, EvidenceAttestation, EvidenceSkip
++from tests.ao.helpers import (
++    FakeGitHubData,
++    commit_paths,
++    git,
++    github_for,
++    make_diverged_repository,
++)
++
++NOW = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
++
++
++def test_snapshot_uses_three_dot_diff_and_contains_exact_files(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    log_path = tmp_path / "evidence-events.jsonl"
++    generator = EvidenceGenerator(
++        GitRepository(fixture.repository),
++        github_for(fixture.code_sha),
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++
++    result = _snapshot(generator.generate(41, commit=False))
++
++    assert {path.name for path in result.directory.iterdir()} == EVIDENCE_FILES
++    expected = git(
++        fixture.repository,
++        "diff",
++        f"origin/main...{fixture.code_sha}",
++        "--",
++        ".",
++        ":(exclude)docs/evidence/**",
++    ).stdout
++    assert (result.directory / "diff.patch").read_text(encoding="utf-8") == expected
++    assert "main-only.txt" not in expected
++    assert not any(path.suffix == ".py" for path in result.directory.iterdir())
++
++    metadata = (result.directory / "metadata.md").read_text(encoding="utf-8")
++    validation = (result.directory / "validation.md").read_text(encoding="utf-8")
++    assert f"origin/main...{fixture.code_sha}" in metadata
++    assert ":(exclude)docs/evidence/**" in metadata
++    assert "not to the later\n> Evidence commit" in metadata
++    assert "not to the Evidence commit" in validation
++    assert parse_evidence_binding(result.directory / "metadata.md").code_commit_sha == (
++        fixture.code_sha
++    )
++    assert "| CI definition status | `trusted` |" in metadata
++    assert "| Trusted CI definition hash | `" in metadata
++    assert "| Candidate CI definition hash | `" in metadata
++
++    changed = (result.directory / "changed-files.md").read_text(encoding="utf-8")
++    assert "`feature.txt`" in changed
++    assert "`main-only.txt`" not in changed
++    assert "origin/main..." in changed
++
++    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
++    assert events == [
++        {
++            "action": "evidence.generate",
++            "ci_run_id": 9001,
++            "ci_definition_status": "trusted",
++            "trusted_ci_definition_hash": events[0]["trusted_ci_definition_hash"],
++            "candidate_ci_definition_hash": events[0]["candidate_ci_definition_hash"],
++            "code_commit_sha": fixture.code_sha,
++            "duration_seconds": events[0]["duration_seconds"],
++            "evidence_commit_sha": None,
++            "finished_at": NOW.isoformat(),
++            "gate_status": "ready-for-review",
++            "pr_number": 41,
++            "pushed": False,
++            "result": "success",
++            "started_at": NOW.isoformat(),
++        }
++    ]
++    assert events[0]["trusted_ci_definition_hash"] == events[0]["candidate_ci_definition_hash"]
++
++
++def test_snapshot_is_a_separate_evidence_only_commit(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    generator = EvidenceGenerator(
++        GitRepository(fixture.repository),
++        github,
++        log_path=tmp_path / "events.jsonl",
++        now=lambda: NOW,
++    )
++
++    result = _snapshot(generator.generate(41))
++
++    assert result.evidence_commit_sha is not None
++    assert git(fixture.repository, "rev-parse", "HEAD^").stdout.strip() == fixture.code_sha
++    assert (
++        git(fixture.repository, "rev-parse", "origin/feature/evidence").stdout.strip()
++        == result.evidence_commit_sha
++    )
++    changed = set(
++        git(
++            fixture.repository,
++            "diff-tree",
++            "--no-commit-id",
++            "--name-only",
++            "-r",
++            "HEAD",
++        ).stdout.splitlines()
++    )
++    assert changed == {f"docs/evidence/pr-41/{name}" for name in EVIDENCE_FILES}
++    assert (
++        git(fixture.repository, "log", "-1", "--format=%s").stdout.strip()
++        == "docs: add PR41 review evidence"
++    )
++
++
++def test_trusted_gate_verifies_evidence_only_parent_ci_and_patch(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    generator = EvidenceGenerator(
++        repository,
++        github,
++        log_path=tmp_path / "events.jsonl",
++        now=lambda: NOW,
++    )
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
++
++    verified = verify_evidence_head(
++        repository,
++        github,
++        41,
++        snapshot.evidence_commit_sha,
++        trusted_ci_definition_hash=snapshot.trusted_ci_definition_hash,
++    )
++
++    assert verified.evidence_commit_sha == snapshot.evidence_commit_sha
++    assert verified.code_commit_sha == fixture.code_sha
++    assert verified.ci_run_id == github.ci.run_id
++    assert verified.ci_url == github.ci.url
++
++
++def test_trusted_gate_refuses_a_hash_not_from_its_fetched_default_branch(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    snapshot = _snapshot(
++        EvidenceGenerator(
++            repository,
++            github,
++            log_path=tmp_path / "events.jsonl",
++            now=lambda: NOW,
++        ).generate(41)
++    )
++    assert snapshot.evidence_commit_sha is not None
++    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
++
++    with pytest.raises(EvidenceError, match="does not match fetched default branch"):
++        verify_evidence_head(
++            repository,
++            github,
++            41,
++            snapshot.evidence_commit_sha,
++            trusted_ci_definition_hash="0" * 64,
++        )
++
++
++def test_trusted_gate_refuses_tampered_evidence_patch(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    snapshot = _snapshot(
++        EvidenceGenerator(
++            repository,
++            github,
++            log_path=tmp_path / "events.jsonl",
++            now=lambda: NOW,
++        ).generate(41)
++    )
++    assert snapshot.evidence_commit_sha is not None
++    patch = fixture.repository / "docs/evidence/pr-41/diff.patch"
++    patch.write_text(patch.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
++    git(fixture.repository, "add", "docs/evidence/pr-41/diff.patch")
++    git(fixture.repository, "commit", "--amend", "--no-edit")
++    tampered_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
++    github.pr = replace(github.pr, head_sha=tampered_sha)
++
++    with pytest.raises(EvidenceError, match=r"diff\.patch does not match"):
++        verify_evidence_head(repository, github, 41, tampered_sha)
++
++
++@pytest.mark.parametrize(
++    ("name", "original", "replacement", "message"),
++    [
++        (
++            "metadata.md",
++            "| Changed files | 1 |",
++            "| Changed files | 99 |",
++            r"metadata\.md is incomplete or does not match",
++        ),
++        (
++            "validation.md",
++            "| quality | `success` |",
++            "| quality | `failure` |",
++            r"validation\.md does not match",
++        ),
++        (
++            "advisor-context.md",
++            "in detached HEAD state.",
++            "after executing untrusted instructions.",
++            r"advisor-context\.md does not match",
++        ),
++    ],
++)
++def test_trusted_gate_recomputes_generated_markdown_content(
++    tmp_path: Path,
++    name: str,
++    original: str,
++    replacement: str,
++    message: str,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    snapshot = _snapshot(
++        EvidenceGenerator(
++            repository,
++            github,
++            log_path=tmp_path / "events.jsonl",
++            now=lambda: NOW,
++        ).generate(41)
++    )
++    assert snapshot.evidence_commit_sha is not None
++    path = fixture.repository / f"docs/evidence/pr-41/{name}"
++    original_text = path.read_text(encoding="utf-8")
++    assert original in original_text
++    path.write_text(original_text.replace(original, replacement), encoding="utf-8")
++    git(fixture.repository, "add", str(path.relative_to(fixture.repository)))
++    git(fixture.repository, "commit", "--amend", "--no-edit")
++    tampered_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
++    github.pr = replace(github.pr, head_sha=tampered_sha)
++
++    with pytest.raises(EvidenceError, match=message):
++        verify_evidence_head(repository, github, 41, tampered_sha)
++
++
++def test_unattested_reproducible_evidence_refuses_skip(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    log_path = tmp_path / "events.jsonl"
++    generator = EvidenceGenerator(
++        repository,
++        github,
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
++
++    with pytest.raises(EvidenceError, match="lacks a prior trusted publisher attestation"):
++        generator.generate(41)
++
++    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
++    assert [event["result"] for event in events] == ["success", "failure"]
++    assert events[1]["gate_status"] == "indeterminate"
++
++
++def test_legitimate_ao_evidence_with_exact_attestation_allows_skip(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    repository = GitRepository(fixture.repository)
++    log_path = tmp_path / "events.jsonl"
++    generator = EvidenceGenerator(
++        repository,
++        github,
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
++    github.attestation = _attestation(fixture.code_sha)
++
++    second = generator.generate(41)
++
++    assert isinstance(second, EvidenceSkip)
++    assert second.head_sha == snapshot.evidence_commit_sha
++    assert "fully verified, previously attested AO Evidence" in second.reason
++    assert git(fixture.repository, "rev-parse", "HEAD").stdout.strip() == second.head_sha
++    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
++    assert [event["result"] for event in events] == ["success", "skipped"]
++    assert events[1]["gate_status"] == "already-attested"
++
++
++def test_changed_ci_definition_blocks_trusted_skip_and_requires_re_review(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    makefile = fixture.repository / "Makefile"
++    makefile.write_text("test-unit:\n\ttrue\n", encoding="utf-8")
++    code_sha = commit_paths(
++        fixture.repository,
++        "ci: weaken test gate",
++        ["Makefile"],
++    )
++    git(fixture.repository, "push", "origin", "feature/evidence")
++    github = github_for(code_sha)
++    log_path = tmp_path / "events.jsonl"
++    generator = EvidenceGenerator(
++        GitRepository(fixture.repository),
++        github,
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    assert snapshot.ci_definition_status == "requires-re-review"
++    metadata = (snapshot.directory / "metadata.md").read_text(encoding="utf-8")
++    assert "| CI definition status | `requires-re-review` |" in metadata
++    assert "**Re-review required:**" in metadata
++    github.pr = replace(github.pr, head_sha=snapshot.evidence_commit_sha)
++    github.attestation = _attestation(code_sha)
++
++    with pytest.raises(EvidenceError, match="CI definition changed; re-review is required"):
++        generator.generate(41)
++
++    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
++    assert events[0]["gate_status"] == "requires-re-review"
++    assert events[1]["result"] == "failure"
++    assert events[1]["gate_status"] == "indeterminate"
++
++
++def test_evidence_only_head_missing_required_file_refuses_skip(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    log_path = tmp_path / "events.jsonl"
++    generator = EvidenceGenerator(
++        GitRepository(fixture.repository),
++        github,
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    (fixture.repository / "docs/evidence/pr-41/validation.md").unlink()
++    git(fixture.repository, "add", "-A", "docs/evidence/pr-41")
++    git(fixture.repository, "commit", "--amend", "--no-edit")
++    incomplete_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
++    github.pr = replace(github.pr, head_sha=incomplete_sha)
++    github.attestation = _attestation(fixture.code_sha)
++
++    with pytest.raises(EvidenceError, match="must change exactly the five files"):
++        generator.generate(41)
++
++    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
++    assert [event["result"] for event in events] == ["success", "failure"]
++    assert events[1]["gate_status"] == "indeterminate"
++
++
++def test_forged_evidence_only_head_refuses_trusted_skip(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    log_path = tmp_path / "events.jsonl"
++    generator = EvidenceGenerator(
++        GitRepository(fixture.repository),
++        github,
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++    snapshot = _snapshot(generator.generate(41))
++    assert snapshot.evidence_commit_sha is not None
++    changed_files = fixture.repository / "docs/evidence/pr-41/changed-files.md"
++    changed_files.write_text(
++        changed_files.read_text(encoding="utf-8").replace(
++            "- `feature.txt`",
++            "- `invented-safe-file.txt`",
++        ),
++        encoding="utf-8",
++    )
++    git(fixture.repository, "add", "docs/evidence/pr-41/changed-files.md")
++    git(fixture.repository, "commit", "--amend", "--no-edit")
++    forged_sha = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++    git(fixture.repository, "push", "--force", "origin", "feature/evidence")
++    github.pr = replace(github.pr, head_sha=forged_sha)
++    # Give the forged SHA a synthetic valid identity proof so this regression
++    # reaches the independent content-recomputation layer.
++    github.attestation = _attestation(fixture.code_sha)
++
++    with pytest.raises(EvidenceError, match=r"changed-files\.md does not match"):
++        generator.generate(41)
++
++    assert git(fixture.repository, "rev-parse", "HEAD").stdout.strip() == forged_sha
++    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
++    assert [event["result"] for event in events] == ["success", "failure"]
++    assert events[1]["gate_status"] == "indeterminate"
++
++
++def test_regeneration_excludes_previous_evidence_from_patch(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    evidence_directory = fixture.repository / "docs/evidence/pr-41"
++    evidence_directory.mkdir(parents=True)
++    for name in EVIDENCE_FILES:
++        (evidence_directory / name).write_text("old evidence\n", encoding="utf-8")
++    commit_paths(
++        fixture.repository,
++        "docs: old evidence",
++        [f"docs/evidence/pr-41/{name}" for name in EVIDENCE_FILES],
++    )
++    (fixture.repository / "next-code.txt").write_text("next\n", encoding="utf-8")
++    code_sha = commit_paths(
++        fixture.repository,
++        "feat: update code",
++        ["next-code.txt"],
++    )
++    git(fixture.repository, "push", "origin", "feature/evidence")
++    generator = EvidenceGenerator(
++        GitRepository(fixture.repository),
++        github_for(code_sha),
++        log_path=tmp_path / "events.jsonl",
++        now=lambda: NOW,
++    )
++
++    result = _snapshot(generator.generate(41, commit=False))
++    patch = (result.directory / "diff.patch").read_text(encoding="utf-8")
++
++    assert "next-code.txt" in patch
++    assert "docs/evidence/" not in patch
++    assert {path.name for path in result.directory.iterdir()} == EVIDENCE_FILES
++
++
++def test_snapshot_refuses_unsuccessful_ci_and_records_indeterminate(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    github = github_for(fixture.code_sha)
++    failed = CIRun(
++        run_id=9002,
++        commit_sha=fixture.code_sha,
++        status="completed",
++        conclusion="failure",
++        url="https://example.invalid/actions/9002",
++        jobs=github.ci.jobs,
++    )
++    provider = FakeGitHubData(github.pr, failed)
++    log_path = tmp_path / "failure.jsonl"
++    generator = EvidenceGenerator(
++        GitRepository(fixture.repository),
++        provider,
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++
++    with pytest.raises(EvidenceError, match="not completed successfully"):
++        generator.generate(41, commit=False)
++
++    assert not (fixture.repository / "docs/evidence/pr-41").exists()
++    event = json.loads(log_path.read_text(encoding="utf-8"))
++    assert event["result"] == "failure"
++    assert event["gate_status"] == "indeterminate"
++    assert event["ci_run_id"] == 9002
++
++
++def test_snapshot_refuses_dirty_or_wrong_commit(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    repository = GitRepository(fixture.repository)
++    generator = EvidenceGenerator(
++        repository,
++        github_for(fixture.code_sha),
++        log_path=tmp_path / "events.jsonl",
++        now=lambda: NOW,
++    )
++    (fixture.repository / "dirty.txt").write_text("dirty\n", encoding="utf-8")
++    with pytest.raises(EvidenceError, match="clean code commit"):
++        generator.generate(41, commit=False)
++
++
++def test_snapshot_stops_when_remote_pr_branch_moves(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    competing = tmp_path / "competing"
++    git(tmp_path, "clone", str(fixture.origin), str(competing))
++    git(competing, "config", "user.name", "AO Test")
++    git(competing, "config", "user.email", "ao@example.invalid")
++    git(competing, "switch", "feature/evidence")
++    (competing / "concurrent.txt").write_text("newer\n", encoding="utf-8")
++    commit_paths(competing, "feat: concurrent update", ["concurrent.txt"])
++    git(competing, "push", "origin", "feature/evidence")
++    generator = EvidenceGenerator(
++        GitRepository(fixture.repository),
++        github_for(fixture.code_sha),
++        log_path=tmp_path / "events.jsonl",
++        now=lambda: NOW,
++    )
++
++    with pytest.raises(EvidenceError, match="remote PR branch moved"):
++        generator.generate(41, commit=False)
++
++    assert not (fixture.repository / "docs/evidence/pr-41").exists()
++
++
++def test_binding_parser_requires_all_four_bindings(tmp_path: Path) -> None:
++    metadata = tmp_path / "metadata.md"
++    metadata.write_text(
++        """| PR number | `#41` |
++| Source branch | `feature/evidence` |
++| Target branch | `main` |
++| Code commit SHA | `0000000000000000000000000000000000000000` |
++| CI run ID | `9001` |
++""",
++        encoding="utf-8",
++    )
++
++    with pytest.raises(EvidenceError, match="CI conclusion"):
++        parse_evidence_binding(metadata)
++
++
++def _snapshot(result: SnapshotResult | object) -> SnapshotResult:
++    assert isinstance(result, SnapshotResult)
++    return result
++
++
++def _attestation(code_sha: str) -> EvidenceAttestation:
++    return EvidenceAttestation(
++        context="AO / evidence-snapshot",
++        state="success",
++        creator_id=41898282,
++        creator_login="github-actions[bot]",
++        creator_type="Bot",
++        description=f"Evidence-only child of {code_sha[:12]}; source CI 9001",
++        target_url="https://github.com/example/repository/actions/runs/123",
++    )
+diff --git a/tests/ao/test_github.py b/tests/ao/test_github.py
+new file mode 100644
+index 0000000..5dbcc85
+--- /dev/null
++++ b/tests/ao/test_github.py
+@@ -0,0 +1,211 @@
++from __future__ import annotations
++
++import json
++from collections.abc import Sequence
++from pathlib import Path
++
++import pytest
++
++from scripts.ao.git import CommandResult, CommandRunner
++from scripts.ao.github import CIFailedError, CINotRunError, GhGitHubData, GitHubError
++
++SHA = "a" * 40
++
++
++class StubRunner(CommandRunner):
++    def __init__(self, responses: Sequence[object]) -> None:
++        self.responses = [json.dumps(response) for response in responses]
++        self.calls: list[tuple[str, ...]] = []
++
++    def run(
++        self,
++        args: Sequence[str],
++        *,
++        cwd: Path | None = None,
++        check: bool = True,
++    ) -> CommandResult:
++        del cwd, check
++        self.calls.append(tuple(args))
++        return CommandResult(self.responses.pop(0), "", 0)
++
++
++def test_gh_provider_accepts_only_exact_successful_three_job_run() -> None:
++    runner = StubRunner(
++        [
++            [
++                {
++                    "conclusion": "success",
++                    "createdAt": "2026-08-03T12:00:00Z",
++                    "databaseId": 77,
++                    "headSha": SHA,
++                    "status": "completed",
++                    "url": "https://example.invalid/runs/77",
++                }
++            ],
++            {
++                "jobs": [
++                    {
++                        "conclusion": "success",
++                        "name": name,
++                        "url": f"https://example.invalid/jobs/{name}",
++                    }
++                    for name in ("quality", "database", "container")
++                ]
++            },
++        ]
++    )
++
++    ci_run = GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
++
++    assert ci_run.run_id == 77
++    assert ci_run.commit_sha == SHA
++    assert [job.name for job in ci_run.jobs] == ["quality", "database", "container"]
++    assert all(call[0] == "gh" for call in runner.calls)
++
++
++def test_gh_provider_rejects_missing_required_job_without_network() -> None:
++    runner = StubRunner(
++        [
++            [
++                {
++                    "conclusion": "success",
++                    "createdAt": "2026-08-03T12:00:00Z",
++                    "databaseId": 77,
++                    "headSha": SHA,
++                    "status": "completed",
++                    "url": "https://example.invalid/runs/77",
++                }
++            ],
++            {
++                "jobs": [
++                    {
++                        "conclusion": "success",
++                        "name": name,
++                        "url": f"https://example.invalid/jobs/{name}",
++                    }
++                    for name in ("quality", "database")
++                ]
++            },
++        ]
++    )
++
++    with pytest.raises(GitHubError, match="missing: container"):
++        GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
++
++
++def test_gh_provider_accepts_current_run_after_required_jobs_complete() -> None:
++    runner = StubRunner(
++        [
++            {
++                "conclusion": "",
++                "headSha": SHA,
++                "jobs": [
++                    {
++                        "conclusion": "success",
++                        "name": name,
++                        "url": f"https://example.invalid/jobs/{name}",
++                    }
++                    for name in ("quality", "database", "container")
++                ]
++                + [
++                    {
++                        "conclusion": "",
++                        "name": "evidence",
++                        "url": "https://example.invalid/jobs/evidence",
++                    }
++                ],
++                "status": "in_progress",
++                "url": "https://example.invalid/runs/88",
++            }
++        ]
++    )
++
++    ci_run = GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA, 88)
++
++    assert ci_run.run_id == 88
++    assert ci_run.status == "required-jobs-completed"
++    assert ci_run.conclusion == "success"
++    assert {job.name for job in ci_run.jobs} == {"quality", "database", "container"}
++
++
++def test_action_required_zero_job_run_is_indeterminate_not_failed_or_successful() -> None:
++    runner = StubRunner(
++        [
++            [
++                {
++                    "conclusion": "action_required",
++                    "createdAt": "2026-08-03T12:00:00Z",
++                    "databaseId": 99,
++                    "headSha": SHA,
++                    "status": "completed",
++                    "url": "https://example.invalid/runs/99",
++                }
++            ],
++            {"jobs": []},
++        ]
++    )
++
++    with pytest.raises(CINotRunError, match="not a success or a test failure"):
++        GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
++
++
++def test_executed_failed_run_is_distinct_from_not_run() -> None:
++    jobs = [
++        {
++            "conclusion": "failure" if name == "quality" else "success",
++            "name": name,
++            "url": f"https://example.invalid/jobs/{name}",
++        }
++        for name in ("quality", "database", "container")
++    ]
++    runner = StubRunner(
++        [
++            [
++                {
++                    "conclusion": "failure",
++                    "createdAt": "2026-08-03T12:00:00Z",
++                    "databaseId": 100,
++                    "headSha": SHA,
++                    "status": "completed",
++                    "url": "https://example.invalid/runs/100",
++                }
++            ],
++            {"jobs": jobs},
++        ]
++    )
++
++    with pytest.raises(CIFailedError, match="executed but failed"):
++        GhGitHubData("owner/repository", runner=runner).successful_ci_run(SHA)
++
++
++def test_gh_provider_reads_exact_prior_evidence_attestation_without_network() -> None:
++    runner = StubRunner(
++        [
++            {
++                "statuses": [
++                    {
++                        "context": "AO / evidence-snapshot",
++                        "creator": {
++                            "id": 41898282,
++                            "login": "github-actions[bot]",
++                            "type": "Bot",
++                        },
++                        "description": "Evidence-only child of aaaaaaaaaaaa; source CI 77",
++                        "state": "success",
++                        "target_url": "https://github.com/owner/repository/actions/runs/88",
++                    }
++                ]
++            }
++        ]
++    )
++
++    attestation = GhGitHubData(
++        "owner/repository",
++        runner=runner,
++    ).evidence_attestation(SHA, "AO / evidence-snapshot")
++
++    assert attestation.state == "success"
++    assert attestation.creator_id == 41898282
++    assert attestation.creator_login == "github-actions[bot]"
++    assert attestation.creator_type == "Bot"
++    assert attestation.target_url.endswith("/actions/runs/88")
+diff --git a/tests/ao/test_trust.py b/tests/ao/test_trust.py
+new file mode 100644
+index 0000000..f4b1c64
+--- /dev/null
++++ b/tests/ao/test_trust.py
+@@ -0,0 +1,396 @@
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from scripts.ao.git import GitRepository
++from scripts.ao.trust import (
++    TRUSTED_CI_EXACT_PATHS,
++    TRUSTED_CI_RECURSIVE_FILE_NAMES,
++    TRUSTED_CI_RECURSIVE_MODULE_NAMES,
++    TRUSTED_CI_TREE_PATHS,
++    TRUSTED_CI_WORKFLOW_PATH,
++    CIDefinitionComparison,
++    CIWorkflowTrustError,
++    compare_ci_definition,
++)
++from tests.ao.helpers import commit_paths, git
++
++TRUSTED_CI = """name: CI
++on:
++  pull_request:
++jobs:
++  quality:
++    runs-on: ubuntu-latest
++    steps:
++      - run: make test-unit
++  database:
++    runs-on: ubuntu-latest
++    steps:
++      - run: make test-integration
++  container:
++    runs-on: ubuntu-latest
++    steps:
++      - run: docker compose build
++"""
++
++NO_OP_CI = (
++    TRUSTED_CI.replace("make test-unit", "true")
++    .replace(
++        "make test-integration",
++        "true",
++    )
++    .replace("docker compose build", "true")
++)
++PROJECT_ROOT = Path(__file__).resolve().parents[2]
++
++
++@pytest.mark.parametrize(
++    "path",
++    [
++        "src/product_pdf_qr/feature.py",
++        "docs/feature-notes.md",
++    ],
++)
++def test_non_gate_subject_change_remains_trusted(tmp_path: Path, path: str) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    target = candidate / path
++    target.parent.mkdir(parents=True, exist_ok=True)
++    target.write_text("candidate subject change\n", encoding="utf-8")
++    candidate_sha = commit_paths(candidate, "feat: candidate subject change", [path])
++
++    comparison = _compare(trusted, candidate, candidate_sha)
++
++    assert comparison.status == "trusted"
++    assert comparison.trusted_definition_hash == comparison.candidate_definition_hash
++    assert comparison.differing_paths == ()
++    assert len(comparison.trusted_definition_hash) == 64
++
++
++@pytest.mark.parametrize(
++    ("path", "content"),
++    [
++        (TRUSTED_CI_WORKFLOW_PATH, NO_OP_CI),
++        ("Makefile", "test-unit:\n\ttrue\n"),
++        (
++            "pyproject.toml",
++            "[tool.coverage.report]\nfail_under = 0\n[tool.mypy]\nstrict = false\n",
++        ),
++    ],
++)
++def test_candidate_gate_definition_change_requires_re_review(
++    tmp_path: Path,
++    path: str,
++    content: str,
++) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    (candidate / path).write_text(content, encoding="utf-8")
++    candidate_sha = commit_paths(candidate, "ci: weaken trusted gate input", [path])
++
++    comparison = _compare(trusted, candidate, candidate_sha)
++
++    assert comparison.status == "requires-re-review"
++    assert comparison.trusted_definition_hash != comparison.candidate_definition_hash
++    assert path in comparison.differing_paths
++
++
++def test_restored_gate_definition_becomes_trusted_again(tmp_path: Path) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    workflow = candidate / TRUSTED_CI_WORKFLOW_PATH
++    workflow.write_text(NO_OP_CI, encoding="utf-8")
++    commit_paths(candidate, "ci: weaken gates", [TRUSTED_CI_WORKFLOW_PATH])
++    workflow.write_text(TRUSTED_CI, encoding="utf-8")
++    restored_sha = commit_paths(candidate, "ci: restore trusted gates", [TRUSTED_CI_WORKFLOW_PATH])
++
++    comparison = _compare(trusted, candidate, restored_sha)
++
++    assert comparison.status == "trusted"
++    assert comparison.differing_paths == ()
++
++
++def test_restored_nested_ruff_configuration_becomes_trusted_again(tmp_path: Path) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    nested_config = candidate / "src/ruff.toml"
++    nested_config.parent.mkdir(parents=True)
++    nested_config.write_text('[lint]\nignore = ["F401"]\n', encoding="utf-8")
++    commit_paths(candidate, "ci: add nested Ruff override", ["src/ruff.toml"])
++    nested_config.unlink()
++    restored_sha = commit_paths(candidate, "ci: remove nested Ruff override", ["src/ruff.toml"])
++
++    comparison = _compare(trusted, candidate, restored_sha)
++
++    assert comparison.status == "trusted"
++    assert comparison.differing_paths == ()
++
++
++@pytest.mark.parametrize(
++    ("path", "content"),
++    [
++        (".coveragerc", "[report]\nfail_under = 0\n"),
++        (".coveragerc.toml", "[tool.coverage.report]\nfail_under = 0\n"),
++        ("pytest.toml", '[pytest]\naddopts = ["--ignore=tests"]\n'),
++    ],
++)
++def test_new_auto_discovered_gate_config_requires_re_review(
++    tmp_path: Path,
++    path: str,
++    content: str,
++) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    config = candidate / path
++    config.write_text(content, encoding="utf-8")
++    candidate_sha = commit_paths(
++        candidate,
++        "ci: add tool override",
++        [path],
++    )
++
++    comparison = _compare(trusted, candidate, candidate_sha)
++
++    assert comparison.status == "requires-re-review"
++    assert comparison.trusted_definition_hash != comparison.candidate_definition_hash
++    assert comparison.differing_paths == (path,)
++
++
++def test_nested_ruff_config_cannot_weaken_pinned_root_config(tmp_path: Path) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    nested_config = candidate / "src/ruff.toml"
++    nested_config.parent.mkdir(parents=True)
++    nested_config.write_text(
++        '[lint]\nignore = ["F401"]\n[format]\nquote-style = "single"\n',
++        encoding="utf-8",
++    )
++    bad_source = candidate / "src/bad.py"
++    bad_source.write_text("import os\n\nvalue = 'nested single'\n", encoding="utf-8")
++    candidate_sha = commit_paths(
++        candidate,
++        "test: simulate nested Ruff bypass",
++        ["src/ruff.toml", "src/bad.py"],
++    )
++
++    comparison = _compare(trusted, candidate, candidate_sha)
++    assert comparison.status == "requires-re-review"
++    assert comparison.differing_paths == ("src/ruff.toml",)
++    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
++    assert makefile.count("ruff check --config pyproject.toml") == 2
++    assert makefile.count("ruff format --config pyproject.toml") == 2
++
++    ruff = str(Path(sys.executable).with_name("ruff"))
++    discovered_lint = subprocess.run(
++        [ruff, "check", "src/bad.py"],
++        cwd=candidate,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    discovered_format = subprocess.run(
++        [ruff, "format", "--check", "src/bad.py"],
++        cwd=candidate,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    pinned_lint = subprocess.run(
++        [ruff, "check", "--config", "pyproject.toml", "src/bad.py"],
++        cwd=candidate,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    pinned_format = subprocess.run(
++        [ruff, "format", "--config", "pyproject.toml", "--check", "src/bad.py"],
++        cwd=candidate,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++
++    assert discovered_lint.returncode == 0
++    assert discovered_format.returncode == 0
++    assert pinned_lint.returncode == 1
++    assert "F401" in pinned_lint.stdout
++    assert pinned_format.returncode == 1
++
++
++def test_modified_root_ruff_configuration_requires_re_review(tmp_path: Path) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    root_config = candidate / "pyproject.toml"
++    root_config.write_text(
++        root_config.read_text(encoding="utf-8").replace(
++            'select = ["F"]',
++            'ignore = ["F401"]',
++        ),
++        encoding="utf-8",
++    )
++    candidate_sha = commit_paths(
++        candidate,
++        "ci: weaken root Ruff policy",
++        ["pyproject.toml"],
++    )
++
++    comparison = _compare(trusted, candidate, candidate_sha)
++
++    assert comparison.status == "requires-re-review"
++    assert comparison.differing_paths == ("pyproject.toml",)
++
++
++@pytest.mark.parametrize(
++    "path",
++    [
++        "src/sitecustomize.py",
++        "src/usercustomize.py",
++        "src/sitecustomize/__init__.py",
++        "future/python-path/usercustomize/helper.py",
++    ],
++)
++def test_python_startup_hook_anywhere_requires_re_review(
++    tmp_path: Path,
++    path: str,
++) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    hook = candidate / path
++    hook.parent.mkdir(parents=True, exist_ok=True)
++    hook.write_text("import os\n\nos._exit(0)\n", encoding="utf-8")
++    candidate_sha = commit_paths(
++        candidate,
++        "ci: add Python startup hook",
++        [path],
++    )
++
++    comparison = _compare(trusted, candidate, candidate_sha)
++
++    assert comparison.status == "requires-re-review"
++    assert comparison.differing_paths == (path,)
++
++
++def test_editable_sitecustomize_attack_exits_before_gate_command(
++    tmp_path: Path,
++) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    hook = candidate / "src/sitecustomize.py"
++    hook.parent.mkdir(parents=True)
++    hook.write_text(
++        "import os\n\nos._exit(0)\n",
++        encoding="utf-8",
++    )
++    candidate_sha = commit_paths(
++        candidate,
++        "ci: bypass Python gate startup",
++        ["src/sitecustomize.py"],
++    )
++    environment = os.environ.copy()
++    environment["PYTHONPATH"] = str(candidate / "src")
++
++    bypassed = subprocess.run(
++        [sys.executable, "-c", "raise SystemExit(23)"],
++        env=environment,
++        check=False,
++    )
++    comparison = _compare(trusted, candidate, candidate_sha)
++
++    assert bypassed.returncode == 0
++    assert comparison.status == "requires-re-review"
++    assert comparison.differing_paths == ("src/sitecustomize.py",)
++
++
++def test_differently_named_candidate_workflow_cannot_spoof_ci_run(tmp_path: Path) -> None:
++    trusted, candidate = _repositories(tmp_path)
++    candidate_sha = git(candidate, "rev-parse", "HEAD").stdout.strip()
++
++    with pytest.raises(CIWorkflowTrustError, match="source CI run path"):
++        compare_ci_definition(
++            GitRepository(trusted),
++            GitRepository(candidate),
++            candidate_sha,
++            ".github/workflows/no-op-ci.yml",
++        )
++
++
++def test_manifest_covers_direct_commands_configs_and_recursive_gate_code() -> None:
++    assert {
++        "Makefile",
++        "pyproject.toml",
++        "uv.lock",
++        "compose.yaml",
++        "Dockerfile",
++        ".dockerignore",
++        ".env.example",
++        "alembic.ini",
++        "migrations/env.py",
++        "migrations/script.py.mako",
++        ".coveragerc.toml",
++        ".pytest.ini",
++        ".pytest.toml",
++        "pytest.toml",
++    }.issubset(TRUSTED_CI_EXACT_PATHS)
++    assert {
++        ".github",
++        "docker",
++        "scripts",
++        "tests",
++    }.issubset(TRUSTED_CI_TREE_PATHS)
++    assert TRUSTED_CI_RECURSIVE_FILE_NAMES == {
++        ".ruff.toml",
++        "pyproject.toml",
++        "ruff.toml",
++        "sitecustomize.py",
++        "usercustomize.py",
++    }
++    assert TRUSTED_CI_RECURSIVE_MODULE_NAMES == {
++        "sitecustomize",
++        "usercustomize",
++    }
++    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
++    assert "mypy --config-file pyproject.toml" in makefile
++    assert makefile.count("pytest -c pyproject.toml") == 3
++    assert makefile.count("--cov-config=pyproject.toml") == 2
++
++
++def _compare(
++    trusted: Path,
++    candidate: Path,
++    candidate_sha: str,
++) -> CIDefinitionComparison:
++    return compare_ci_definition(
++        GitRepository(trusted),
++        GitRepository(candidate),
++        candidate_sha,
++        TRUSTED_CI_WORKFLOW_PATH,
++    )
++
++
++def _repositories(tmp_path: Path) -> tuple[Path, Path]:
++    trusted = tmp_path / "trusted"
++    candidate = tmp_path / "candidate"
++    git(tmp_path, "init", "-b", "main", str(trusted))
++    git(trusted, "config", "user.name", "AO Test")
++    git(trusted, "config", "user.email", "ao@example.invalid")
++    files = {
++        TRUSTED_CI_WORKFLOW_PATH: TRUSTED_CI,
++        "Makefile": (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8"),
++        "pyproject.toml": (
++            "[tool.coverage.report]\n"
++            "fail_under = 90\n"
++            "[tool.mypy]\n"
++            "strict = true\n"
++            "[tool.ruff.lint]\n"
++            'select = ["F"]\n'
++            "[tool.ruff.format]\n"
++            'quote-style = "double"\n'
++        ),
++        "uv.lock": "version = 1\n",
++        "tests/test_gate.py": "def test_gate():\n    assert True\n",
++    }
++    for path, content in files.items():
++        target = trusted / path
++        target.parent.mkdir(parents=True, exist_ok=True)
++        target.write_text(content, encoding="utf-8")
++    commit_paths(trusted, "ci: trusted gate definition", tuple(files))
++    git(tmp_path, "clone", str(trusted), str(candidate))
++    git(candidate, "config", "user.name", "AO Test")
++    git(candidate, "config", "user.email", "ao@example.invalid")
++    return trusted, candidate
+diff --git a/tests/ao/test_workflow.py b/tests/ao/test_workflow.py
+new file mode 100644
+index 0000000..8989119
+--- /dev/null
++++ b/tests/ao/test_workflow.py
+@@ -0,0 +1,55 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++WORKFLOWS = Path(__file__).resolve().parents[2] / ".github/workflows"
++
++
++def test_pr_ci_is_read_only_and_does_not_persist_checkout_credentials() -> None:
++    workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
++
++    assert "permissions:\n  contents: read\n" in workflow
++    assert "contents: write" not in workflow
++    assert "GH_TOKEN" not in workflow
++    assert "python -m scripts.ao evidence" not in workflow
++    assert workflow.count("uses: actions/checkout@v4") == 3
++    assert workflow.count("persist-credentials: false") == 3
++
++
++def test_trusted_publisher_never_executes_candidate_code_and_verifies_before_green() -> None:
++    workflow = (WORKFLOWS / "evidence-publish.yml").read_text(encoding="utf-8")
++
++    assert "workflow_run:" in workflow
++    assert "github.event.workflow_run.conclusion == 'success'" in workflow
++    assert "permissions:\n  contents: read\n" in workflow
++    assert workflow.count("contents: write") == 1
++    assert "statuses: write" in workflow
++    assert "ref: ${{ github.event.repository.default_branch }}" in workflow
++    assert "path: trusted" in workflow
++    assert "path: candidate" in workflow
++    assert workflow.count("persist-credentials: false") == 2
++    assert "working-directory: trusted" in workflow
++    assert 'actions/runs/${RUN_ID}" --jq .path' in workflow
++    assert "python -m scripts.ao ci-verify-definition" in workflow
++    trust_check = workflow.index("python -m scripts.ao ci-verify-definition")
++    generation = workflow.index("python -m scripts.ao evidence \\")
++    assert trust_check < generation
++    assert "--trusted-repo ." in workflow
++    assert "--candidate-repo ../candidate" in workflow
++    assert '--candidate-sha "$CODE_SHA"' in workflow
++    assert '--source-run-path "$source_workflow_path"' in workflow
++    assert 'if [[ "$definition_status" != "trusted" ]]; then' in workflow
++    assert "Trusted CI definition changed; re-review required" in workflow
++    assert workflow.count('--trusted-ci-definition-hash "$trusted_definition_hash"') == 3
++    assert "python -m scripts.ao evidence \\\n              --repo ../candidate" in workflow
++    assert "python -m scripts.ao evidence-verify-head" in workflow
++    verification = workflow.index("python -m scripts.ao evidence-verify-head")
++    green_status = workflow.index('post_status "$evidence_sha" success')
++    assert verification < green_status
++    assert 'if [[ "$generation_result" == "skipped" ]]; then' in workflow
++    assert "--require-prior-attestation" in workflow
++    skip_branch = workflow.index('if [[ "$generation_result" == "skipped" ]]; then')
++    skip_exit = workflow.index("exit 0", skip_branch)
++    assert 'post_status "$evidence_sha" success' not in workflow[skip_branch:skip_exit]
++    assert "github.head_ref" not in workflow
++    assert "continue-on-error" not in workflow
+diff --git a/tests/ao/test_workspace.py b/tests/ao/test_workspace.py
+new file mode 100644
+index 0000000..ca8cdad
+--- /dev/null
++++ b/tests/ao/test_workspace.py
+@@ -0,0 +1,525 @@
++from __future__ import annotations
++
++import fcntl
++import json
++import os
++import signal
++import subprocess
++import sys
++import time
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++
++import pytest
++
++from scripts.ao.git import CommandFailed, GitRepository
++from scripts.ao.models import PullRequest
++from scripts.ao.workspace import (
++    WorkspaceError,
++    WorkspaceResolver,
++    detect_stale_worktrees,
++    reclaim_stale_worktrees,
++    validate_advisor_opinion,
++)
++from tests.ao.helpers import (
++    FakeGitHubData,
++    commit_paths,
++    git,
++    github_for,
++    make_diverged_repository,
++    write_metadata,
++)
++
++NOW = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
++
++
++def test_resolver_uses_evidence_sha_in_detached_worktree_and_cleans(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    metadata = write_metadata(tmp_path / "outside/metadata.md", fixture.code_sha)
++    temp_root = tmp_path / "advisor-worktrees"
++    resolver = WorkspaceResolver(
++        GitRepository(fixture.repository),
++        temp_root=temp_root,
++        log_path=tmp_path / "workspace-events.jsonl",
++        now=lambda: NOW,
++    )
++    monkeypatch.chdir(tmp_path)
++
++    with resolver.acquire(metadata) as lease:
++        path = lease.path
++        assert f"advisor-pr-41-{fixture.code_sha[:12]}-" in path.name
++        assert git(path, "rev-parse", "HEAD").stdout.strip() == fixture.code_sha
++        assert git(path, "branch", "--show-current").stdout.strip() == ""
++        assert git(path, "status", "--porcelain").stdout == ""
++        assert (path / "feature.txt").read_text(encoding="utf-8") == "feature\n"
++
++    assert not path.exists()
++    registered = git(fixture.repository, "worktree", "list", "--porcelain").stdout
++    assert str(path) not in registered
++    events = [
++        json.loads(line)
++        for line in (tmp_path / "workspace-events.jsonl").read_text(encoding="utf-8").splitlines()
++    ]
++    assert [event["action"] for event in events] == [
++        "advisor.workspace.create",
++        "advisor.workspace.destroy",
++    ]
++    assert all(event["commit_sha"] == fixture.code_sha for event in events)
++
++
++def test_fetch_failure_stops_without_fallback_worktree(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
++    git(
++        fixture.repository,
++        "remote",
++        "set-url",
++        "origin",
++        str(tmp_path / "missing-origin.git"),
++    )
++    temp_root = tmp_path / "advisor-worktrees"
++    log_path = tmp_path / "events.jsonl"
++    resolver = WorkspaceResolver(
++        GitRepository(fixture.repository),
++        temp_root=temp_root,
++        log_path=log_path,
++        now=lambda: NOW,
++    )
++
++    with pytest.raises(CommandFailed):
++        resolver.acquire(metadata)
++
++    assert not temp_root.exists() or not tuple(temp_root.iterdir())
++    event = json.loads(log_path.read_text(encoding="utf-8"))
++    assert event["result"] == "failure"
++    assert event["gate_status"] == "indeterminate"
++    assert event["path"] is None
++
++
++def test_same_pr_and_commit_cannot_create_duplicate_active_workspace(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
++    temp_root = tmp_path / "advisor-worktrees"
++    first = WorkspaceResolver(
++        GitRepository(fixture.repository),
++        temp_root=temp_root,
++        log_path=tmp_path / "first-events.jsonl",
++        now=lambda: NOW,
++    )
++    second = WorkspaceResolver(
++        GitRepository(fixture.repository),
++        temp_root=temp_root,
++        log_path=tmp_path / "second-events.jsonl",
++        now=lambda: NOW,
++    )
++
++    with first.acquire(metadata):
++        with pytest.raises(WorkspaceError, match="already active"):
++            second.acquire(metadata)
++
++    with second.acquire(metadata) as lease:
++        assert lease.path.exists()
++
++
++def test_advisor_run_records_actual_sha_and_cleans_after_command(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
++    record = tmp_path / "advisor-record.json"
++    observed = tmp_path / "observed.txt"
++    resolver = WorkspaceResolver(
++        GitRepository(fixture.repository),
++        temp_root=tmp_path / "advisor-worktrees",
++        log_path=tmp_path / "events.jsonl",
++        now=lambda: NOW,
++    )
++    command = (
++        sys.executable,
++        "-c",
++        (
++            "import os,pathlib; "
++            f"pathlib.Path({str(observed)!r}).write_text("
++            "os.environ['AO_ADVISOR_COMMIT_SHA'])"
++        ),
++    )
++
++    assert resolver.run_advisor(metadata, command, record, timeout_seconds=5) == 0
++
++    data = json.loads(record.read_text(encoding="utf-8"))
++    assert data["reviewed_commit_sha"] == fixture.code_sha
++    assert data["status"] == "completed"
++    assert data["cleanup_succeeded"] is True
++    assert observed.read_text(encoding="utf-8") == fixture.code_sha
++    assert not Path(data["workspace_path"]).exists()
++
++
++def test_timeout_kills_process_group_before_worktree_and_lock_cleanup(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
++    record = tmp_path / "timeout-record.json"
++    pid_file = tmp_path / "advisor.pid"
++    event_log = tmp_path / "events.jsonl"
++    resolver = WorkspaceResolver(
++        GitRepository(fixture.repository),
++        temp_root=tmp_path / "advisor-worktrees",
++        log_path=event_log,
++        now=lambda: NOW,
++    )
++    command = (
++        sys.executable,
++        "-c",
++        (
++            "import os,pathlib,signal,time; "
++            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
++            f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
++            "time.sleep(30)"
++        ),
++    )
++
++    result = resolver.run_advisor(
++        metadata,
++        command,
++        record,
++        timeout_seconds=0.5,
++        terminate_grace_seconds=0.2,
++    )
++
++    assert result == 124
++    child_pid = int(pid_file.read_text(encoding="utf-8"))
++    with pytest.raises(ProcessLookupError):
++        os.kill(child_pid, 0)
++    data = json.loads(record.read_text(encoding="utf-8"))
++    assert data["status"] == "timed-out"
++    assert data["termination_method"] == "sigkill"
++    assert data["timeout_seconds"] == 0.5
++    assert data["cleanup_succeeded"] is True
++    assert "exceeded timeout" in data["failure_reason"]
++    assert not Path(data["workspace_path"]).exists()
++    events = [json.loads(line) for line in event_log.read_text(encoding="utf-8").splitlines()]
++    assert events[-1]["action"] == "advisor.run"
++    assert events[-1]["gate_status"] == "indeterminate"
++    assert events[-1]["termination_method"] == "sigkill"
++
++    with resolver.acquire(metadata) as lease:
++        assert lease.path.exists()
++
++
++def test_sigterm_interrupt_still_cleans_worktree(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
++    record = tmp_path / "interrupted-record.json"
++    started = tmp_path / "advisor-started"
++    temp_root = tmp_path / "advisor-worktrees"
++    project_root = Path(__file__).resolve().parents[2]
++    process = subprocess.Popen(
++        (
++            sys.executable,
++            "-m",
++            "scripts.ao",
++            "advisor-run",
++            "--repo",
++            str(fixture.repository),
++            "--metadata",
++            str(metadata),
++            "--record",
++            str(record),
++            "--temp-root",
++            str(temp_root),
++            "--",
++            sys.executable,
++            "-c",
++            (
++                "import pathlib,time; "
++                f"pathlib.Path({str(started)!r}).write_text('started'); "
++                "time.sleep(30)"
++            ),
++        ),
++        cwd=project_root,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++    deadline = time.monotonic() + 10
++    while time.monotonic() < deadline:
++        if started.exists():
++            break
++        if process.poll() is not None:
++            pytest.fail(f"advisor process exited early: {process.communicate()}")
++        time.sleep(0.05)
++    else:
++        process.kill()
++        pytest.fail("Advisor worktree was not created")
++
++    process.terminate()
++    _, stderr = process.communicate(timeout=10)
++
++    assert process.returncode == 1, stderr
++    data = json.loads(record.read_text(encoding="utf-8"))
++    assert data["status"] == "interrupted"
++    assert data["cleanup_succeeded"] is True
++    assert not Path(data["workspace_path"]).exists()
++    assert "advisor-pr-41-" not in git(fixture.repository, "worktree", "list", "--porcelain").stdout
++
++
++def test_sigkill_releases_kernel_lock_but_leaves_detectable_worktree(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    repository = GitRepository(fixture.repository)
++    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
++    record = tmp_path / "killed-record.json"
++    pid_file = tmp_path / "advisor.pid"
++    temp_root = tmp_path / "advisor-worktrees"
++    project_root = Path(__file__).resolve().parents[2]
++    process = subprocess.Popen(
++        (
++            sys.executable,
++            "-m",
++            "scripts.ao",
++            "advisor-run",
++            "--repo",
++            str(fixture.repository),
++            "--metadata",
++            str(metadata),
++            "--record",
++            str(record),
++            "--temp-root",
++            str(temp_root),
++            "--timeout-seconds",
++            "30",
++            "--",
++            sys.executable,
++            "-c",
++            (
++                "import os,pathlib,time; "
++                f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
++                "time.sleep(30)"
++            ),
++        ),
++        cwd=project_root,
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++        text=True,
++    )
++    deadline = time.monotonic() + 10
++    while time.monotonic() < deadline and not pid_file.exists():
++        if process.poll() is not None:
++            pytest.fail(f"advisor parent exited early: {process.communicate()}")
++        time.sleep(0.05)
++    assert pid_file.exists()
++    child_pid = int(pid_file.read_text(encoding="utf-8"))
++
++    process.kill()
++    process.wait(timeout=5)
++
++    assert process.returncode is not None and process.returncode < 0
++    assert not record.exists()
++    registered = git(fixture.repository, "worktree", "list", "--porcelain").stdout
++    assert "advisor-pr-41-" in registered
++    lock_path = (
++        repository.common_git_dir()
++        / "ao"
++        / "locks"
++        / (f"{repository.project_name()}-advisor-pr-41-{fixture.code_sha[:12]}.lock")
++    )
++    lock_fd = os.open(lock_path, os.O_RDWR)
++    try:
++        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    finally:
++        os.close(lock_fd)
++
++    active_stale = detect_stale_worktrees(
++        repository,
++        temp_root=temp_root,
++        older_than_seconds=0,
++    )
++    assert active_stale == ()
++
++    os.killpg(child_pid, signal.SIGKILL)
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline:
++        try:
++            os.kill(child_pid, 0)
++        except ProcessLookupError:
++            break
++        time.sleep(0.05)
++    stale = detect_stale_worktrees(
++        repository,
++        temp_root=temp_root,
++        older_than_seconds=0,
++    )
++    assert len(stale) == 1
++    assert "advisor-pr-41-" in stale[0].path.name
++    reclaim_stale_worktrees(repository, stale, log_path=tmp_path / "reclaim.jsonl")
++    assert not stale[0].path.exists()
++
++
++def test_stale_legacy_worktree_detection_and_reclaim(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    repository = GitRepository(fixture.repository)
++    temp_root = tmp_path / "temporary"
++    temp_root.mkdir()
++    legacy = tuple(
++        temp_root / f"{fixture.repository.name}-{suffix}"
++        for suffix in ("advisor.ABC123", "g01-final.DEF456", "g01.GHI789")
++    )
++    old = (NOW - timedelta(days=3)).timestamp()
++    for path in legacy:
++        git(
++            fixture.repository,
++            "worktree",
++            "add",
++            "--detach",
++            str(path),
++            fixture.code_sha,
++        )
++        os.utime(path, (old, old))
++
++    stale = detect_stale_worktrees(
++        repository,
++        temp_root=temp_root,
++        older_than_seconds=24 * 3600,
++        now=lambda: NOW,
++    )
++
++    assert {item.path for item in stale} == set(legacy)
++    assert {item.pattern for item in stale} == {"legacy-advisor-review"}
++    reclaimed = reclaim_stale_worktrees(
++        repository,
++        stale,
++        log_path=tmp_path / "reclaim.jsonl",
++        now=lambda: NOW,
++    )
++    assert set(reclaimed) == set(legacy)
++    assert all(not path.exists() for path in legacy)
++
++
++def test_live_pid_marker_is_not_reported_stale(tmp_path: Path) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    repository = GitRepository(fixture.repository)
++    temp_root = tmp_path / "temporary"
++    temp_root.mkdir()
++    modern = temp_root / f"{fixture.repository.name}-advisor-pr-41-{fixture.code_sha[:12]}-ACTIVE"
++    git(
++        fixture.repository,
++        "worktree",
++        "add",
++        "--detach",
++        str(modern),
++        fixture.code_sha,
++    )
++    marker = {
++        "commit_sha": fixture.code_sha,
++        "created_at": (NOW - timedelta(days=3)).isoformat(),
++        "pid": os.getpid(),
++        "pr_number": 41,
++    }
++    modern.with_name(f".{modern.name}.ao-workspace.json").write_text(
++        json.dumps(marker),
++        encoding="utf-8",
++    )
++
++    try:
++        assert (
++            detect_stale_worktrees(
++                repository,
++                temp_root=temp_root,
++                older_than_seconds=24 * 3600,
++                now=lambda: NOW,
++            )
++            == ()
++        )
++    finally:
++        git(fixture.repository, "worktree", "remove", "--force", str(modern))
++        modern.with_name(f".{modern.name}.ao-workspace.json").unlink()
++
++
++def test_opinion_validation_accepts_evidence_only_head_and_rejects_new_code(
++    tmp_path: Path,
++) -> None:
++    fixture = make_diverged_repository(tmp_path)
++    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
++    record = tmp_path / "record.json"
++    record.write_text(
++        json.dumps(
++            {
++                "cleanup_succeeded": True,
++                "exit_code": 0,
++                "reviewed_commit_sha": fixture.code_sha,
++                "status": "completed",
++            }
++        ),
++        encoding="utf-8",
++    )
++    evidence_file = fixture.repository / "docs/evidence/pr-41/metadata.md"
++    evidence_file.parent.mkdir(parents=True)
++    evidence_file.write_text("evidence only\n", encoding="utf-8")
++    evidence_head = commit_paths(
++        fixture.repository,
++        "docs: evidence",
++        ["docs/evidence/pr-41/metadata.md"],
++    )
++    git(fixture.repository, "push", "origin", "feature/evidence")
++    provider = _provider_with_head(fixture.code_sha, evidence_head)
++
++    valid = validate_advisor_opinion(
++        GitRepository(fixture.repository),
++        provider,
++        metadata,
++        record,
++    )
++    assert valid.valid is True
++    assert valid.current_pr_head_sha == evidence_head
++
++    (fixture.repository / "later-code.txt").write_text("changed\n", encoding="utf-8")
++    later_head = commit_paths(
++        fixture.repository,
++        "feat: later code",
++        ["later-code.txt"],
++    )
++    git(fixture.repository, "push", "origin", "feature/evidence")
++    stale = validate_advisor_opinion(
++        GitRepository(fixture.repository),
++        _provider_with_head(fixture.code_sha, later_head),
++        metadata,
++        record,
++    )
++    assert stale.valid is False
++    assert stale.gate_status == "indeterminate"
++    assert "re-review" in stale.reason
++
++    git(fixture.repository, "rm", "later-code.txt")
++    git(fixture.repository, "commit", "-m", "revert: remove later code")
++    reverted_head = git(fixture.repository, "rev-parse", "HEAD").stdout.strip()
++    git(fixture.repository, "push", "origin", "feature/evidence")
++    reverted = validate_advisor_opinion(
++        GitRepository(fixture.repository),
++        _provider_with_head(fixture.code_sha, reverted_head),
++        metadata,
++        record,
++    )
++    assert reverted.valid is False
++    assert "re-review" in reverted.reason
++
++
++def _provider_with_head(code_sha: str, head_sha: str) -> FakeGitHubData:
++    provider = github_for(code_sha)
++    provider.pr = PullRequest(
++        number=provider.pr.number,
++        repository=provider.pr.repository,
++        title=provider.pr.title,
++        source_branch=provider.pr.source_branch,
++        target_branch=provider.pr.target_branch,
++        head_sha=head_sha,
++        url=provider.pr.url,
++        review_decision=provider.pr.review_decision,
++    )
++    return provider
