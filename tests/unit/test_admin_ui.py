@@ -8,7 +8,11 @@ from uuid import UUID
 import httpx
 import pytest
 
-from product_pdf_qr.domains.auth import SESSION_COOKIE_NAME, AuthenticatedAdmin
+from product_pdf_qr.domains.auth import (
+    SESSION_COOKIE_NAME,
+    AuthenticatedAdmin,
+    csrf_token_for_session,
+)
 from product_pdf_qr.main import create_app
 
 pytestmark = pytest.mark.anyio
@@ -65,6 +69,7 @@ async def test_authenticated_admin_pages_render(
     assert 'id="product-table"' in response.text
     assert 'id="detail-view"' in response.text
     assert "管理员：business-owner" in response.text  # noqa: RUF001
+    assert f'value="{csrf_token_for_session("browser-token")}"' in response.text
 
 
 async def test_admin_page_uses_session_identity_for_complete_browser_workflow(
@@ -94,6 +99,8 @@ async def test_admin_page_uses_session_identity_for_complete_browser_workflow(
     assert "ACTOR_ID" not in page
     assert "操作人 ID" not in page
     assert "managementFetch" in page
+    assert 'headers.set("X-CSRF-Token", csrfToken)' in page
+    assert csrf_token_for_session("browser-token") in page
     assert "/api/products/${currentProduct.id}/pdf" in page
     assert 'name="q"' in page
     assert 'name="pdf_status"' in page

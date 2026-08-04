@@ -101,6 +101,7 @@ async def create_product(
     raw_code: str,
     raw_name: str,
     *,
+    actor_id: int,
     request_id: UUID | None = None,
 ) -> Product:
     """Atomically create a product and its success audit event."""
@@ -142,6 +143,8 @@ async def create_product(
                         AuditEvent(
                             action="product_create",
                             result="success",
+                            actor_type="admin",
+                            actor_id=actor_id,
                             target_type="product",
                             target_id=product.id,
                             product_code=product.code,

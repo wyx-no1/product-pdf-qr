@@ -22,9 +22,11 @@ from pypdf import PdfWriter
 from product_pdf_qr.config import Settings, get_settings
 from product_pdf_qr.database import Database
 from product_pdf_qr.domains.auth import (
+    CSRF_HEADER_NAME,
     SESSION_COOKIE_NAME,
     PasswordManager,
     create_admin,
+    csrf_token_for_session,
     hash_session_token,
 )
 from product_pdf_qr.main import create_app, lifespan
@@ -109,13 +111,18 @@ def clean_business_database() -> AuthContext:
             (uuid4(), admin_id, hash_session_token(session_token)),
         )
         connection.commit()
-    return AuthContext(admin_id=admin_id, session_token=session_token)
+    return AuthContext(
+        admin_id=admin_id,
+        session_token=session_token,
+        csrf_token=csrf_token_for_session(session_token),
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class AuthContext:
     admin_id: int
     session_token: str
+    csrf_token: str
 
 
 def synthetic_pdf(width: int) -> bytes:
@@ -294,6 +301,12 @@ async def test_login_force_change_session_revocation_and_logout(
                 assert "HttpOnly" in cookie_header
                 assert "SameSite=lax" in cookie_header
                 assert "Secure" not in cookie_header
+                first_session_token = first.cookies.get(SESSION_COOKIE_NAME)
+                second_session_token = second.cookies.get(SESSION_COOKIE_NAME)
+                assert first_session_token is not None
+                assert second_session_token is not None
+                first_csrf_token = csrf_token_for_session(first_session_token)
+                second_csrf_token = csrf_token_for_session(second_session_token)
 
                 bypass = await first.get("/api/products")
                 assert bypass.status_code == 303
@@ -306,6 +319,7 @@ async def test_login_force_change_session_revocation_and_logout(
                         "current_password": temporary_password,
                         "new_password": temporary_password,
                         "confirm_password": temporary_password,
+                        "csrf_token": first_csrf_token,
                     },
                 )
                 assert unchanged.status_code == 422
@@ -317,17 +331,33 @@ async def test_login_force_change_session_revocation_and_logout(
                         "current_password": temporary_password,
                         "new_password": permanent_password,
                         "confirm_password": permanent_password,
+                        "csrf_token": first_csrf_token,
                     },
                 )
                 assert changed.status_code == 303
                 assert changed.headers["location"] == "/admin"
                 assert (await first.get("/admin")).status_code == 200
 
+                missing_csrf = await first.post(
+                    "/api/products",
+                    json={"code": "CSRF-MISSING", "name": "缺少 CSRF"},
+                )
+                invalid_csrf = await first.post(
+                    "/api/products",
+                    json={"code": "CSRF-INVALID", "name": "错误 CSRF"},
+                    headers={CSRF_HEADER_NAME: second_csrf_token},
+                )
+                assert missing_csrf.status_code == invalid_csrf.status_code == 403
+                assert missing_csrf.json()["error"]["code"] == "invalid_csrf_token"
+
                 revoked_other = await second.get("/admin")
                 assert revoked_other.status_code == 303
                 assert revoked_other.headers["location"].startswith("/admin/login")
 
-                logout = await first.post("/admin/logout")
+                logout = await first.post(
+                    "/admin/logout",
+                    data={"csrf_token": first_csrf_token},
+                )
                 assert logout.status_code == 303
                 assert (await first.get("/admin")).status_code == 303
 
@@ -367,6 +397,14 @@ async def test_login_force_change_session_revocation_and_logout(
             password_change_audit = connection.execute(
                 "SELECT count(*) FROM audit_events WHERE action = 'password_change'"
             ).fetchone()
+            limited_login_audit = connection.execute(
+                """
+                SELECT count(*)
+                FROM audit_events
+                WHERE action = 'login_failure'
+                  AND detail->>'reason' = 'rate_limited'
+                """
+            ).fetchone()
         assert session_rows
         assert all(len(str(row[0])) == 64 for row in session_rows)
         assert all(row[1] is not None for row in session_rows)
@@ -374,6 +412,7 @@ async def test_login_force_change_session_revocation_and_logout(
         assert admin_state[0] is False
         assert admin_state[1] is not None
         assert password_change_audit == (1,)
+        assert limited_login_audit == (1,)
     finally:
         get_settings.cache_clear()
 
@@ -399,6 +438,7 @@ async def test_product_list_database_search_filter_and_filtered_pagination(
                     transport=transport,
                     base_url="http://test",
                     cookies={SESSION_COOKIE_NAME: auth.session_token},
+                    headers={CSRF_HEADER_NAME: auth.csrf_token},
                 ) as client,
                 httpx.AsyncClient(transport=transport, base_url="http://test") as anonymous,
             ):
@@ -526,6 +566,7 @@ async def test_minimum_business_loop_and_four_public_states(
                     transport=transport,
                     base_url="http://test",
                     cookies={SESSION_COOKIE_NAME: auth.session_token},
+                    headers={CSRF_HEADER_NAME: auth.csrf_token},
                 ) as client,
                 httpx.AsyncClient(transport=transport, base_url="http://test") as public_client,
             ):
@@ -673,6 +714,14 @@ async def test_minimum_business_loop_and_four_public_states(
                 "SELECT DISTINCT uploaded_by FROM pdf_versions WHERE product_id = %s",
                 (product_id,),
             ).fetchall()
+            product_create_actor = connection.execute(
+                """
+                SELECT actor_type, actor_id
+                FROM audit_events
+                WHERE action = 'product_create' AND target_id = %s
+                """,
+                (product_id,),
+            ).fetchone()
             actions = {
                 str(row[0])
                 for row in connection.execute(
@@ -682,6 +731,7 @@ async def test_minimum_business_loop_and_four_public_states(
         assert version_count == (3,)
         assert file_count == (2,)
         assert upload_actors == [(auth.admin_id,)]
+        assert product_create_actor == ("admin", auth.admin_id)
         assert {"product_create", "pdf_upload", "pdf_upload_rejected"}.issubset(actions)
     finally:
         get_settings.cache_clear()
@@ -714,6 +764,7 @@ async def test_pre_parser_size_rejections_commit_independent_audits(
                 transport=transport,
                 base_url="http://test",
                 cookies={SESSION_COOKIE_NAME: clean_business_database.session_token},
+                headers={CSRF_HEADER_NAME: clean_business_database.csrf_token},
             ) as client:
                 declared = await client.post(
                     "/api/products/5/pdf",
@@ -790,6 +841,7 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                 transport=transport,
                 base_url="http://test",
                 cookies={SESSION_COOKIE_NAME: auth.session_token},
+                headers={CSRF_HEADER_NAME: auth.csrf_token},
             ) as client:
                 create_responses = await asyncio.gather(
                     *[

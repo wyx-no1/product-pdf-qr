@@ -10,11 +10,13 @@ import pytest
 from fastapi import FastAPI
 
 from product_pdf_qr.config import Settings
+from product_pdf_qr.domains.audit import AuditEvent
 from product_pdf_qr.domains.auth import (
     SESSION_COOKIE_NAME,
     AuthenticatedAdmin,
     CreatedSession,
     LoginRateLimiter,
+    csrf_token_for_session,
 )
 from product_pdf_qr.errors import AppError
 from product_pdf_qr.main import create_app
@@ -58,7 +60,10 @@ async def test_login_failure_and_dual_rate_limit(
     async def failed_login(*_args: object, **_kwargs: object) -> None:
         return None
 
-    async def audit(*_args: object, **_kwargs: object) -> bool:
+    audit_events: list[AuditEvent] = []
+
+    async def audit(_database: object, event: AuditEvent) -> bool:
+        audit_events.append(event)
         return True
 
     monkeypatch.setattr(
@@ -90,6 +95,12 @@ async def test_login_failure_and_dual_rate_limit(
     assert second.headers["retry-after"] == "10"
     assert blocked.status_code == 429
     assert blocked.headers["retry-after"] == "10"
+    assert len(audit_events) == 3
+    assert all(event.action == "login_failure" for event in audit_events)
+    assert audit_events[-1].detail == {
+        "username": "owner",
+        "reason": "rate_limited",
+    }
 
 
 async def test_successful_login_sets_reviewed_cookie_and_forces_change(
@@ -128,6 +139,7 @@ async def test_password_change_errors_success_and_logout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     admin = identity()
+    csrf_token = csrf_token_for_session("raw-token")
 
     async def resolve(_database: object, _token: str) -> AuthenticatedAdmin:
         return admin
@@ -154,12 +166,30 @@ async def test_password_change_errors_success_and_logout(
         cookies={SESSION_COOKIE_NAME: "raw-token"},
     ) as client:
         page = await client.get("/admin/change-password")
+        missing_csrf = await client.post(
+            "/admin/change-password",
+            data={
+                "current_password": "CurrentPassword-123",
+                "new_password": "NewPassword-456",
+                "confirm_password": "NewPassword-456",
+            },
+        )
+        invalid_csrf = await client.post(
+            "/admin/change-password",
+            data={
+                "current_password": "CurrentPassword-123",
+                "new_password": "NewPassword-456",
+                "confirm_password": "NewPassword-456",
+                "csrf_token": "invalid",
+            },
+        )
         mismatch = await client.post(
             "/admin/change-password",
             data={
                 "current_password": "CurrentPassword-123",
                 "new_password": "NewPassword-456",
                 "confirm_password": "DifferentPassword-789",
+                "csrf_token": csrf_token,
             },
         )
         invalid_current = await client.post(
@@ -168,6 +198,7 @@ async def test_password_change_errors_success_and_logout(
                 "current_password": "wrong",
                 "new_password": "NewPassword-456",
                 "confirm_password": "NewPassword-456",
+                "csrf_token": csrf_token,
             },
         )
         monkeypatch.setattr("product_pdf_qr.admin.change_password", password_success)
@@ -177,12 +208,23 @@ async def test_password_change_errors_success_and_logout(
                 "current_password": "CurrentPassword-123",
                 "new_password": "NewPassword-456",
                 "confirm_password": "NewPassword-456",
+                "csrf_token": csrf_token,
             },
         )
-        logout = await client.post("/admin/logout")
+        invalid_logout = await client.post(
+            "/admin/logout",
+            data={"csrf_token": "invalid"},
+        )
+        logout = await client.post(
+            "/admin/logout",
+            data={"csrf_token": csrf_token},
+        )
 
     assert page.status_code == 200
     assert "修改初始密码" in page.text
+    assert f'value="{csrf_token}"' in page.text
+    assert missing_csrf.status_code == invalid_csrf.status_code == 403
+    assert invalid_logout.status_code == 403
     assert mismatch.status_code == 422
     assert "两次输入的新密码不一致" in mismatch.text
     assert invalid_current.status_code == 422

@@ -377,6 +377,7 @@
       <div class="session-info">
         <span>管理员：{{ admin.username }}</span>
         <form action="/admin/logout" method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="logout-button" type="submit">退出登录</button>
         </form>
       </div>
@@ -538,6 +539,7 @@
       "use strict";
 
       const LIST_PAGE_SIZE = 50;
+      const csrfToken = {{ csrf_token | tojson }};
       let currentProduct = null;
       let listOffset = 0;
       let listHasNext = false;
@@ -575,7 +577,14 @@
       }
 
       async function managementFetch(input, init) {
-        const response = await fetch(input, init);
+        const requestInit = {...(init || {})};
+        const method = String(requestInit.method || "GET").toUpperCase();
+        if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+          const headers = new Headers(requestInit.headers || {});
+          headers.set("X-CSRF-Token", csrfToken);
+          requestInit.headers = headers;
+        }
+        const response = await fetch(input, requestInit);
         if (
           response.redirected
           && (

@@ -3,6 +3,7 @@
 from product_pdf_qr.domains.auth.rate_limit import LoginRateLimiter
 from product_pdf_qr.domains.auth.service import (
     ADMIN_USERNAME_MAX_LENGTH,
+    CSRF_HEADER_NAME,
     PASSWORD_MIN_LENGTH,
     SESSION_COOKIE_NAME,
     AuthenticatedAdmin,
@@ -11,6 +12,7 @@ from product_pdf_qr.domains.auth.service import (
     change_password,
     create_admin,
     create_authenticated_session,
+    csrf_token_for_session,
     hash_session_token,
     normalize_username,
     reset_admin_password,
@@ -21,6 +23,7 @@ from product_pdf_qr.domains.auth.service import (
 
 __all__ = [
     "ADMIN_USERNAME_MAX_LENGTH",
+    "CSRF_HEADER_NAME",
     "PASSWORD_MIN_LENGTH",
     "SESSION_COOKIE_NAME",
     "AuthenticatedAdmin",
@@ -30,6 +33,7 @@ __all__ = [
     "change_password",
     "create_admin",
     "create_authenticated_session",
+    "csrf_token_for_session",
     "hash_session_token",
     "normalize_username",
     "reset_admin_password",

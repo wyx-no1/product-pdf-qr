@@ -15,6 +15,7 @@ from product_pdf_qr.domains.auth import (
     change_password,
     create_admin,
     create_authenticated_session,
+    csrf_token_for_session,
     hash_session_token,
     reset_admin_password,
     resolve_session,
@@ -61,6 +62,16 @@ def test_password_manager_uses_argon2id_and_strength_rules() -> None:
         with pytest.raises(AppError) as captured:
             validate_new_password(password, username)
         assert captured.value.code == "weak_password"
+
+
+def test_csrf_token_is_deterministic_session_bound_and_non_reversible() -> None:
+    session_token = "raw-session-token"
+    csrf_token = csrf_token_for_session(session_token)
+
+    assert csrf_token == csrf_token_for_session(session_token)
+    assert csrf_token != csrf_token_for_session("different-session-token")
+    assert session_token not in csrf_token
+    assert len(csrf_token) == 64
 
 
 def test_login_limiter_blocks_by_ip_and_account_with_exponential_backoff() -> None:

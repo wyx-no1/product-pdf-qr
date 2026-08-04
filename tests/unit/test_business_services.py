@@ -141,6 +141,7 @@ async def test_create_product_commits_audit_with_normalized_code() -> None:
         as_database(ScriptedDatabase(connection)),
         " a001 ",
         " 测试产品 ",
+        actor_id=9,
     )
 
     assert product.code == "A001"
@@ -149,6 +150,9 @@ async def test_create_product_commits_audit_with_normalized_code() -> None:
     assert "INSERT INTO products" in connection.queries[0]
     assert cast(tuple[object, ...], connection.parameters[0])[:2] == ("A001", "测试产品")
     assert "INSERT INTO audit_events" in connection.queries[1]
+    audit_parameters = cast(tuple[object, ...], connection.parameters[1])
+    assert audit_parameters[:2] == ("admin", 9)
+    assert audit_parameters[2] == "product_create"
 
 
 @pytest.mark.anyio
@@ -170,6 +174,7 @@ async def test_create_product_rejects_duplicate_code(
             as_database(ScriptedDatabase(connection)),
             "A001",
             "测试产品",
+            actor_id=9,
         )
 
     assert captured.value.code == "duplicate_product_code"

@@ -92,6 +92,7 @@ async def test_create_download_and_retry_qrcode_handlers(tmp_path: Path) -> None
 
     created = await create_product_endpoint(
         ProductCreateRequest(code=" a001 ", name=" 测试产品 "),
+        authenticated_admin(),
         create_database,
         qrcode_service,
     )
@@ -139,6 +140,7 @@ async def test_create_survives_qrcode_generation_failure(
 
     created = await create_product_endpoint(
         ProductCreateRequest(code="A001", name="测试产品"),
+        authenticated_admin(),
         database,
         qrcode_service,
     )

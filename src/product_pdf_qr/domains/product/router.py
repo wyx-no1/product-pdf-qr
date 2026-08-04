@@ -189,12 +189,19 @@ async def _generate_with_audit(
 @router.post("", response_model=ProductCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_product_endpoint(
     payload: ProductCreateRequest,
+    admin: Annotated[AuthenticatedAdmin, Depends(get_current_admin)],
     database: Annotated[Database, Depends(get_database)],
     qrcode_service: Annotated[QRCodeService, Depends(get_qrcode_service)],
 ) -> ProductCreateResponse:
     """Create first, commit, then pre-generate the derived QR cache best-effort."""
 
-    product = await create_product(database, payload.code, payload.name, request_id=uuid4())
+    product = await create_product(
+        database,
+        payload.code,
+        payload.name,
+        actor_id=admin.id,
+        request_id=uuid4(),
+    )
     qrcode_status = "ready"
     try:
         result = await _generate_with_audit(database, qrcode_service, product)

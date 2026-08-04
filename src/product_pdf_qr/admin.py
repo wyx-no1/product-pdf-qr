@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import math
 from pathlib import Path
 from typing import Annotated, cast
@@ -77,11 +78,42 @@ def _password_response(
     response = templates.TemplateResponse(
         request=request,
         name="change_password.html",
-        context={"admin": admin, "error": error},
+        context={
+            "admin": admin,
+            "csrf_token": cast(str, request.state.csrf_token),
+            "error": error,
+        },
         status_code=status_code,
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+async def _record_login_failure(
+    database: Database,
+    *,
+    account_key: str,
+    reason: str,
+) -> None:
+    await append_independent_event(
+        database,
+        AuditEvent(
+            action="login_failure",
+            result="failure",
+            actor_type="anonymous",
+            target_type="admin",
+            detail={"username": account_key, "reason": reason},
+        ),
+    )
+
+
+def _valid_csrf_token(request: Request, candidate: str | None) -> bool:
+    expected = getattr(request.state, "csrf_token", None)
+    return (
+        isinstance(expected, str)
+        and candidate is not None
+        and hmac.compare_digest(candidate, expected)
+    )
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -109,6 +141,11 @@ async def login(
     retry_after = limiter.retry_after(ip_address, account_key)
     if retry_after > 0:
         wait_seconds = max(1, math.ceil(retry_after))
+        await _record_login_failure(
+            database,
+            account_key=account_key,
+            reason="rate_limited",
+        )
         return _login_response(
             request,
             next_path=next_path,
@@ -126,15 +163,10 @@ async def login(
     )
     if session is None:
         retry_after = limiter.register_failure(ip_address, account_key)
-        await append_independent_event(
+        await _record_login_failure(
             database,
-            AuditEvent(
-                action="admin_login",
-                result="failure",
-                actor_type="anonymous",
-                target_type="admin",
-                detail={"username": account_key},
-            ),
+            account_key=account_key,
+            reason="invalid_credentials",
         )
         failure_wait_seconds: int | None = math.ceil(retry_after) if retry_after > 0 else None
         message = "用户名或密码错误。"
@@ -187,10 +219,18 @@ async def change_password_endpoint(
     confirm_password: Annotated[str, Form()],
     database: Annotated[Database, Depends(get_database)],
     password_manager: Annotated[PasswordManager, Depends(get_password_manager)],
+    csrf_token: Annotated[str | None, Form()] = None,
 ) -> Response:
     """Change the password and revoke every other session."""
 
     admin = cast(AuthenticatedAdmin, request.state.admin)
+    if not _valid_csrf_token(request, csrf_token):
+        return _password_response(
+            request,
+            admin,
+            error="请求验证失败, 请刷新页面后重试。",
+            status_code=403,
+        )
     if new_password != confirm_password:
         return _password_response(
             request,
@@ -225,9 +265,16 @@ async def logout(
     request: Request,
     database: Annotated[Database, Depends(get_database)],
     settings: Annotated[Settings, Depends(get_runtime_settings)],
-) -> RedirectResponse:
+    csrf_token: Annotated[str | None, Form()] = None,
+) -> Response:
     """Revoke the current server-side session and remove its browser cookie."""
 
+    if not _valid_csrf_token(request, csrf_token):
+        return HTMLResponse(
+            "请求验证失败, 请刷新页面后重试。",
+            status_code=403,
+            headers={"Cache-Control": "no-store"},
+        )
     admin = cast(AuthenticatedAdmin, request.state.admin)
     await revoke_session(database, admin)
     response = RedirectResponse(
@@ -254,7 +301,11 @@ async def admin_page(request: Request, product_id: int | None = None) -> HTMLRes
     response = templates.TemplateResponse(
         request=request,
         name="admin.html",
-        context={"product_id": product_id, "admin": admin},
+        context={
+            "product_id": product_id,
+            "admin": admin,
+            "csrf_token": cast(str, request.state.csrf_token),
+        },
     )
     response.headers["Cache-Control"] = "no-store"
     return response

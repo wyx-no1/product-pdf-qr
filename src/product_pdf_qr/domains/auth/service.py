@@ -21,6 +21,8 @@ ADMIN_USERNAME_MAX_LENGTH = 64
 PASSWORD_MIN_LENGTH = 12
 SESSION_TOKEN_BYTES = 32
 SESSION_COOKIE_NAME = "admin_session"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+CSRF_DOMAIN_SEPARATOR = b"product-pdf-qr:csrf:v1\x00"
 ADMIN_CREATE_ADVISORY_LOCK_ID = 7_328_011_001
 
 
@@ -110,6 +112,12 @@ def hash_session_token(token: str) -> str:
     """Return the only representation of a session token persisted in PostgreSQL."""
 
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def csrf_token_for_session(token: str) -> str:
+    """Derive a non-reversible CSRF token bound to one raw browser session."""
+
+    return hashlib.sha256(CSRF_DOMAIN_SEPARATOR + token.encode("utf-8")).hexdigest()
 
 
 async def create_admin(
