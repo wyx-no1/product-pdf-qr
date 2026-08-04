@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling==1.29.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "product-pdf-qr"
+version = "0.1.0"
+description = "Local-only Phase 1 product PDF QR workflow"
+readme = "README.md"
+requires-python = ">=3.13,<3.15"
+dependencies = [
+  "alembic==1.18.5",
+  "fastapi==0.141.1",
+  "pillow==12.3.0",
+  "psycopg[binary]==3.3.4",
+  "psycopg-pool==3.3.1",
+  "pydantic-settings==2.14.2",
+  "pypdf==6.14.2",
+  "python-multipart==0.0.32",
+  "segno==1.6.6",
+  "uvicorn==0.52.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build==1.4.0",
+  "httpx==0.28.1",
+  "mypy==2.3.0",
+  "pip-audit==2.10.0",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "pytest-cov==7.0.0",
+  "ruff==0.16.1",
+]
+
+[project.scripts]
+product-pdf-qr = "app.main:run"
+orphan-report = "app.storage.reconcile:run"
+qrcode-report = "app.qrcode.reconcile:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config -ra"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "database: requires an isolated PostgreSQL test database",
+  "concurrency: exercises PostgreSQL locking and concurrent writes",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["app"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "S", "UP", "B", "A", "C4", "DTZ", "PIE", "PT", "RUF"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S108", "S311"]
+"migrations/**" = ["E501"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["app"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["segno", "pypdf"]
+ignore_missing_imports = true
+
