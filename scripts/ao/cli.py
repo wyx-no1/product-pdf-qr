@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--repo", type=Path, required=True)
     validate.add_argument("--metadata", type=Path, required=True)
     validate.add_argument("--record", type=Path, required=True)
+    validate.add_argument("--log", type=Path)
 
     stale = commands.add_parser("stale-list", help="detect stale Advisor worktrees")
     _add_stale_arguments(stale)
@@ -230,6 +231,7 @@ def _advisor_validate(arguments: argparse.Namespace) -> int:
         github,
         arguments.metadata,
         arguments.record,
+        log_path=arguments.log,
     )
     _print_json(asdict(result))
     return 0 if result.valid else 2
