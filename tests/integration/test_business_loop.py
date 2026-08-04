@@ -379,6 +379,130 @@ async def test_login_force_change_session_revocation_and_logout(
 
 
 @pytest.mark.e2e
+async def test_product_list_database_search_filter_and_filtered_pagination(
+    clean_business_database: AuthContext,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = clean_business_database
+    runtime_url = required_environment("TEST_DATABASE_URL")
+    monkeypatch.setenv("DATABASE_URL", runtime_url)
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path))
+    get_settings.cache_clear()
+    app = create_app()
+
+    try:
+        async with lifespan(app):
+            transport = httpx.ASGITransport(app=app)
+            async with (
+                httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://test",
+                    cookies={SESSION_COOKIE_NAME: auth.session_token},
+                ) as client,
+                httpx.AsyncClient(transport=transport, base_url="http://test") as anonymous,
+            ):
+                uploaded = await create_product(client, "V1-ACC-001", "Acme%_Literal")
+                not_uploaded = await create_product(client, "V1-ACC-002", "Beta Product")
+                await create_product(client, "PAGE-ONE", "Page Match One")
+                await create_product(client, "PAGE-TWO", "Page Match Two")
+                uploaded_id = cast(int, uploaded["id"])
+                not_uploaded_id = cast(int, not_uploaded["id"])
+
+                with psycopg.connect(runtime_url) as connection:
+                    historical_row = connection.execute(
+                        """
+                        INSERT INTO products (
+                            code,
+                            name,
+                            public_token,
+                            status,
+                            created_at,
+                            updated_at
+                        ) VALUES ('HIST_NULL', NULL, %s, 'active', now(), now())
+                        RETURNING id
+                        """,
+                        ("H" * 26,),
+                    ).fetchone()
+                    connection.commit()
+                assert historical_row is not None
+                historical_id = int(historical_row[0])
+
+                uploaded_response = await upload(
+                    client,
+                    uploaded_id,
+                    synthetic_pdf(72),
+                    "search-filter.pdf",
+                )
+                assert uploaded_response.status_code == 201
+
+                default_page = await client.get("/api/products")
+                assert default_page.status_code == 200
+                assert len(default_page.json()) == 5
+                assert set(default_page.json()[0]) == {
+                    "id",
+                    "code",
+                    "name",
+                    "pdf_status",
+                    "updated_at",
+                }
+
+                exact_code = await client.get("/api/products", params={"q": "V1-ACC-001"})
+                assert [item["id"] for item in exact_code.json()] == [uploaded_id]
+
+                lowercase_code = await client.get("/api/products", params={"q": "v1-acc"})
+                assert {item["id"] for item in lowercase_code.json()} == {
+                    uploaded_id,
+                    not_uploaded_id,
+                }
+
+                name_fragment = await client.get("/api/products", params={"q": "literal"})
+                assert [item["id"] for item in name_fragment.json()] == [uploaded_id]
+
+                literal_wildcards = await client.get("/api/products", params={"q": "%_"})
+                assert [item["id"] for item in literal_wildcards.json()] == [uploaded_id]
+
+                uploaded_only = await client.get(
+                    "/api/products",
+                    params={"pdf_status": "uploaded"},
+                )
+                assert [item["id"] for item in uploaded_only.json()] == [uploaded_id]
+
+                not_uploaded_only = await client.get(
+                    "/api/products",
+                    params={"pdf_status": "not_uploaded"},
+                )
+                assert uploaded_id not in {item["id"] for item in not_uploaded_only.json()}
+                historical = next(
+                    item for item in not_uploaded_only.json() if item["id"] == historical_id
+                )
+                assert historical["name"] is None
+
+                combined = await client.get(
+                    "/api/products",
+                    params={"q": "v1-acc", "pdf_status": "not_uploaded"},
+                )
+                assert [item["id"] for item in combined.json()] == [not_uploaded_id]
+
+                filtered = await client.get(
+                    "/api/products",
+                    params={"q": "page", "limit": 10, "offset": 0},
+                )
+                second_filtered = await client.get(
+                    "/api/products",
+                    params={"q": "page", "limit": 1, "offset": 1},
+                )
+                assert len(filtered.json()) == 2
+                assert second_filtered.json() == [filtered.json()[1]]
+
+                denied = await anonymous.get("/api/products", params={"q": "v1-acc"})
+                assert denied.status_code == 303
+                assert denied.headers["location"].startswith("/admin/login")
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.e2e
 async def test_minimum_business_loop_and_four_public_states(
     clean_business_database: AuthContext,
     tmp_path: Path,

@@ -95,7 +95,16 @@ async def test_admin_page_uses_session_identity_for_complete_browser_workflow(
     assert "操作人 ID" not in page
     assert "managementFetch" in page
     assert "/api/products/${currentProduct.id}/pdf" in page
-    assert 'managementFetch("/api/products?limit=100&offset=0")' in page
+    assert 'name="q"' in page
+    assert 'name="pdf_status"' in page
+    assert '<option value="uploaded">已上传 PDF</option>' in page
+    assert '<option value="not_uploaded">未上传 PDF</option>' in page
+    assert "new URLSearchParams" in page
+    assert 'parameters.set("q", query)' in page
+    assert 'parameters.set("pdf_status", pdfStatusFilter.value)' in page
+    assert "listOffset += LIST_PAGE_SIZE" in page
+    assert "没有匹配的产品。请调整或清除搜索条件。" in page
+    assert "清除条件" in page
     assert "managementFetch(`/api/products/${productId}`)" in page
     assert "未找到该产品，可能已被移除。" in page  # noqa: RUF001
     assert "暂无产品。请使用上方表单创建第一个产品。" in page

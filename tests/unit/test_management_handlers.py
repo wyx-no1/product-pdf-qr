@@ -152,12 +152,21 @@ async def test_create_survives_qrcode_generation_failure(
 async def test_list_and_detail_handlers_expose_persisted_state(tmp_path: Path) -> None:
     historical = {**product_row(), "id": 4, "code": "OLD", "name": None}
     uploaded = {**product_row(), "current_version_id": 17}
-    list_database = as_database(ScriptedDatabase(ScriptedConnection([[uploaded, historical]])))
+    list_connection = ScriptedConnection([[uploaded, historical]])
+    list_database = as_database(ScriptedDatabase(list_connection))
 
-    products = await list_products_endpoint(list_database, limit=25, offset=5)
+    products = await list_products_endpoint(
+        list_database,
+        limit=25,
+        offset=5,
+        q=" a00 ",
+        pdf_status="not_uploaded",
+    )
 
     assert [product.name for product in products] == ["测试产品", None]
     assert [product.pdf_status for product in products] == ["uploaded", "not_uploaded"]
+    assert list_connection.parameters[0] == ("%a00%", "%a00%", 25, 5)
+    assert "current_version_id IS NULL" in list_connection.queries[0]
 
     qrcode_service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
     await qrcode_service.get_or_generate("A001", "A" * 26)

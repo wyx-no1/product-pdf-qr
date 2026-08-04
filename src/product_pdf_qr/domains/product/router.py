@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Query, Response, UploadFile, status
@@ -21,6 +21,7 @@ from product_pdf_qr.domains.auth import AuthenticatedAdmin
 from product_pdf_qr.domains.product.service import (
     PRODUCT_NAME_MAX_LENGTH,
     Product,
+    ProductPDFStatus,
     create_product,
     get_product,
     list_products,
@@ -51,9 +52,6 @@ class ProductCreateResponse(BaseModel):
     public_url: str
     qrcode_url: str
     qrcode_status: str
-
-
-ProductPDFStatus = Literal["uploaded", "not_uploaded"]
 
 
 class ProductListItemResponse(BaseModel):
@@ -222,10 +220,18 @@ async def list_products_endpoint(
     database: Annotated[Database, Depends(get_database)],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
+    q: Annotated[str | None, Query(max_length=120)] = None,
+    pdf_status: Annotated[ProductPDFStatus | None, Query()] = None,
 ) -> list[ProductListItemResponse]:
-    """Return a bounded page of persisted products for the admin index."""
+    """Return a database-filtered page of persisted products for the admin index."""
 
-    products = await list_products(database, limit=limit, offset=offset)
+    products = await list_products(
+        database,
+        limit=limit,
+        offset=offset,
+        q=q,
+        pdf_status=pdf_status,
+    )
     return [
         ProductListItemResponse(
             id=product.id,

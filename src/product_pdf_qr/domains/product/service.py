@@ -7,7 +7,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
@@ -22,6 +22,7 @@ PUBLIC_TOKEN_BYTES = 16
 PUBLIC_TOKEN_LENGTH = 26
 TOKEN_RETRY_LIMIT = 5
 PRODUCT_NAME_MAX_LENGTH = 120
+ProductPDFStatus = Literal["uploaded", "not_uploaded"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,12 +159,46 @@ async def create_product(
     raise AppError("token_generation_failed", "无法生成公开标识, 请重试。", 503)
 
 
-async def list_products(database: Database, *, limit: int, offset: int) -> list[Product]:
-    """Return one stable page ordered by the most recently updated product."""
+def _escape_like_pattern(value: str) -> str:
+    """Escape PostgreSQL LIKE metacharacters before adding substring wildcards."""
 
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def list_products(
+    database: Database,
+    *,
+    limit: int,
+    offset: int,
+    q: str | None = None,
+    pdf_status: ProductPDFStatus | None = None,
+) -> list[Product]:
+    """Filter in PostgreSQL, then return one stable page of matching products."""
+
+    clauses: list[str] = []
+    parameters: list[object] = []
+    search_term = q.strip() if q is not None else ""
+    if search_term:
+        pattern = f"%{_escape_like_pattern(search_term)}%"
+        clauses.append(
+            """
+            (
+                code ILIKE %s ESCAPE E'\\\\'
+                OR COALESCE(name, '') ILIKE %s ESCAPE E'\\\\'
+            )
+            """
+        )
+        parameters.extend((pattern, pattern))
+    if pdf_status == "uploaded":
+        clauses.append("current_version_id IS NOT NULL")
+    elif pdf_status == "not_uploaded":
+        clauses.append("current_version_id IS NULL")
+
+    where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    parameters.extend((limit, offset))
     async with database.connection() as connection:
         cursor = await connection.execute(
-            """
+            f"""
             SELECT
                 id,
                 code,
@@ -174,10 +209,11 @@ async def list_products(database: Database, *, limit: int, offset: int) -> list[
                 created_at,
                 updated_at
             FROM products
+            {where_clause}
             ORDER BY updated_at DESC, id DESC
             LIMIT %s OFFSET %s
             """,
-            (limit, offset),
+            tuple(parameters),
         )
         rows = await cursor.fetchall()
     return [_product_from_row(row) for row in rows]

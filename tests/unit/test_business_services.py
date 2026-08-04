@@ -222,6 +222,55 @@ async def test_product_list_and_detail_support_historical_null_names() -> None:
 
 
 @pytest.mark.anyio
+async def test_product_list_filters_in_sql_before_pagination_and_escapes_like() -> None:
+    search_connection = ScriptedConnection([[]])
+    uploaded_connection = ScriptedConnection([[]])
+    not_uploaded_connection = ScriptedConnection([[]])
+    database = as_database(
+        ScriptedDatabase(
+            search_connection,
+            uploaded_connection,
+            not_uploaded_connection,
+        )
+    )
+
+    await list_products(
+        database,
+        limit=5,
+        offset=10,
+        q=r" v1%_\legacy ",
+    )
+    await list_products(
+        database,
+        limit=20,
+        offset=0,
+        pdf_status="uploaded",
+    )
+    await list_products(
+        database,
+        limit=20,
+        offset=20,
+        pdf_status="not_uploaded",
+    )
+
+    search_sql = search_connection.queries[0]
+    assert "code ILIKE %s" in search_sql
+    assert "COALESCE(name, '') ILIKE %s" in search_sql
+    assert search_sql.index("WHERE") < search_sql.index("ORDER BY")
+    assert search_sql.index("ORDER BY") < search_sql.index("LIMIT")
+    assert search_connection.parameters[0] == (
+        r"%v1\%\_\\legacy%",
+        r"%v1\%\_\\legacy%",
+        5,
+        10,
+    )
+    assert "current_version_id IS NOT NULL" in uploaded_connection.queries[0]
+    assert uploaded_connection.parameters[0] == (20, 0)
+    assert "current_version_id IS NULL" in not_uploaded_connection.queries[0]
+    assert not_uploaded_connection.parameters[0] == (20, 20)
+
+
+@pytest.mark.anyio
 async def test_get_product_missing_uses_safe_error() -> None:
     database = as_database(ScriptedDatabase(ScriptedConnection([None])))
 

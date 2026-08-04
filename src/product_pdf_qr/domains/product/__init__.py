@@ -3,6 +3,7 @@
 from product_pdf_qr.domains.product.service import (
     PRODUCT_NAME_MAX_LENGTH,
     Product,
+    ProductPDFStatus,
     create_product,
     generate_public_token,
     get_product,
@@ -15,6 +16,7 @@ from product_pdf_qr.domains.product.service import (
 __all__ = [
     "PRODUCT_NAME_MAX_LENGTH",
     "Product",
+    "ProductPDFStatus",
     "create_product",
     "generate_public_token",
     "get_product",

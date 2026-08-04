@@ -41,6 +41,21 @@ def test_product_create_and_read_contracts_include_persisted_name() -> None:
     )
 
 
+def test_product_list_search_and_filter_parameters_are_optional() -> None:
+    operation = create_app().openapi()["paths"]["/api/products"]["get"]
+    parameters = {parameter["name"]: parameter for parameter in operation["parameters"]}
+
+    assert set(parameters) == {"limit", "offset", "q", "pdf_status"}
+    assert parameters["limit"]["schema"]["default"] == 50
+    assert parameters["offset"]["schema"]["default"] == 0
+    assert parameters["q"]["required"] is False
+    assert parameters["pdf_status"]["required"] is False
+    assert set(parameters["pdf_status"]["schema"]["anyOf"][0]["enum"]) == {
+        "uploaded",
+        "not_uploaded",
+    }
+
+
 def test_pdf_upload_no_longer_accepts_a_client_actor_identity() -> None:
     schema = create_app().openapi()
     operation = schema["paths"]["/api/products/{product_id}/pdf"]["post"]
