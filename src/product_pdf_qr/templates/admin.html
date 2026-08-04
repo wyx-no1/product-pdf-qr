@@ -77,9 +77,35 @@
       background: #172033;
     }
 
+    .page-header-inner,
+    .session-info {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
     .page-header h1 {
       margin: 0;
       font-size: 1.2rem;
+    }
+
+    .session-info {
+      justify-content: flex-end;
+      color: #dce5f5;
+      font-size: 0.9rem;
+    }
+
+    .logout-button {
+      min-height: 36px;
+      padding: 0.4rem 0.75rem;
+      border: 1px solid #6f7c92;
+      color: #fff;
+      background: transparent;
+    }
+
+    .logout-button:hover {
+      background: #2c3850;
     }
 
     main {
@@ -262,6 +288,11 @@
     }
 
     @media (max-width: 760px) {
+      .page-header-inner {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
       .form-grid,
       .detail-grid {
         grid-template-columns: 1fr;
@@ -293,7 +324,15 @@
 
 {% block content %}
   <header class="page-header">
-    <h1>Product PDF QR 管理</h1>
+    <div class="page-header-inner">
+      <h1>Product PDF QR 管理</h1>
+      <div class="session-info">
+        <span>管理员：{{ admin.username }}</span>
+        <form action="/admin/logout" method="post">
+          <button class="logout-button" type="submit">退出登录</button>
+        </form>
+      </div>
+    </div>
   </header>
 
   <main>
@@ -380,8 +419,6 @@
           <dd id="detail-updated-at"></dd>
           <dt>公开访问地址</dt>
           <dd><a id="detail-public-url" target="_blank" rel="noopener noreferrer"></a></dd>
-          <dt>操作人 ID</dt>
-          <dd><strong>1</strong>（第一期固定值）</dd>
         </dl>
 
         <div class="detail-grid">
@@ -421,7 +458,6 @@
     (() => {
       "use strict";
 
-      const ACTOR_ID = "1"; // 第一期为单管理员；无用户体系，按已裁定规格固定传 1。
       let currentProduct = null;
 
       const indexView = document.querySelector("#index-view");
@@ -446,6 +482,21 @@
       function setFeedback(element, message, kind = "success") {
         element.textContent = message;
         element.dataset.kind = kind;
+      }
+
+      async function managementFetch(input, init) {
+        const response = await fetch(input, init);
+        if (
+          response.redirected
+          && (
+            response.url.includes("/admin/login")
+            || response.url.includes("/admin/change-password")
+          )
+        ) {
+          window.location.assign(response.url);
+          throw new Error("管理员会话需要重新验证。");
+        }
+        return response;
       }
 
       async function apiErrorMessage(response) {
@@ -545,7 +596,7 @@
       async function loadProduct(productId) {
         showDetailLoading();
         try {
-          const response = await fetch(`/api/products/${productId}`);
+          const response = await managementFetch(`/api/products/${productId}`);
           if (response.status === 404) {
             showMissingProduct("未找到该产品，可能已被移除。");
             return;
@@ -597,7 +648,7 @@
       async function loadProducts() {
         setFeedback(listFeedback, "正在加载产品列表…");
         try {
-          const response = await fetch("/api/products?limit=100&offset=0");
+          const response = await managementFetch("/api/products?limit=100&offset=0");
           if (!response.ok) {
             throw new Error(await apiErrorMessage(response));
           }
@@ -635,7 +686,7 @@
         createButton.disabled = true;
         setFeedback(createFeedback, "正在创建…");
         try {
-          const response = await fetch("/api/products", {
+          const response = await managementFetch("/api/products", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify({code, name}),
@@ -670,12 +721,11 @@
         }
 
         const body = new FormData();
-        body.append("actor_id", ACTOR_ID);
         body.append("file", file);
         uploadButton.disabled = true;
         setFeedback(uploadFeedback, "正在上传…");
         try {
-          const response = await fetch(`/api/products/${currentProduct.id}/pdf`, {
+          const response = await managementFetch(`/api/products/${currentProduct.id}/pdf`, {
             method: "POST",
             body,
           });

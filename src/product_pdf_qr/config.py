@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_PDF_VALIDATION_TIMEOUT_SECONDS = 5.0
 DEFAULT_PDF_VALIDATION_CPU_SECONDS = 3
 DEFAULT_PDF_VALIDATION_MEMORY_BYTES = 512 * 1024 * 1024
+DEFAULT_SESSION_TTL_SECONDS = 12 * 60 * 60
 
 
 class Settings(BaseSettings):
@@ -45,6 +46,12 @@ class Settings(BaseSettings):
     )
     public_miss_limit: int = Field(default=20, ge=1)
     public_miss_window_seconds: int = Field(default=600, ge=1)
+    session_cookie_secure: bool = True
+    session_ttl_seconds: int = Field(default=DEFAULT_SESSION_TTL_SECONDS, ge=300)
+    login_failure_limit: int = Field(default=5, ge=2)
+    login_failure_window_seconds: int = Field(default=15 * 60, ge=60)
+    login_backoff_base_seconds: float = Field(default=1.0, gt=0, le=60)
+    login_backoff_max_seconds: float = Field(default=60.0, gt=0, le=600)
 
     def __init__(self, **values: Any) -> None:
         """Allow required values to be supplied by BaseSettings sources."""
@@ -57,6 +64,10 @@ class Settings(BaseSettings):
 
         if self.db_pool_max_size < self.db_pool_min_size:
             raise ValueError("DB_POOL_MAX_SIZE must be at least DB_POOL_MIN_SIZE")
+        if self.login_backoff_max_seconds < self.login_backoff_base_seconds:
+            raise ValueError(
+                "LOGIN_BACKOFF_MAX_SECONDS must be at least LOGIN_BACKOFF_BASE_SECONDS"
+            )
         return self
 
 

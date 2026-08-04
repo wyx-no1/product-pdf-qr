@@ -39,3 +39,14 @@ def test_product_create_and_read_contracts_include_persisted_name() -> None:
     assert {"created_at", "updated_at", "pdf_status", "qrcode_status"}.issubset(
         detail_schema["required"]
     )
+
+
+def test_pdf_upload_no_longer_accepts_a_client_actor_identity() -> None:
+    schema = create_app().openapi()
+    operation = schema["paths"]["/api/products/{product_id}/pdf"]["post"]
+    body_reference = operation["requestBody"]["content"]["multipart/form-data"]["schema"]["$ref"]
+    body_schema = schema["components"]["schemas"][body_reference.rsplit("/", 1)[-1]]
+
+    assert "actor_id" not in str(operation)
+    assert body_schema["required"] == ["file"]
+    assert set(body_schema["properties"]) == {"file"}

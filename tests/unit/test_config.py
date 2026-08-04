@@ -20,6 +20,9 @@ def test_settings_are_local_by_default() -> None:
     assert settings.pdf_validation_timeout_seconds == 5
     assert settings.pdf_validation_cpu_seconds == 3
     assert settings.pdf_validation_memory_bytes == 512 * 1024 * 1024
+    assert settings.session_cookie_secure
+    assert settings.session_ttl_seconds == 43_200
+    assert settings.login_failure_limit == 5
 
 
 def test_settings_reject_invalid_pool_bounds() -> None:
@@ -39,6 +42,15 @@ def test_settings_reject_maximum_below_minimum() -> None:
                 "database_url": "postgresql://app_rw:synthetic@127.0.0.1:5432/test",
                 "db_pool_min_size": 3,
                 "db_pool_max_size": 2,
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        Settings.model_validate(
+            {
+                "database_url": "postgresql://app_rw:synthetic@127.0.0.1:5432/test",
+                "login_backoff_base_seconds": 10,
+                "login_backoff_max_seconds": 1,
             }
         )
 

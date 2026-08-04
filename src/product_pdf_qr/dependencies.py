@@ -6,6 +6,7 @@ from fastapi import Request
 
 from product_pdf_qr.config import Settings
 from product_pdf_qr.database import Database
+from product_pdf_qr.domains.auth import AuthenticatedAdmin, LoginRateLimiter, PasswordManager
 from product_pdf_qr.domains.public import PublicMissLimiter
 from product_pdf_qr.domains.qrcode import QRCodeService
 from product_pdf_qr.domains.storage import StorageService
@@ -39,3 +40,21 @@ def get_public_miss_limiter(request: Request) -> PublicMissLimiter:
     """Return the process-local missing-token limiter."""
 
     return cast(PublicMissLimiter, request.app.state.public_miss_limiter)
+
+
+def get_password_manager(request: Request) -> PasswordManager:
+    """Return the application-owned Argon2id password manager."""
+
+    return cast(PasswordManager, request.app.state.password_manager)
+
+
+def get_login_rate_limiter(request: Request) -> LoginRateLimiter:
+    """Return the process-local dual-dimension login limiter."""
+
+    return cast(LoginRateLimiter, request.app.state.login_rate_limiter)
+
+
+def get_current_admin(request: Request) -> AuthenticatedAdmin:
+    """Return the identity populated by the authentication middleware."""
+
+    return cast(AuthenticatedAdmin, request.state.admin)

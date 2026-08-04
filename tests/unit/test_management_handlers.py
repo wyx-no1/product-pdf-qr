@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Never
+from uuid import UUID
 
 import pytest
 from fastapi import UploadFile
@@ -15,12 +16,16 @@ from pypdf import PdfWriter
 from starlette.datastructures import Headers
 
 from product_pdf_qr.dependencies import (
+    get_current_admin,
     get_database,
+    get_login_rate_limiter,
+    get_password_manager,
     get_public_miss_limiter,
     get_qrcode_service,
     get_runtime_settings,
     get_storage_service,
 )
+from product_pdf_qr.domains.auth import AuthenticatedAdmin
 from product_pdf_qr.domains.product.router import (
     ProductCreateRequest,
     create_product_endpoint,
@@ -42,6 +47,16 @@ from tests.unit.test_business_services import (
     ScriptedDatabase,
     as_database,
 )
+
+
+def authenticated_admin(admin_id: int = 9) -> AuthenticatedAdmin:
+    return AuthenticatedAdmin(
+        id=admin_id,
+        username="test-admin",
+        must_change_password=False,
+        session_id=UUID("11111111-1111-1111-1111-111111111111"),
+        session_expires_at=datetime(2026, 8, 5, tzinfo=UTC),
+    )
 
 
 def product_row() -> dict[str, object]:
@@ -193,8 +208,8 @@ async def test_upload_handler_validates_then_creates_version(tmp_path: Path) -> 
 
     uploaded = await upload_pdf_endpoint(
         5,
-        9,
         synthetic_upload(),
+        authenticated_admin(),
         database,
         storage,
     )
@@ -217,7 +232,13 @@ async def test_upload_validation_rejection_is_audited(tmp_path: Path) -> None:
     )
 
     with pytest.raises(UploadRejected):
-        await upload_pdf_endpoint(5, 9, invalid, database, storage)
+        await upload_pdf_endpoint(
+            5,
+            invalid,
+            authenticated_admin(),
+            database,
+            storage,
+        )
 
     audit_parameters = audit_connection.parameters[0]
     assert isinstance(audit_parameters, tuple)
@@ -248,8 +269,8 @@ async def test_parser_limit_rejection_reason_is_audited(
     with pytest.raises(UploadRejected):
         await upload_pdf_endpoint(
             5,
-            9,
             synthetic_upload(),
+            authenticated_admin(),
             database,
             ParserRejectingStorage(Path("unused"), max_pdf_bytes=1024),
         )
@@ -313,12 +334,18 @@ def test_dependency_accessors_return_application_state() -> None:
         "storage_service": object(),
         "qrcode_service": object(),
         "public_miss_limiter": PublicMissLimiter(1, 1),
+        "password_manager": object(),
+        "login_rate_limiter": object(),
     }
     app = SimpleNamespace(state=SimpleNamespace(**values))
-    request = SimpleNamespace(app=app)
+    admin = authenticated_admin()
+    request = SimpleNamespace(app=app, state=SimpleNamespace(admin=admin))
 
     assert get_database(request) is values["database"]  # type: ignore[arg-type]
     assert get_runtime_settings(request) is values["settings"]  # type: ignore[arg-type]
     assert get_storage_service(request) is values["storage_service"]  # type: ignore[arg-type]
     assert get_qrcode_service(request) is values["qrcode_service"]  # type: ignore[arg-type]
     assert get_public_miss_limiter(request) is values["public_miss_limiter"]  # type: ignore[arg-type]
+    assert get_password_manager(request) is values["password_manager"]  # type: ignore[arg-type]
+    assert get_login_rate_limiter(request) is values["login_rate_limiter"]  # type: ignore[arg-type]
+    assert get_current_admin(request) is admin  # type: ignore[arg-type]

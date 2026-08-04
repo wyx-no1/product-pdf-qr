@@ -7,8 +7,10 @@ import io
 import os
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 import httpx
 import psycopg
@@ -17,7 +19,14 @@ from alembic import command
 from alembic.config import Config
 from pypdf import PdfWriter
 
-from product_pdf_qr.config import get_settings
+from product_pdf_qr.config import Settings, get_settings
+from product_pdf_qr.database import Database
+from product_pdf_qr.domains.auth import (
+    SESSION_COOKIE_NAME,
+    PasswordManager,
+    create_admin,
+    hash_session_token,
+)
 from product_pdf_qr.main import create_app, lifespan
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
@@ -44,7 +53,7 @@ def migration_environment(url: str) -> Iterator[None]:
 
 
 @pytest.fixture
-def clean_business_database() -> int:
+def clean_business_database() -> AuthContext:
     migration_url = required_environment("TEST_MIGRATION_DATABASE_URL")
     runtime_url = required_environment("TEST_DATABASE_URL")
     with migration_environment(migration_url):
@@ -66,21 +75,47 @@ def clean_business_database() -> int:
             RESTART IDENTITY CASCADE
             """
         )
+
+    async def provision_admin() -> int:
+        database = Database(Settings.model_validate({"database_url": runtime_url}))
+        await database.open()
+        try:
+            return await create_admin(
+                database,
+                PasswordManager(),
+                raw_username="phase1b-synthetic-admin",
+                password="FixtureTemporaryPassword-123",
+            )
+        finally:
+            await database.close()
+
+    admin_id = asyncio.run(provision_admin())
     with psycopg.connect(runtime_url) as connection:
-        row = connection.execute(
+        connection.execute(
+            "UPDATE admins SET must_change_password = false WHERE id = %s",
+            (admin_id,),
+        )
+        session_token = "integration-session-token"
+        connection.execute(
             """
-            INSERT INTO admins (
-                username,
-                password_hash,
-                password_updated_at,
-                created_at
-            ) VALUES ('phase1b-synthetic-admin', 'authentication-not-in-phase1b', now(), now())
-            RETURNING id
-            """
-        ).fetchone()
+            INSERT INTO admin_sessions (
+                id,
+                admin_id,
+                token_hash,
+                issued_at,
+                expires_at
+            ) VALUES (%s, %s, %s, now(), now() + interval '1 hour')
+            """,
+            (uuid4(), admin_id, hash_session_token(session_token)),
+        )
         connection.commit()
-    assert row is not None
-    return int(row[0])
+    return AuthContext(admin_id=admin_id, session_token=session_token)
+
+
+@dataclass(frozen=True, slots=True)
+class AuthContext:
+    admin_id: int
+    session_token: str
 
 
 def synthetic_pdf(width: int) -> bytes:
@@ -111,13 +146,11 @@ async def create_product(
 async def upload(
     client: httpx.AsyncClient,
     product_id: int,
-    actor_id: int,
     content: bytes,
     filename: str,
 ) -> httpx.Response:
     return await client.post(
         f"/api/products/{product_id}/pdf",
-        data={"actor_id": str(actor_id)},
         files={"file": (filename, content, "application/pdf")},
     )
 
@@ -137,9 +170,6 @@ class ChunkedRequestBody(httpx.AsyncByteStream):
 
 def oversized_multipart_body() -> bytes:
     return (
-        b"--integration-boundary\r\n"
-        b'Content-Disposition: form-data; name="actor_id"\r\n\r\n'
-        b"1\r\n"
         b"--integration-boundary\r\n"
         b'Content-Disposition: form-data; name="file"; filename="large.pdf"\r\n'
         b"Content-Type: application/pdf\r\n\r\n"
@@ -187,12 +217,174 @@ async def simulate_locked_restore(
 
 
 @pytest.mark.e2e
-async def test_minimum_business_loop_and_four_public_states(
-    clean_business_database: int,
+async def test_login_force_change_session_revocation_and_logout(
+    clean_business_database: AuthContext,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    actor_id = clean_business_database
+    runtime_url = required_environment("TEST_DATABASE_URL")
+    temporary_password = "TemporaryPassword-123"
+    permanent_password = "PermanentPassword-456"
+    password_hash = PasswordManager().hash(temporary_password)
+    with psycopg.connect(runtime_url) as connection:
+        connection.execute("DELETE FROM admin_sessions")
+        connection.execute(
+            """
+            UPDATE admins
+            SET
+                password_hash = %s,
+                must_change_password = true,
+                password_updated_at = now()
+            WHERE id = %s
+            """,
+            (password_hash, clean_business_database.admin_id),
+        )
+        connection.commit()
+
+    monkeypatch.setenv("DATABASE_URL", runtime_url)
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path))
+    monkeypatch.setenv("SESSION_COOKIE_SECURE", "false")
+    monkeypatch.setenv("LOGIN_FAILURE_LIMIT", "2")
+    monkeypatch.setenv("LOGIN_BACKOFF_BASE_SECONDS", "30")
+    monkeypatch.setenv("LOGIN_BACKOFF_MAX_SECONDS", "30")
+    get_settings.cache_clear()
+    app = create_app()
+
+    try:
+        async with lifespan(app):
+            transport = httpx.ASGITransport(app=app)
+            async with (
+                httpx.AsyncClient(transport=transport, base_url="http://test") as first,
+                httpx.AsyncClient(transport=transport, base_url="http://test") as second,
+            ):
+                unauthenticated = await first.get("/admin")
+                assert unauthenticated.status_code == 303
+                assert unauthenticated.headers["location"].startswith("/admin/login")
+
+                wrong = await first.post(
+                    "/admin/login",
+                    data={
+                        "username": "phase1b-synthetic-admin",
+                        "password": "WrongPassword-123",
+                        "next": "/admin",
+                    },
+                )
+                assert wrong.status_code == 401
+                assert "用户名或密码错误" in wrong.text
+
+                first_login = await first.post(
+                    "/admin/login",
+                    data={
+                        "username": "phase1b-synthetic-admin",
+                        "password": temporary_password,
+                        "next": "/admin",
+                    },
+                )
+                second_login = await second.post(
+                    "/admin/login",
+                    data={
+                        "username": "phase1b-synthetic-admin",
+                        "password": temporary_password,
+                        "next": "/admin",
+                    },
+                )
+                assert first_login.status_code == second_login.status_code == 303
+                assert first_login.headers["location"] == "/admin/change-password"
+                cookie_header = first_login.headers["set-cookie"]
+                assert "HttpOnly" in cookie_header
+                assert "SameSite=lax" in cookie_header
+                assert "Secure" not in cookie_header
+
+                bypass = await first.get("/api/products")
+                assert bypass.status_code == 303
+                assert bypass.headers["location"] == "/admin/change-password"
+                assert "public_token" not in bypass.text
+
+                unchanged = await first.post(
+                    "/admin/change-password",
+                    data={
+                        "current_password": temporary_password,
+                        "new_password": temporary_password,
+                        "confirm_password": temporary_password,
+                    },
+                )
+                assert unchanged.status_code == 422
+                assert "新密码必须与当前密码不同" in unchanged.text
+
+                changed = await first.post(
+                    "/admin/change-password",
+                    data={
+                        "current_password": temporary_password,
+                        "new_password": permanent_password,
+                        "confirm_password": permanent_password,
+                    },
+                )
+                assert changed.status_code == 303
+                assert changed.headers["location"] == "/admin"
+                assert (await first.get("/admin")).status_code == 200
+
+                revoked_other = await second.get("/admin")
+                assert revoked_other.status_code == 303
+                assert revoked_other.headers["location"].startswith("/admin/login")
+
+                logout = await first.post("/admin/logout")
+                assert logout.status_code == 303
+                assert (await first.get("/admin")).status_code == 303
+
+                for _index in range(2):
+                    limited_failure = await first.post(
+                        "/admin/login",
+                        data={
+                            "username": "unknown-admin",
+                            "password": "WrongPassword-123",
+                            "next": "/admin",
+                        },
+                    )
+                    assert limited_failure.status_code == 401
+                blocked = await first.post(
+                    "/admin/login",
+                    data={
+                        "username": "unknown-admin",
+                        "password": "WrongPassword-123",
+                        "next": "/admin",
+                    },
+                )
+                assert blocked.status_code == 429
+                assert int(blocked.headers["retry-after"]) >= 1
+
+        with psycopg.connect(runtime_url) as connection:
+            session_rows = connection.execute(
+                "SELECT token_hash, revoked_at FROM admin_sessions ORDER BY issued_at"
+            ).fetchall()
+            admin_state = connection.execute(
+                """
+                SELECT must_change_password, last_login_at
+                FROM admins
+                WHERE id = %s
+                """,
+                (clean_business_database.admin_id,),
+            ).fetchone()
+            password_change_audit = connection.execute(
+                "SELECT count(*) FROM audit_events WHERE action = 'password_change'"
+            ).fetchone()
+        assert session_rows
+        assert all(len(str(row[0])) == 64 for row in session_rows)
+        assert all(row[1] is not None for row in session_rows)
+        assert admin_state is not None
+        assert admin_state[0] is False
+        assert admin_state[1] is not None
+        assert password_change_audit == (1,)
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.e2e
+async def test_minimum_business_loop_and_four_public_states(
+    clean_business_database: AuthContext,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = clean_business_database
     runtime_url = required_environment("TEST_DATABASE_URL")
     monkeypatch.setenv("DATABASE_URL", runtime_url)
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path))
@@ -205,7 +397,14 @@ async def test_minimum_business_loop_and_four_public_states(
     try:
         async with lifespan(app):
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async with (
+                httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://test",
+                    cookies={SESSION_COOKIE_NAME: auth.session_token},
+                ) as client,
+                httpx.AsyncClient(transport=transport, base_url="http://test") as public_client,
+            ):
                 created = await create_product(client, " a001_1 ", " 一号测试产品 ")
                 product_id = cast(int, created["id"])
                 token = str(created["public_token"])
@@ -260,7 +459,7 @@ async def test_minimum_business_loop_and_four_public_states(
                 assert qrcode.content.startswith(b"\x89PNG\r\n\x1a\n")
                 assert qrcode.headers["content-disposition"] == 'attachment; filename="A001_1.png"'
 
-                unuploaded = await client.get(f"/p/{token}")
+                unuploaded = await public_client.get(f"/p/{token}")
                 assert unuploaded.status_code == 200
                 assert "资料暂未上传" in unuploaded.text
                 assert unuploaded.headers["cache-control"] == "no-store"
@@ -268,7 +467,6 @@ async def test_minimum_business_loop_and_four_public_states(
                 uploaded_v1 = await upload(
                     client,
                     product_id,
-                    actor_id,
                     first_pdf,
                     "../../first.pdf",
                 )
@@ -280,7 +478,7 @@ async def test_minimum_business_loop_and_four_public_states(
                     refreshed_detail.json()["current_version_id"]
                     == uploaded_v1.json()["version_id"]
                 )
-                public_v1 = await client.get(f"/p/{token}")
+                public_v1 = await public_client.get(f"/p/{token}")
                 assert public_v1.status_code == 200
                 assert public_v1.content == first_pdf
                 assert public_v1.headers["content-type"] == "application/pdf"
@@ -289,29 +487,26 @@ async def test_minimum_business_loop_and_four_public_states(
                 uploaded_v2 = await upload(
                     client,
                     product_id,
-                    actor_id,
                     second_pdf,
                     "second.pdf",
                 )
                 assert uploaded_v2.status_code == 201
                 assert uploaded_v2.json()["version_no"] == 2
-                assert (await client.get(f"/p/{token}")).content == second_pdf
+                assert (await public_client.get(f"/p/{token}")).content == second_pdf
 
                 uploaded_old_content = await upload(
                     client,
                     product_id,
-                    actor_id,
                     first_pdf,
                     "first-again.pdf",
                 )
                 assert uploaded_old_content.status_code == 201
                 assert uploaded_old_content.json()["version_no"] == 3
-                assert (await client.get(f"/p/{token}")).content == first_pdf
+                assert (await public_client.get(f"/p/{token}")).content == first_pdf
 
                 duplicate_current = await upload(
                     client,
                     product_id,
-                    actor_id,
                     first_pdf,
                     "duplicate.pdf",
                 )
@@ -321,14 +516,13 @@ async def test_minimum_business_loop_and_four_public_states(
                 invalid_pdf = await upload(
                     client,
                     product_id,
-                    actor_id,
                     b"not a pdf",
                     "fake.pdf",
                 )
                 assert invalid_pdf.status_code == 422
 
-                missing = await client.get("/p/not-base32")
-                malformed = await client.get("/p/invalid/token")
+                missing = await public_client.get("/p/not-base32")
+                malformed = await public_client.get("/p/invalid/token")
                 assert missing.status_code == malformed.status_code == 200
                 assert "资料链接无效" in missing.text
                 assert "not-base32" not in missing.text
@@ -339,7 +533,7 @@ async def test_minimum_business_loop_and_four_public_states(
                         (product_id,),
                     )
                     connection.commit()
-                disabled = await client.get(f"/p/{token}")
+                disabled = await public_client.get(f"/p/{token}")
                 assert disabled.status_code == 200
                 assert "该产品资料已停用" in disabled.text
                 assert "资料暂未上传" not in disabled.text
@@ -351,6 +545,10 @@ async def test_minimum_business_loop_and_four_public_states(
                 (product_id,),
             ).fetchone()
             file_count = connection.execute("SELECT count(*) FROM pdf_files").fetchone()
+            upload_actors = connection.execute(
+                "SELECT DISTINCT uploaded_by FROM pdf_versions WHERE product_id = %s",
+                (product_id,),
+            ).fetchall()
             actions = {
                 str(row[0])
                 for row in connection.execute(
@@ -359,6 +557,7 @@ async def test_minimum_business_loop_and_four_public_states(
             }
         assert version_count == (3,)
         assert file_count == (2,)
+        assert upload_actors == [(auth.admin_id,)]
         assert {"product_create", "pdf_upload", "pdf_upload_rejected"}.issubset(actions)
     finally:
         get_settings.cache_clear()
@@ -366,7 +565,7 @@ async def test_minimum_business_loop_and_four_public_states(
 
 @pytest.mark.e2e
 async def test_pre_parser_size_rejections_commit_independent_audits(
-    clean_business_database: int,
+    clean_business_database: AuthContext,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -387,7 +586,11 @@ async def test_pre_parser_size_rejections_commit_independent_audits(
     try:
         async with lifespan(app):
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+                cookies={SESSION_COOKIE_NAME: clean_business_database.session_token},
+            ) as client:
                 declared = await client.post(
                     "/api/products/5/pdf",
                     content=declared_body,
@@ -443,11 +646,11 @@ async def test_pre_parser_size_rejections_commit_independent_audits(
 
 @pytest.mark.e2e
 async def test_concurrent_identical_uploads_create_only_one_version(
-    clean_business_database: int,
+    clean_business_database: AuthContext,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    actor_id = clean_business_database
+    auth = clean_business_database
     runtime_url = required_environment("TEST_DATABASE_URL")
     monkeypatch.setenv("DATABASE_URL", runtime_url)
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path))
@@ -459,7 +662,11 @@ async def test_concurrent_identical_uploads_create_only_one_version(
     try:
         async with lifespan(app):
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+                cookies={SESSION_COOKIE_NAME: auth.session_token},
+            ) as client:
                 create_responses = await asyncio.gather(
                     *[
                         client.post(
@@ -482,7 +689,6 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                         upload(
                             client,
                             product_id,
-                            actor_id,
                             content,
                             f"same-{index}.pdf",
                         )
@@ -496,14 +702,12 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                     upload(
                         client,
                         different_product_id,
-                        actor_id,
                         synthetic_pdf(100),
                         "different-a.pdf",
                     ),
                     upload(
                         client,
                         different_product_id,
-                        actor_id,
                         synthetic_pdf(200),
                         "different-b.pdf",
                     ),
@@ -516,14 +720,12 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                     upload(
                         client,
                         cast(int, parallel_a["id"]),
-                        actor_id,
                         synthetic_pdf(300),
                         "parallel-a.pdf",
                     ),
                     upload(
                         client,
                         cast(int, parallel_b["id"]),
-                        actor_id,
                         synthetic_pdf(400),
                         "parallel-b.pdf",
                     ),
@@ -535,14 +737,12 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                 restore_v1 = await upload(
                     client,
                     restore_product_id,
-                    actor_id,
                     synthetic_pdf(500),
                     "restore-v1.pdf",
                 )
                 restore_v2 = await upload(
                     client,
                     restore_product_id,
-                    actor_id,
                     synthetic_pdf(600),
                     "restore-v2.pdf",
                 )
@@ -552,7 +752,6 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                     upload(
                         client,
                         restore_product_id,
-                        actor_id,
                         synthetic_pdf(700),
                         "restore-v3.pdf",
                     ),

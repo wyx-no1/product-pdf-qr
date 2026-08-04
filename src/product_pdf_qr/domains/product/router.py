@@ -6,16 +6,18 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
 from product_pdf_qr.database import Database
 from product_pdf_qr.dependencies import (
+    get_current_admin,
     get_database,
     get_qrcode_service,
     get_storage_service,
 )
 from product_pdf_qr.domains.audit import AuditEvent, append_independent_event
+from product_pdf_qr.domains.auth import AuthenticatedAdmin
 from product_pdf_qr.domains.product.service import (
     PRODUCT_NAME_MAX_LENGTH,
     Product,
@@ -291,12 +293,12 @@ async def retry_qrcode(
 )
 async def upload_pdf_endpoint(
     product_id: int,
-    actor_id: Annotated[int, Form(gt=0)],
     file: Annotated[UploadFile, File()],
+    admin: Annotated[AuthenticatedAdmin, Depends(get_current_admin)],
     database: Annotated[Database, Depends(get_database)],
     storage: Annotated[StorageService, Depends(get_storage_service)],
 ) -> PDFUploadResponse:
-    """Validate outside the lock, then serialize current-version mutation."""
+    """Use the authenticated administrator while serializing the version mutation."""
 
     request_id = uuid4()
     try:
@@ -305,7 +307,7 @@ async def upload_pdf_endpoint(
         await record_upload_rejection(
             database,
             product_id=product_id,
-            actor_id=actor_id,
+            actor_id=admin.id,
             reason=error.code,
             stage=error.stage,
             request_id=request_id,
@@ -315,7 +317,7 @@ async def upload_pdf_endpoint(
         database,
         storage,
         product_id=product_id,
-        actor_id=actor_id,
+        actor_id=admin.id,
         upload=validated,
         request_id=request_id,
     )
