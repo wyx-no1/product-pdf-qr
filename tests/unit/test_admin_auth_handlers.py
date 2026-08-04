@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -101,6 +102,65 @@ async def test_login_failure_and_dual_rate_limit(
         "username": "owner",
         "reason": "rate_limited",
     }
+
+
+async def test_concurrent_login_burst_reserves_attempts_before_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure_limit = 2
+    burst_size = 8
+    release_authentication = asyncio.Event()
+    authentication_calls = 0
+
+    async def failed_login(*_args: object, **_kwargs: object) -> None:
+        nonlocal authentication_calls
+        authentication_calls += 1
+        await release_authentication.wait()
+        return None
+
+    async def audit(_database: object, _event: AuditEvent) -> bool:
+        return True
+
+    app = configured_app()
+    app.state.login_rate_limiter = LoginRateLimiter(
+        failure_limit=failure_limit,
+        window_seconds=60,
+        base_backoff_seconds=10,
+        max_backoff_seconds=10,
+    )
+    monkeypatch.setattr(
+        "product_pdf_qr.admin.create_authenticated_session",
+        failed_login,
+    )
+    monkeypatch.setattr("product_pdf_qr.admin.append_independent_event", audit)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        tasks = [
+            asyncio.create_task(
+                client.post(
+                    "/admin/login",
+                    data={"username": "owner", "password": "wrong", "next": "/admin"},
+                )
+            )
+            for _index in range(burst_size)
+        ]
+        burst = asyncio.gather(*tasks)
+        for _iteration in range(100):
+            await asyncio.sleep(0)
+            completed_without_verification = sum(task.done() for task in tasks)
+            if authentication_calls + completed_without_verification >= burst_size:
+                break
+        admitted_before_release = authentication_calls
+        release_authentication.set()
+        responses = await burst
+
+    assert admitted_before_release == failure_limit
+    assert sum(response.status_code == 401 for response in responses) == failure_limit
+    assert sum(response.status_code == 429 for response in responses) == (
+        burst_size - failure_limit
+    )
+    assert authentication_calls == failure_limit
 
 
 async def test_successful_login_sets_reviewed_cookie_and_forces_change(

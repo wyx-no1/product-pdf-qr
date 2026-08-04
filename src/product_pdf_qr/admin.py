@@ -138,9 +138,9 @@ async def login(
 
     ip_address = _client_ip(request)
     account_key = username.strip()[:64].casefold()
-    retry_after = limiter.retry_after(ip_address, account_key)
-    if retry_after > 0:
-        wait_seconds = max(1, math.ceil(retry_after))
+    reservation = limiter.reserve_attempt(ip_address, account_key)
+    if not reservation.allowed:
+        wait_seconds = max(1, math.ceil(reservation.retry_after))
         await _record_login_failure(
             database,
             account_key=account_key,
@@ -162,13 +162,14 @@ async def login(
         ttl_seconds=settings.session_ttl_seconds,
     )
     if session is None:
-        retry_after = limiter.register_failure(ip_address, account_key)
         await _record_login_failure(
             database,
             account_key=account_key,
             reason="invalid_credentials",
         )
-        failure_wait_seconds: int | None = math.ceil(retry_after) if retry_after > 0 else None
+        failure_wait_seconds: int | None = (
+            math.ceil(reservation.retry_after) if reservation.retry_after > 0 else None
+        )
         message = "用户名或密码错误。"
         if failure_wait_seconds is not None:
             message += f" 请在 {failure_wait_seconds} 秒后重试。"

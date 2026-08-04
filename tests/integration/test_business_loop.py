@@ -405,6 +405,14 @@ async def test_login_force_change_session_revocation_and_logout(
                   AND detail->>'reason' = 'rate_limited'
                 """
             ).fetchone()
+            successful_login_audits = connection.execute(
+                """
+                SELECT actor_type, actor_id
+                FROM audit_events
+                WHERE action = 'login_success'
+                ORDER BY id
+                """
+            ).fetchall()
         assert session_rows
         assert all(len(str(row[0])) == 64 for row in session_rows)
         assert all(row[1] is not None for row in session_rows)
@@ -413,6 +421,10 @@ async def test_login_force_change_session_revocation_and_logout(
         assert admin_state[1] is not None
         assert password_change_audit == (1,)
         assert limited_login_audit == (1,)
+        assert successful_login_audits == [
+            ("admin", clean_business_database.admin_id),
+            ("admin", clean_business_database.admin_id),
+        ]
     finally:
         get_settings.cache_clear()
 
@@ -796,8 +808,8 @@ async def test_pre_parser_size_rejections_commit_independent_audits(
                 """
             ).fetchall()
         assert len(rows) == 2
-        assert {str(row[0]) for row in rows} == {"anonymous"}
-        assert {row[1] for row in rows} == {None}
+        assert {str(row[0]) for row in rows} == {"admin"}
+        assert {row[1] for row in rows} == {clean_business_database.admin_id}
         assert {str(row[2]) for row in rows} == {"product"}
         assert {int(row[3]) for row in rows} == {5}
         assert str(rows[0][4]) == declared.headers["x-request-id"]

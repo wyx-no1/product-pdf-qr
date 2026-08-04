@@ -305,7 +305,7 @@ async def create_authenticated_session(
             await append_event(
                 connection,
                 AuditEvent(
-                    action="admin_login",
+                    action="login_success",
                     result="success",
                     actor_type="admin",
                     actor_id=admin_id,

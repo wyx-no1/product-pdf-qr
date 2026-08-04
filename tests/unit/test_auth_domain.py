@@ -184,6 +184,8 @@ async def test_login_creates_only_a_hashed_session_token() -> None:
     assert session.token not in repr(connection.parameters)
     assert len(str(insert_parameters[2])) == 64
     assert "UPDATE admins SET last_login_at" in connection.queries[2]
+    audit_parameters = cast(tuple[object, ...], connection.parameters[3])
+    assert audit_parameters[:3] == ("admin", 7, "login_success")
 
 
 @pytest.mark.anyio

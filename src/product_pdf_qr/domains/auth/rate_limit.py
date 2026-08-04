@@ -1,4 +1,9 @@
-"""Process-local dual-dimension login failure backoff."""
+"""Process-local dual-dimension login failure backoff.
+
+Each process or application instance owns independent counters. Multi-process
+deployments therefore multiply the effective allowance unless a future shared
+rate-limit store is introduced.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +17,14 @@ class _FailureState:
     count: int
     blocked_until: float
     last_failure: float
+
+
+@dataclass(frozen=True, slots=True)
+class LoginAttemptReservation:
+    """One atomic decision made before password verification starts."""
+
+    allowed: bool
+    retry_after: float
 
 
 class LoginRateLimiter:
@@ -32,6 +45,22 @@ class LoginRateLimiter:
         self.max_backoff_seconds = max_backoff_seconds
         self.clock = clock
         self._failures: dict[tuple[str, str], _FailureState] = {}
+
+    def reserve_attempt(self, ip_address: str, username: str) -> LoginAttemptReservation:
+        """Atomically check both dimensions and count one admitted attempt.
+
+        This synchronous method contains no await point, so requests on the
+        process event loop cannot interleave between the backoff check and the
+        counter update. Slow password verification happens only after it returns.
+        """
+
+        retry_after = self.retry_after(ip_address, username)
+        if retry_after > 0:
+            return LoginAttemptReservation(allowed=False, retry_after=retry_after)
+        return LoginAttemptReservation(
+            allowed=True,
+            retry_after=self.register_failure(ip_address, username),
+        )
 
     def retry_after(self, ip_address: str, username: str) -> float:
         """Return the longest remaining IP/account backoff."""
