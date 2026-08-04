@@ -225,14 +225,21 @@ The Resolver record binds the opinion to:
   timezone-qualified creation and destruction times, and destruction reason
   (`normal`, `timeout`, or `exception`).
 
-Validation accepts an opinion only when the Evidence commit exists, is the direct
-child of the bound code commit, contains the supplied `metadata.md` at the expected
-PR path, and remains in the current PR history. The reviewed SHA and lifecycle SHA
-must both equal the Evidence code SHA. The lifecycle must be complete and
-self-consistent, the recorded workspace must use the Resolver naming contract and
-must no longer be registered or present, and a default/current repository workspace
-is always rejected. A current PR head may differ from the reviewed SHA only through
-`docs/evidence/**`; any later code commit invalidates the opinion.
+Validation accepts an opinion only when the bound commit passes the existing full
+Evidence verification in an isolated detached worktree. That verification requires
+exactly the five Evidence files, reconstructs their contents from the PR, CI, review,
+diff, and trusted-definition facts, and requires the exact server-authenticated
+`AO / evidence-snapshot` attestation. A metadata-only, incomplete, author-created,
+or unattested commit is therefore rejected. The commit must also be the direct child
+of the bound code commit and remain in current PR history.
+
+The reviewed SHA and lifecycle SHA must both equal the Evidence code SHA. The
+lifecycle must be complete and self-consistent, the recorded workspace must use the
+Resolver naming contract and must no longer be registered or present, and a
+default/current repository workspace is always rejected. A current PR head may
+differ from the reviewed SHA only through `docs/evidence/**`; any later code commit
+invalidates the opinion. The currently bound Evidence Snapshot itself must be the
+current PR head so its trusted attestation and remote binding can be reverified.
 
 Every rejection is `indeterminate`, never warning or neutral. The JSON result names
 the failed check and reason, and the validator appends the same information to the

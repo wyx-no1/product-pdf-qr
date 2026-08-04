@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from scripts.ao.evidence import parse_evidence_binding
+from scripts.ao.evidence import parse_evidence_binding, verify_evidence_head
 from scripts.ao.git import GitRepository, append_json_event
 from scripts.ao.github import GitHubData
 from scripts.ao.models import EvidenceBinding
@@ -699,6 +699,40 @@ def validate_advisor_opinion(
                 failed_checks=("evidence",),
                 reason=evidence_failure,
             )
+        current_code_failure = _validate_current_pr_code(
+            repository,
+            binding,
+            current_head,
+        )
+        if current_code_failure is not None:
+            return _opinion_validation_result(
+                event_log,
+                valid=False,
+                reviewed_commit_sha=reviewed,
+                evidence_code_commit_sha=binding.code_commit_sha,
+                evidence_commit_sha=evidence_commit_sha,
+                current_pr_head_sha=current_head,
+                failed_checks=("current_pr_head",),
+                reason=current_code_failure,
+            )
+        evidence_failure = _validate_trusted_evidence_snapshot(
+            repository,
+            github,
+            binding,
+            metadata_path,
+            evidence_commit_sha,
+        )
+        if evidence_failure is not None:
+            return _opinion_validation_result(
+                event_log,
+                valid=False,
+                reviewed_commit_sha=reviewed,
+                evidence_code_commit_sha=binding.code_commit_sha,
+                evidence_commit_sha=evidence_commit_sha,
+                current_pr_head_sha=current_head,
+                failed_checks=("evidence",),
+                reason=evidence_failure,
+            )
 
         lifecycle_failure = _validate_workspace_lifecycle(repository, binding, raw)
         if lifecycle_failure is not None:
@@ -738,43 +772,6 @@ def validate_advisor_opinion(
                 current_pr_head_sha=current_head,
                 failed_checks=("advisor_completion",),
                 reason="Advisor command or workspace cleanup did not complete successfully",
-            )
-        ancestor = repository.git(
-            "merge-base",
-            "--is-ancestor",
-            binding.code_commit_sha,
-            current_head,
-            check=False,
-        )
-        if ancestor.returncode != 0:
-            return _opinion_validation_result(
-                event_log,
-                valid=False,
-                reviewed_commit_sha=reviewed,
-                evidence_code_commit_sha=binding.code_commit_sha,
-                evidence_commit_sha=evidence_commit_sha,
-                current_pr_head_sha=current_head,
-                failed_checks=("current_pr_head",),
-                reason="Evidence code commit is no longer an ancestor of the PR head",
-            )
-        later_code_commits = repository.git(
-            "log",
-            "--format=%H",
-            f"{binding.code_commit_sha}..{current_head}",
-            "--",
-            ".",
-            ":(exclude)docs/evidence/**",
-        )
-        if later_code_commits.stdout.strip():
-            return _opinion_validation_result(
-                event_log,
-                valid=False,
-                reviewed_commit_sha=reviewed,
-                evidence_code_commit_sha=binding.code_commit_sha,
-                evidence_commit_sha=evidence_commit_sha,
-                current_pr_head_sha=current_head,
-                failed_checks=("current_pr_head",),
-                reason="PR has code changes after the reviewed commit; re-review is required",
             )
         return _opinion_validation_result(
             event_log,
@@ -869,6 +866,91 @@ def _validate_evidence_commit(
     )
     if ancestor.returncode != 0:
         return "Bound Evidence commit is not an ancestor of the current PR head"
+    return None
+
+
+def _validate_trusted_evidence_snapshot(
+    repository: GitRepository,
+    github: GitHubData,
+    binding: EvidenceBinding,
+    metadata_path: Path,
+    evidence_commit_sha: str,
+) -> str | None:
+    worktree_path = Path(
+        tempfile.mkdtemp(
+            prefix=(
+                f"{repository.project_name()}-evidence-verify-pr-{binding.pr_number}-"
+                f"{evidence_commit_sha[:12]}-"
+            )
+        )
+    )
+    worktree_path.rmdir()
+    added = False
+    try:
+        repository.git(
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree_path),
+            evidence_commit_sha,
+        )
+        added = True
+        verified = verify_evidence_head(
+            GitRepository(worktree_path),
+            github,
+            binding.pr_number,
+            evidence_commit_sha,
+            require_prior_attestation=True,
+        )
+        committed_metadata = (worktree_path / _evidence_metadata_relative(binding)).read_text(
+            encoding="utf-8"
+        )
+        if committed_metadata != metadata_path.read_text(encoding="utf-8"):
+            return "Evidence metadata does not match the fully verified Snapshot"
+        if verified.code_commit_sha != binding.code_commit_sha:
+            return "Verified Evidence Snapshot does not bind the opinion code commit"
+    except Exception as error:
+        return f"Trusted Evidence Snapshot verification failed: {error}"
+    finally:
+        if added:
+            removed = repository.git(
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree_path),
+                check=False,
+            )
+            repository.git("worktree", "prune", check=False)
+            if removed.returncode != 0 and worktree_path.exists():
+                shutil.rmtree(worktree_path)
+                repository.git("worktree", "prune", check=False)
+    return None
+
+
+def _validate_current_pr_code(
+    repository: GitRepository,
+    binding: EvidenceBinding,
+    current_head_sha: str,
+) -> str | None:
+    ancestor = repository.git(
+        "merge-base",
+        "--is-ancestor",
+        binding.code_commit_sha,
+        current_head_sha,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        return "Evidence code commit is no longer an ancestor of the PR head"
+    later_code_commits = repository.git(
+        "log",
+        "--format=%H",
+        f"{binding.code_commit_sha}..{current_head_sha}",
+        "--",
+        ".",
+        ":(exclude)docs/evidence/**",
+    )
+    if later_code_commits.stdout.strip():
+        return "PR has code changes after the reviewed commit; re-review is required"
     return None
 
 

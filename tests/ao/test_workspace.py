@@ -7,13 +7,15 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from scripts.ao.evidence import EvidenceGenerator, SnapshotResult
 from scripts.ao.git import CommandFailed, GitRepository
-from scripts.ao.models import PullRequest
+from scripts.ao.models import EvidenceAttestation
 from scripts.ao.workspace import (
     WorkspaceError,
     WorkspaceResolver,
@@ -131,8 +133,7 @@ def test_advisor_run_records_actual_sha_and_cleans_after_command(
     tmp_path: Path,
 ) -> None:
     fixture = make_diverged_repository(tmp_path)
-    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
-    evidence_head = _publish_evidence_metadata(fixture.repository, metadata)
+    metadata, evidence_head = _publish_trusted_evidence(fixture, tmp_path)
     record = tmp_path / "advisor-record.json"
     observed = tmp_path / "observed.txt"
     resolver = WorkspaceResolver(
@@ -457,8 +458,7 @@ def test_evidence_resolver_opinion_validation_normal_path_and_pr_update(
     tmp_path: Path,
 ) -> None:
     fixture = make_diverged_repository(tmp_path)
-    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
-    evidence_head = _publish_evidence_metadata(fixture.repository, metadata)
+    metadata, evidence_head = _publish_trusted_evidence(fixture, tmp_path)
     record = tmp_path / "record.json"
     resolver = WorkspaceResolver(
         GitRepository(fixture.repository),
@@ -490,6 +490,7 @@ def test_evidence_resolver_opinion_validation_normal_path_and_pr_update(
     assert valid.evidence_commit_sha == evidence_head
     assert valid.current_pr_head_sha == evidence_head
     assert valid.failed_checks == ()
+    assert "evidence_attestation" in provider.calls
     valid_event = json.loads(validation_log.read_text(encoding="utf-8"))
     assert valid_event["result"] == "success"
 
@@ -597,12 +598,61 @@ def test_opinion_validation_rejects_missing_lifecycle_b4(tmp_path: Path) -> None
     assert "destroyed_at" in result.reason
 
 
+def test_opinion_validation_rejects_metadata_only_evidence_commit(tmp_path: Path) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
+    evidence_head = _publish_evidence_metadata(fixture.repository, metadata)
+    record = _write_valid_opinion_record(tmp_path, fixture, evidence_head)
+
+    result = validate_advisor_opinion(
+        GitRepository(fixture.repository),
+        _provider_with_head(fixture.code_sha, evidence_head),
+        metadata,
+        record,
+        log_path=tmp_path / "validation-events.jsonl",
+    )
+
+    assert result.valid is False
+    assert result.gate_status == "indeterminate"
+    assert result.failed_checks == ("evidence",)
+    assert "exactly the five files" in result.reason
+
+
+def test_opinion_validation_rejects_unattested_evidence_snapshot(tmp_path: Path) -> None:
+    fixture = make_diverged_repository(tmp_path)
+    metadata, evidence_head = _publish_trusted_evidence(fixture, tmp_path)
+    record = _write_valid_opinion_record(tmp_path, fixture, evidence_head)
+    provider = github_for(fixture.code_sha)
+    provider.pr = replace(provider.pr, head_sha=evidence_head)
+
+    result = validate_advisor_opinion(
+        GitRepository(fixture.repository),
+        provider,
+        metadata,
+        record,
+        log_path=tmp_path / "validation-events.jsonl",
+    )
+
+    assert result.valid is False
+    assert result.gate_status == "indeterminate"
+    assert result.failed_checks == ("evidence",)
+    assert "trusted publisher attestation" in result.reason
+
+
 def _prepare_validation_case(
     tmp_path: Path,
 ) -> tuple[GitFixture, Path, Path, str]:
     fixture = make_diverged_repository(tmp_path)
-    metadata = write_metadata(tmp_path / "metadata.md", fixture.code_sha)
-    evidence_head = _publish_evidence_metadata(fixture.repository, metadata)
+    metadata, evidence_head = _publish_trusted_evidence(fixture, tmp_path)
+    record = _write_valid_opinion_record(tmp_path, fixture, evidence_head)
+    return fixture, metadata, record, evidence_head
+
+
+def _write_valid_opinion_record(
+    tmp_path: Path,
+    fixture: GitFixture,
+    evidence_head: str,
+) -> Path:
     record = tmp_path / "record.json"
     workspace_path = (
         tmp_path
@@ -637,7 +687,23 @@ def _prepare_validation_case(
         ),
         encoding="utf-8",
     )
-    return fixture, metadata, record, evidence_head
+    return record
+
+
+def _publish_trusted_evidence(
+    fixture: GitFixture,
+    tmp_path: Path,
+) -> tuple[Path, str]:
+    provider = github_for(fixture.code_sha)
+    result = EvidenceGenerator(
+        GitRepository(fixture.repository),
+        provider,
+        log_path=tmp_path / "evidence-events.jsonl",
+        now=lambda: NOW,
+    ).generate(41)
+    assert isinstance(result, SnapshotResult)
+    assert result.evidence_commit_sha is not None
+    return result.directory / "metadata.md", result.evidence_commit_sha
 
 
 def _publish_evidence_metadata(repository: Path, metadata: Path) -> str:
@@ -655,14 +721,14 @@ def _publish_evidence_metadata(repository: Path, metadata: Path) -> str:
 
 def _provider_with_head(code_sha: str, head_sha: str) -> FakeGitHubData:
     provider = github_for(code_sha)
-    provider.pr = PullRequest(
-        number=provider.pr.number,
-        repository=provider.pr.repository,
-        title=provider.pr.title,
-        source_branch=provider.pr.source_branch,
-        target_branch=provider.pr.target_branch,
-        head_sha=head_sha,
-        url=provider.pr.url,
-        review_decision=provider.pr.review_decision,
+    provider.pr = replace(provider.pr, head_sha=head_sha)
+    provider.attestation = EvidenceAttestation(
+        context="AO / evidence-snapshot",
+        state="success",
+        creator_id=41898282,
+        creator_login="github-actions[bot]",
+        creator_type="Bot",
+        description=f"Evidence-only child of {code_sha[:12]}; source CI 9001",
+        target_url="https://github.com/example/repository/actions/runs/123",
     )
     return provider
