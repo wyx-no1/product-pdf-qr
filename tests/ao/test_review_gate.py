@@ -191,6 +191,93 @@ def test_untrusted_reviewer_cannot_supply_an_approved_verdict() -> None:
     assert "not from a trusted reviewer" in result.commits[0].gaps[0]
 
 
+def test_chinese_approved_heading_passes_the_gate() -> None:
+    review = replace(
+        _review(CODE_SHA, "approved"),
+        body="## 审查结论：通过\n\n可复核的审查依据。",  # noqa: RUF001
+    )
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (review,),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "PASS"
+    assert result.exit_code == 0
+    assert result.commits[0].verdict == "approved"
+
+
+def test_chinese_changes_requested_heading_is_recognized() -> None:
+    review = replace(
+        _review(CODE_SHA, "approved"),
+        body="## 审查结论：需要修改\n\n发现需要修改的问题。",  # noqa: RUF001
+    )
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (review,),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "REVIEW_GAP"
+    assert result.commits[0].verdict == "changes_requested"
+    assert "final code commit verdict must be approved" in result.commits[0].gaps[0]
+
+
+def test_agreeing_english_and_chinese_headings_are_ambiguous() -> None:
+    review = replace(
+        _review(CODE_SHA, "approved"),
+        body="## Review verdict: approved\n\n## 审查结论：通过\n\nSame meaning twice.",  # noqa: RUF001
+    )
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (review,),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "REVIEW_GAP"
+    assert result.commits[0].verdict == "indeterminate"
+
+
+def test_duplicate_chinese_headings_are_ambiguous() -> None:
+    review = replace(
+        _review(CODE_SHA, "approved"),
+        body="## 审查结论：通过\n\n## 审查结论：需要修改\n\n互相矛盾的结论。",  # noqa: RUF001
+    )
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (review,),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "REVIEW_GAP"
+    assert result.commits[0].verdict == "indeterminate"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "## 审查结论：通过（Ready）\n\n结论带装饰后缀。",  # noqa: RUF001
+        "## Review verdict: 通过\n\n跨语言混拼的结论值。",
+        "## 审查结论：approved\n\n跨语言混拼的结论值。",  # noqa: RUF001
+    ],
+)
+def test_decorated_or_cross_language_verdict_values_fail_closed(body: str) -> None:
+    review = replace(_review(CODE_SHA, "approved"), body=body)
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (review,),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "REVIEW_GAP"
+    assert result.commits[0].verdict == "indeterminate"
+
+
 def test_known_and_unknown_verdict_headings_are_ambiguous() -> None:
     review = _review(CODE_SHA, "approved")
     ambiguous = replace(

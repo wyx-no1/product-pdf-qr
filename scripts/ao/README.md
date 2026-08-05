@@ -206,22 +206,34 @@ server-authenticated numeric ID. Review records retain GitHub's author ID, login
 type, and author association for audit.
 
 The auditable verdict source is exactly one Markdown heading in a submitted,
-non-dismissed, trusted review body:
+non-dismissed, trusted review body, in either its English form:
 
 ```markdown
 ## Review verdict: approved
 ```
 
-or:
-
 ```markdown
 ## Review verdict: changes requested
 ```
 
+or its Chinese form:
+
+```markdown
+## 审查结论：通过
+```
+
+```markdown
+## 审查结论：需要修改
+```
+
 When a commit has multiple trusted bodies with a valid heading, the latest submitted
 review is selected deterministically by `submitted_at` and then GitHub review ID.
-The parser first collects every `## Review verdict:` heading in a body and accepts
-only one complete known value. An absent, unknown, or ambiguous heading is a
+The parser first collects every `## Review verdict:` and `## 审查结论：` heading in
+a body — both languages count toward the same exactly-one requirement — and accepts
+only one complete known value from the heading's own language. A body containing
+both an English and a Chinese heading is ambiguous even when they agree. A decorated
+value such as `通过（Ready）`, or a cross-language value such as
+`## Review verdict: 通过`, is unknown. An absent, unknown, or ambiguous heading is a
 `REVIEW_GAP`; it is never inferred as approval. Exact-SHA trusted review activity
 that remains without a parseable verdict for more than 30 minutes is additionally
 reported as `STALLED`, without triggering a retry. The command exits `0` only for
