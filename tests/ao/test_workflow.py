@@ -19,9 +19,9 @@ def test_pr_ci_is_read_only_and_does_not_persist_checkout_credentials() -> None:
     assert workflow.count("persist-credentials: false") == 4
     assert "pull_request_review:" in workflow
     assert "review-gate:" in workflow
-    assert 'python -m scripts.ao review-gate --pr "${{ github.event.pull_request.number }}"' in (
-        workflow
-    )
+    assert "python -m scripts.ao review-gate" in workflow
+    assert '--pr "${{ github.event.pull_request.number }}"' in workflow
+    assert "--trusted-reviewer-id 306825498" in workflow
 
 
 def test_trusted_publisher_never_executes_candidate_code_and_verifies_before_green() -> None:

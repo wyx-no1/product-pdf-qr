@@ -131,4 +131,7 @@ jobs:
       - name: Run review integrity gate
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python -m scripts.ao review-gate --pr "${{ github.event.pull_request.number }}"
+        run: >-
+          python -m scripts.ao review-gate
+          --pr "${{ github.event.pull_request.number }}"
+          --trusted-reviewer-id 306825498

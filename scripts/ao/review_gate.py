@@ -13,10 +13,14 @@ from scripts.ao.models import PullRequest
 REQUIRED_CI_JOBS = frozenset({"quality", "database", "container"})
 EVIDENCE_PREFIX = "docs/evidence/"
 STALL_THRESHOLD = timedelta(minutes=30)
-VERDICT_PATTERN = re.compile(
-    r"^## Review verdict: (approved|changes requested)$",
+VERDICT_HEADING_PATTERN = re.compile(
+    r"^## Review verdict: (.*)$",
     flags=re.MULTILINE,
 )
+KNOWN_VERDICTS = {
+    "approved": "approved",
+    "changes requested": "changes_requested",
+}
 
 
 class ReviewGateError(RuntimeError):
@@ -41,6 +45,10 @@ class ReviewRecord:
     body: str
     submitted_at: datetime
     url: str
+    author_id: int
+    author_login: str
+    author_type: str
+    author_association: str
 
 
 @dataclass(frozen=True)
@@ -89,6 +97,8 @@ class ReviewGateResult:
 
 
 class ReviewGateData(Protocol):
+    def repository_owner_id(self) -> int: ...
+
     def pull_request(self, number: int) -> PullRequest: ...
 
     def pull_request_commits(self, number: int) -> tuple[ReviewCommit, ...]: ...
@@ -138,6 +148,15 @@ class GhReviewGateData:
             review_decision=str(data.get("review_decision") or "not-reviewed"),
         )
 
+    def repository_owner_id(self) -> int:
+        pages = self._pages(f"repos/{self.repository}")
+        if len(pages) != 1 or not isinstance(pages[0], dict):
+            raise ReviewGateError(
+                f"GitHub returned an invalid repository record for {self.repository}"
+            )
+        owner = _required_mapping(cast(dict[str, object], pages[0]), "owner")
+        return _required_int(owner, "id")
+
     def pull_request_commits(self, number: int) -> tuple[ReviewCommit, ...]:
         pages = self._pages(f"repos/{self.repository}/pulls/{number}/commits?per_page=100")
         commits = _flatten_list_pages(pages, f"PR #{number} commits")
@@ -175,6 +194,10 @@ class GhReviewGateData:
                 body=str(item.get("body") or ""),
                 submitted_at=_required_datetime(item, "submitted_at"),
                 url=_required_str(item, "html_url"),
+                author_id=_required_int(_required_mapping(item, "user"), "id"),
+                author_login=_required_str(_required_mapping(item, "user"), "login"),
+                author_type=_required_str(_required_mapping(item, "user"), "type"),
+                author_association=_required_str(item, "author_association"),
             )
             for item in reviews
             if item.get("state") != "PENDING"
@@ -258,8 +281,16 @@ def evaluate_review_gate(
     pr_number: int,
     github: ReviewGateData,
     *,
+    trusted_reviewer_ids: frozenset[int] | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> ReviewGateResult:
+    trusted_ids = (
+        trusted_reviewer_ids
+        if trusted_reviewer_ids is not None
+        else frozenset({github.repository_owner_id()})
+    )
+    if not trusted_ids:
+        raise ReviewGateError("at least one trusted reviewer ID is required")
     pull_request = github.pull_request(pr_number)
     commits = github.pull_request_commits(pr_number)
     if commits[-1].sha != pull_request.head_sha:
@@ -308,17 +339,26 @@ def evaluate_review_gate(
             for review in reviews
             if review.commit_id == commit.sha and review.state not in {"DISMISSED", "PENDING"}
         )
+        trusted_anchored = tuple(review for review in anchored if review.author_id in trusted_ids)
         recognized = tuple(
             (review, verdict)
-            for review in anchored
+            for review in trusted_anchored
             if (verdict := _review_verdict(review.body)) is not None
         )
         if not anchored:
             verdict = "missing"
             gaps.append("missing anchored review with commit_id exactly equal to this sha")
+        elif not trusted_anchored:
+            verdict = "untrusted"
+            authors = ", ".join(
+                sorted({f"{review.author_login} (id={review.author_id})" for review in anchored})
+            )
+            gaps.append(f"anchored reviews are not from a trusted reviewer: {authors}")
         elif not recognized:
             verdict = "indeterminate"
-            gaps.append("review verdict cannot be determined from an anchored GitHub review body")
+            gaps.append(
+                "review verdict cannot be determined from a trusted anchored GitHub review body"
+            )
         else:
             latest_review, verdict = max(
                 recognized,
@@ -328,8 +368,9 @@ def evaluate_review_gate(
 
         stalled = (
             not recognized
-            and bool(anchored)
-            and current_time - max(review.submitted_at for review in anchored) > STALL_THRESHOLD
+            and bool(trusted_anchored)
+            and current_time - max(review.submitted_at for review in trusted_anchored)
+            > STALL_THRESHOLD
         )
         if commit.sha == final_code_sha and verdict != "approved":
             gaps.append(f"final code commit verdict must be approved, got {verdict}")
@@ -351,11 +392,11 @@ def evaluate_review_gate(
 
 def _review_verdict(body: str) -> str | None:
     matches = tuple(
-        match.group(1) for match in VERDICT_PATTERN.finditer(body.replace("\r\n", "\n"))
+        match.group(1) for match in VERDICT_HEADING_PATTERN.finditer(body.replace("\r\n", "\n"))
     )
     if len(matches) != 1:
         return None
-    return matches[0].replace(" ", "_")
+    return KNOWN_VERDICTS.get(matches[0])
 
 
 def _latest_observations(

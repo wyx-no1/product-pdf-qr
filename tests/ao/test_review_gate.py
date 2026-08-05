@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,6 +22,7 @@ NOW = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
 BASE_SHA = "a" * 40
 CODE_SHA = "b" * 40
 METADATA_SHA = "d" * 40
+TRUSTED_REVIEWER_ID = 306825498
 
 
 class FakeReviewGateData:
@@ -34,6 +36,9 @@ class FakeReviewGateData:
         self.commits = commits
         self.reviews = reviews
         self.failed_jobs = failed_jobs
+
+    def repository_owner_id(self) -> int:
+        return TRUSTED_REVIEWER_ID
 
     def pull_request(self, number: int) -> PullRequest:
         return PullRequest(
@@ -157,6 +162,10 @@ def test_unparseable_verdict_fails_closed_and_reports_stalled() -> None:
                 body="Looks reasonable, but this is not a machine verdict.",
                 submitted_at=datetime(2026, 8, 5, 11, 0, tzinfo=UTC),
                 url="https://example.invalid/review/1",
+                author_id=TRUSTED_REVIEWER_ID,
+                author_login="trusted-reviewer",
+                author_type="User",
+                author_association="OWNER",
             ),
         ),
     )
@@ -167,6 +176,40 @@ def test_unparseable_verdict_fails_closed_and_reports_stalled() -> None:
     assert result.commits[0].verdict == "indeterminate"
     assert result.commits[0].stalled is True
     assert "STALLED" in result.render()
+
+
+def test_untrusted_reviewer_cannot_supply_an_approved_verdict() -> None:
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (_review(CODE_SHA, "approved", author_id=999),),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "REVIEW_GAP"
+    assert result.commits[0].verdict == "untrusted"
+    assert "not from a trusted reviewer" in result.commits[0].gaps[0]
+
+
+def test_known_and_unknown_verdict_headings_are_ambiguous() -> None:
+    review = _review(CODE_SHA, "approved")
+    ambiguous = replace(
+        review,
+        body=(
+            "## Review verdict: approved\n\n"
+            "## Review verdict: rejected\n\n"
+            "Conflicting machine headings."
+        ),
+    )
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (ambiguous,),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "REVIEW_GAP"
+    assert result.commits[0].verdict == "indeterminate"
 
 
 class FailingRunner(CommandRunner):
@@ -200,7 +243,13 @@ def test_network_or_api_failure_fails_explicitly(detail: str) -> None:
         github.pull_request(19)
 
 
-def _review(sha: str, verdict: str, *, review_id: int = 1) -> ReviewRecord:
+def _review(
+    sha: str,
+    verdict: str,
+    *,
+    review_id: int = 1,
+    author_id: int = TRUSTED_REVIEWER_ID,
+) -> ReviewRecord:
     return ReviewRecord(
         review_id=review_id,
         commit_id=sha,
@@ -208,4 +257,8 @@ def _review(sha: str, verdict: str, *, review_id: int = 1) -> ReviewRecord:
         body=f"## Review verdict: {verdict}\n\nAuditable details.",
         submitted_at=NOW,
         url=f"https://example.invalid/review/{review_id}",
+        author_id=author_id,
+        author_login="trusted-reviewer" if author_id == TRUSTED_REVIEWER_ID else "attacker",
+        author_type="User",
+        author_association="OWNER" if author_id == TRUSTED_REVIEWER_ID else "NONE",
     )

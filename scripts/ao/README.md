@@ -199,8 +199,14 @@ and at least one GitHub PR review whose `commit_id` exactly equals the commit SH
 The final code commit must have an approved verdict.
 
 AO submits reviews with GitHub state `COMMENTED`, so that state is not treated as a
-verdict. The auditable verdict source is exactly one Markdown heading in a submitted,
-non-dismissed GitHub review body:
+verdict. A verdict is accepted only from a configured trusted GitHub numeric user ID;
+the CI workflow pins that ID in its reviewed definition. When the command is run
+without `--trusted-reviewer-id`, it retrieves and trusts the repository owner's
+server-authenticated numeric ID. Review records retain GitHub's author ID, login,
+type, and author association for audit.
+
+The auditable verdict source is exactly one Markdown heading in a submitted,
+non-dismissed, trusted review body:
 
 ```markdown
 ## Review verdict: approved
@@ -212,13 +218,15 @@ or:
 ## Review verdict: changes requested
 ```
 
-When a commit has multiple bodies with a valid heading, the latest submitted review
-is selected deterministically by `submitted_at` and then GitHub review ID.
-An absent, unknown, or ambiguous heading is a `REVIEW_GAP`; it is never inferred as
-approval. Exact-SHA review activity that remains without a parseable verdict for
-more than 30 minutes is additionally reported as `STALLED`, without triggering a
-retry. The command exits `0` only for `PASS`, `2` for `REVIEW_GAP`, and `1` when
-required GitHub evidence cannot be retrieved or validated.
+When a commit has multiple trusted bodies with a valid heading, the latest submitted
+review is selected deterministically by `submitted_at` and then GitHub review ID.
+The parser first collects every `## Review verdict:` heading in a body and accepts
+only one complete known value. An absent, unknown, or ambiguous heading is a
+`REVIEW_GAP`; it is never inferred as approval. Exact-SHA trusted review activity
+that remains without a parseable verdict for more than 30 minutes is additionally
+reported as `STALLED`, without triggering a retry. The command exits `0` only for
+`PASS`, `2` for `REVIEW_GAP`, and `1` when required GitHub evidence cannot be
+retrieved or validated.
 
 ## Advisor workspace workflow
 

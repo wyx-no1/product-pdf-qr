@@ -64,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_gate.add_argument("--repo", type=Path, default=Path("."))
     review_gate.add_argument("--pr", type=int, required=True)
+    review_gate.add_argument(
+        "--trusted-reviewer-id",
+        action="append",
+        type=int,
+        help="trusted GitHub numeric user ID; repeat to trust multiple reviewers",
+    )
 
     verify_evidence = commands.add_parser(
         "evidence-verify-head",
@@ -202,7 +208,16 @@ def _ci_verify_definition(arguments: argparse.Namespace) -> int:
 def _review_gate(arguments: argparse.Namespace) -> int:
     repository = GitRepository(arguments.repo)
     github = GhReviewGateData(repository.remote_slug())
-    result = evaluate_review_gate(arguments.pr, github)
+    configured_ids = (
+        frozenset(arguments.trusted_reviewer_id)
+        if arguments.trusted_reviewer_id is not None
+        else None
+    )
+    result = evaluate_review_gate(
+        arguments.pr,
+        github,
+        trusted_reviewer_ids=configured_ids,
+    )
     print(result.render())
     return result.exit_code
 
