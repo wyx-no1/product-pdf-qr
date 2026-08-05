@@ -32,6 +32,7 @@ from product_pdf_qr.config import (
 from product_pdf_qr.domains.auth import AuthenticatedAdmin
 from product_pdf_qr.domains.importer.parser import (
     ContainerMetrics,
+    ParsedCells,
     ParsedRow,
     ParsedWorkbook,
     XlsxRejected,
@@ -60,7 +61,7 @@ from tests.unit.test_business_services import (
     ScriptedDatabase,
     as_database,
 )
-from tests.xlsx_helpers import build_xlsx
+from tests.xlsx_helpers import build_sparse_wide_xlsx, build_xlsx
 
 DATABASE_URL = "postgresql://app_rw:synthetic@127.0.0.1:5432/test"
 
@@ -72,8 +73,15 @@ def workbook(
     sheets: int = 1,
 ) -> ParsedWorkbook:
     return ParsedWorkbook(
-        headers=headers,
-        rows=tuple(ParsedRow(row_number=row, values=values) for row, values in rows),
+        headers=ParsedCells.from_dense(headers),
+        rows=tuple(
+            ParsedRow(
+                row_number=row,
+                values=ParsedCells.from_dense(values),
+                has_nonblank_cells=any(value.strip() for value in values),
+            )
+            for row, values in rows
+        ),
         nonempty_sheet_count=sheets,
     )
 
@@ -212,6 +220,30 @@ def test_tc17_5001_nonblank_rows_rejected() -> None:
         validate_workbook(workbook(("编码",), rows), max_rows=5_000)
     assert captured.value.detail["actual_rows"] == 5_001
     assert captured.value.detail["max_rows"] == 5_000
+
+
+def test_sparse_xfd_rows_are_bounded_during_parsing() -> None:
+    single_row = parse_xlsx(build_sparse_wide_xlsx(1), max_rows=5_000)
+    assert single_row.rows[0].values.entries == ()
+    assert single_row.rows[0].has_nonblank_cells is True
+
+    attack = build_sparse_wide_xlsx(50_000)
+    assert len(attack) < 10 * 1024 * 1024
+    metrics = inspect_xlsx_container(
+        attack,
+        max_decompressed_bytes=50 * 1024 * 1024,
+        max_compression_ratio=100,
+    )
+    assert metrics.decompressed_bytes < 50 * 1024 * 1024
+    assert metrics.compression_ratio <= 100
+    with pytest.raises(XlsxRejected) as captured:
+        parse_xlsx(attack, max_rows=5_000)
+    assert captured.value.code == "xlsx_row_limit_exceeded"
+    assert captured.value.detail == {
+        "reason": "row_limit_exceeded",
+        "actual_rows": 5_001,
+        "max_rows": 5_000,
+    }
 
 
 def test_tc18_non_zip_disguised_as_xlsx_rejected_before_xml_parser() -> None:
@@ -401,7 +433,7 @@ def test_tc39_tc40_only_first_nonempty_sheet_is_parsed_and_empty_sheets_not_coun
         )
     )
     assert three_nonempty.nonempty_sheet_count == 3
-    assert [row.values for row in three_nonempty.rows] == [("FIRST",)]
+    assert [row.values.populated_values() for row in three_nonempty.rows] == [("FIRST",)]
     extra_blank = parse_xlsx(
         build_xlsx(
             [
@@ -420,8 +452,14 @@ async def test_timeout_parser_success_returns_complete_workbook() -> None:
         build_xlsx([[(1, ("编码",)), (2, ("A001",))]]),
         timeout_seconds=5,
     )
-    assert parsed.headers == ("编码",)
-    assert parsed.rows == (ParsedRow(row_number=2, values=("A001",)),)
+    assert parsed.headers.populated_values() == ("编码",)
+    assert parsed.rows == (
+        ParsedRow(
+            row_number=2,
+            values=ParsedCells.from_dense(("A001",)),
+            has_nonblank_cells=True,
+        ),
+    )
 
 
 def test_parser_cell_variants_coordinates_and_invalid_rows() -> None:
@@ -510,8 +548,14 @@ def patch_valid_phase_one(monkeypatch: pytest.MonkeyPatch) -> None:
     async def read_upload(_upload: UploadFile, _max_bytes: int) -> bytes:
         return b"synthetic-xlsx"
 
-    async def parse_upload(_content: bytes, *, timeout_seconds: float) -> ParsedWorkbook:
+    async def parse_upload(
+        _content: bytes,
+        *,
+        timeout_seconds: float,
+        max_rows: int,
+    ) -> ParsedWorkbook:
         assert timeout_seconds == 30
+        assert max_rows == 5_000
         return workbook(("编码",), [(2, ("A",))])
 
     monkeypatch.setattr(

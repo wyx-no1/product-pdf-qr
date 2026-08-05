@@ -12,6 +12,9 @@ from product_pdf_qr.config import Settings
 from product_pdf_qr.database import Database
 from product_pdf_qr.domains.audit import AuditEvent, append_event, append_independent_event
 from product_pdf_qr.domains.importer.parser import (
+    CODE_HEADERS,
+    NAME_HEADERS,
+    ParsedCells,
     ParsedWorkbook,
     XlsxRejected,
     inspect_xlsx_container,
@@ -25,8 +28,6 @@ from product_pdf_qr.domains.product import (
 from product_pdf_qr.errors import AppError
 
 ImportErrorKind = Literal["format", "security", "system", "authentication"]
-CODE_HEADERS = frozenset({"编码", "产品编码"})
-NAME_HEADERS = frozenset({"名称", "产品名称"})
 UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 
 
@@ -93,8 +94,8 @@ def _header_key(value: str) -> str:
     return value.strip().casefold()
 
 
-def _cell(values: tuple[str, ...], index: int) -> str:
-    return values[index] if index < len(values) else ""
+def _cell(values: ParsedCells, index: int) -> str:
+    return values.get(index)
 
 
 def _code_error_reason(raw_code: str, error: AppError) -> str:
@@ -113,9 +114,7 @@ def validate_workbook(
 ) -> tuple[tuple[ImportCandidate, ...], int, tuple[str, ...]]:
     """Validate all rows without persistence and retain first file occurrence."""
 
-    nonblank_rows = tuple(
-        row for row in workbook.rows if any(value.strip() for value in row.values)
-    )
+    nonblank_rows = tuple(row for row in workbook.rows if row.has_nonblank_cells)
     if len(nonblank_rows) > max_rows:
         raise XlsxRejected(
             "xlsx_row_limit_exceeded",
@@ -128,18 +127,19 @@ def validate_workbook(
             status_code=413,
         )
 
-    normalized_headers = tuple(_header_key(header) for header in workbook.headers)
-    code_columns = [
-        index for index, header in enumerate(normalized_headers) if header in CODE_HEADERS
-    ]
+    normalized_headers = tuple(
+        (index, _header_key(header)) for index, header in workbook.headers.entries
+    )
+    code_columns = [index for index, header in normalized_headers if header in CODE_HEADERS]
     if not code_columns:
-        actual_headers = "、".join(repr(header) for header in workbook.headers)
+        header_values = workbook.headers.populated_values()
+        actual_headers = "、".join(repr(header) for header in header_values)
         raise XlsxRejected(
             "missing_code_column",
             f"找不到编码列; 实际表头: {actual_headers}",
             detail={
                 "reason": "missing_code_column",
-                "actual_headers": list(workbook.headers),
+                "actual_headers": list(header_values),
             },
             format_error=True,
         )
@@ -149,13 +149,11 @@ def validate_workbook(
             "列名歧义: 编码列只能出现一次, 且“编码/产品编码”不能同时存在。",
             detail={
                 "reason": "ambiguous_code_column",
-                "actual_headers": list(workbook.headers),
+                "actual_headers": list(workbook.headers.populated_values()),
             },
             format_error=True,
         )
-    name_columns = [
-        index for index, header in enumerate(normalized_headers) if header in NAME_HEADERS
-    ]
+    name_columns = [index for index, header in normalized_headers if header in NAME_HEADERS]
     code_column = code_columns[0]
     name_column = name_columns[0] if name_columns else None
     candidates: list[ImportCandidate] = []
@@ -300,6 +298,7 @@ async def import_products(
         workbook = await parse_xlsx_with_timeout(
             content,
             timeout_seconds=settings.import_parse_timeout_seconds,
+            max_rows=settings.import_max_rows,
         )
         candidates, file_duplicate_count, notices = validate_workbook(
             workbook,

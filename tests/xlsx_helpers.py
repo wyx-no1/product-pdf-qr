@@ -106,3 +106,32 @@ def build_xlsx(
         for name, payload in (extra_entries or {}).items():
             archive.writestr(name, payload)
     return output.getvalue()
+
+
+def build_sparse_wide_xlsx(row_count: int) -> bytes:
+    """Build stored XML whose only data cell is in the final XLSX column."""
+
+    rows = "".join(
+        (f'<row r="{row_number}"><c r="XFD{row_number}" t="inlineStr"><is><t>X</t></is></c></row>')
+        for row_number in range(2, row_count + 2)
+    )
+    worksheet = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>编码</t></is></c></row>'
+        f"{rows}</sheetData></worksheet>"
+    ).encode()
+    source = io.BytesIO(build_xlsx([[]], compression=zipfile.ZIP_STORED))
+    output = io.BytesIO()
+    with (
+        zipfile.ZipFile(source) as source_archive,
+        zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as output_archive,
+    ):
+        for entry in source_archive.infolist():
+            payload = (
+                worksheet
+                if entry.filename == "xl/worksheets/sheet1.xml"
+                else source_archive.read(entry)
+            )
+            output_archive.writestr(entry.filename, payload)
+    return output.getvalue()

@@ -40,7 +40,7 @@ from product_pdf_qr.domains.product import (
     create_product_in_transaction,
 )
 from product_pdf_qr.main import create_app, lifespan
-from tests.xlsx_helpers import Worksheet, build_xlsx
+from tests.xlsx_helpers import Worksheet, build_sparse_wide_xlsx, build_xlsx
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -423,6 +423,30 @@ async def test_tc17_5001_rows_rejected_with_actual_value(
 
 
 @pytest.mark.api
+async def test_sparse_wide_row_limit_is_rejected_during_parse_and_audited(
+    clean_import_database: ImportAuth,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attack = build_sparse_wide_xlsx(50_000)
+    assert len(attack) < 10 * 1024 * 1024
+    async with running_clients(clean_import_database, tmp_path, monkeypatch) as (client, _):
+        response = await post_import(client, attack)
+    assert response.status_code == 413
+    assert response.json()["error_code"] == "xlsx_row_limit_exceeded"
+    assert product_rows() == []
+    failure_audits = audit_rows("failure")
+    assert len(failure_audits) == 1
+    detail = cast(dict[str, object], failure_audits[0][4])
+    assert detail["reason"] == "row_limit_exceeded"
+    assert detail["actual_rows"] == 5_001
+    assert detail["max_rows"] == 5_000
+    assert detail["success_count"] == 0
+    assert detail["duplicate_count"] == 0
+    assert detail["format_error_count"] == 0
+
+
+@pytest.mark.api
 async def test_tc18_fake_xlsx_signature_rejected_before_parser(
     clean_import_database: ImportAuth,
     tmp_path: Path,
@@ -532,8 +556,14 @@ async def test_tc22_parse_timeout_is_audited_and_never_enters_phase_two(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def timeout_parser(content: bytes, *, timeout_seconds: float) -> object:
+    async def timeout_parser(
+        content: bytes,
+        *,
+        timeout_seconds: float,
+        max_rows: int,
+    ) -> object:
         del content
+        assert max_rows == 5_000
         raise XlsxRejected(
             "xlsx_parse_timeout",
             "XLSX 解析超过 30 秒上限, 已中止。",

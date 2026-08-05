@@ -8,6 +8,7 @@ import posixpath
 import re
 import time
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from io import BytesIO
 from multiprocessing.connection import Connection as PipeConnection
@@ -22,6 +23,8 @@ CELL_REFERENCE_PATTERN = re.compile(r"^([A-Z]+)([1-9][0-9]*)$", re.ASCII)
 SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CODE_HEADERS = frozenset({"编码", "产品编码"})
+NAME_HEADERS = frozenset({"名称", "产品名称"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,18 +37,47 @@ class ContainerMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class ParsedCells:
+    """Sparse worksheet cells keyed by zero-based XLSX column index."""
+
+    entries: tuple[tuple[int, str], ...]
+
+    @classmethod
+    def from_dense(cls, values: tuple[str, ...]) -> ParsedCells:
+        """Build sparse cells for tests and non-parser callers."""
+
+        return cls(tuple((index, value) for index, value in enumerate(values) if value))
+
+    def get(self, index: int) -> str:
+        """Return one cell without allocating through the requested column."""
+
+        return next((value for column, value in self.entries if column == index), "")
+
+    def has_nonblank(self) -> bool:
+        """Return whether any represented cell contains non-whitespace text."""
+
+        return any(value.strip() for _column, value in self.entries)
+
+    def populated_values(self) -> tuple[str, ...]:
+        """Return represented values in column order for diagnostics."""
+
+        return tuple(value for _column, value in self.entries)
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedRow:
-    """One physical worksheet row and its cell values."""
+    """One physical worksheet row and its sparse cell values."""
 
     row_number: int
-    values: tuple[str, ...]
+    values: ParsedCells
+    has_nonblank_cells: bool
 
 
 @dataclass(frozen=True, slots=True)
 class ParsedWorkbook:
     """The first worksheet plus the count of all non-empty worksheets."""
 
-    headers: tuple[str, ...]
+    headers: ParsedCells
     rows: tuple[ParsedRow, ...]
     nonempty_sheet_count: int
 
@@ -229,48 +261,197 @@ def _cell_text(
     return value
 
 
+def _row_number(row: ElementTree.Element, fallback: int) -> int:
+    raw_row_number = row.attrib.get("r")
+    try:
+        return int(raw_row_number) if raw_row_number is not None else fallback
+    except ValueError as error:
+        raise ValueError("Worksheet row number is invalid") from error
+
+
+def _row_cells(
+    row: ElementTree.Element,
+    shared_strings: tuple[str, ...],
+    *,
+    retained_columns: frozenset[int] | None,
+) -> tuple[ParsedCells, bool]:
+    values: list[tuple[int, str]] = []
+    fallback_column = 0
+    has_nonblank_cells = False
+    for cell in row.iter(f"{{{SPREADSHEET_NS}}}c"):
+        column = _column_index(cell.attrib.get("r", ""), fallback_column)
+        if column < 0 or column > 16_383:
+            raise ValueError("Worksheet column is outside the XLSX limit")
+        value = _cell_text(cell, shared_strings)
+        has_nonblank_cells = has_nonblank_cells or bool(value.strip())
+        if value and (retained_columns is None or column in retained_columns):
+            values.append((column, value))
+        fallback_column = column + 1
+    return ParsedCells(tuple(values)), has_nonblank_cells
+
+
+def _consume_rows(
+    rows: Iterable[ElementTree.Element],
+    shared_strings: tuple[str, ...],
+    *,
+    max_data_rows: int | None = None,
+    clear_elements: bool,
+) -> tuple[tuple[ParsedRow, ...], bool]:
+    parsed_data_rows: list[ParsedRow] = []
+    header_values = ParsedCells(())
+    header_has_nonblank_cells = False
+    header_seen = False
+    retained_columns: frozenset[int] | None = None
+    nonblank_data_rows = 0
+    worksheet_is_nonempty = False
+
+    for fallback_row_number, row in enumerate(
+        rows,
+        start=1,
+    ):
+        try:
+            row_number = _row_number(row, fallback_row_number)
+            parsed_values, has_nonblank_cells = _row_cells(
+                row,
+                shared_strings,
+                retained_columns=None if row_number == 1 else retained_columns,
+            )
+            worksheet_is_nonempty = worksheet_is_nonempty or has_nonblank_cells
+            if row_number == 1:
+                if not header_seen:
+                    header_seen = True
+                    header_values = parsed_values
+                    header_has_nonblank_cells = has_nonblank_cells
+                    retained_columns = frozenset(
+                        column
+                        for column, value in header_values.entries
+                        if value.strip().casefold() in CODE_HEADERS | NAME_HEADERS
+                    )
+                continue
+            if row_number < 1 or not has_nonblank_cells:
+                continue
+            nonblank_data_rows += 1
+            if max_data_rows is not None and nonblank_data_rows > max_data_rows:
+                raise XlsxRejected(
+                    "xlsx_row_limit_exceeded",
+                    "数据行超过 5,000 行上限, 请分批导入。",
+                    detail={
+                        "reason": "row_limit_exceeded",
+                        "actual_rows": nonblank_data_rows,
+                        "max_rows": max_data_rows,
+                    },
+                    status_code=413,
+                )
+            parsed_data_rows.append(
+                ParsedRow(
+                    row_number=row_number,
+                    values=parsed_values,
+                    has_nonblank_cells=True,
+                )
+            )
+        finally:
+            if clear_elements:
+                row.clear()
+
+    consumed_columns = retained_columns or frozenset()
+    parsed_data_rows = [
+        ParsedRow(
+            row_number=row.row_number,
+            values=ParsedCells(
+                tuple(
+                    (column, value)
+                    for column, value in row.values.entries
+                    if column in consumed_columns
+                )
+            ),
+            has_nonblank_cells=True,
+        )
+        for row in parsed_data_rows
+    ]
+    parsed: list[ParsedRow] = []
+    if header_seen:
+        parsed.append(
+            ParsedRow(
+                row_number=1,
+                values=header_values,
+                has_nonblank_cells=header_has_nonblank_cells,
+            )
+        )
+    parsed.extend(parsed_data_rows)
+    return tuple(parsed), worksheet_is_nonempty
+
+
 def _rows(
     root: ElementTree.Element,
     shared_strings: tuple[str, ...],
+    *,
+    max_data_rows: int | None = None,
 ) -> tuple[ParsedRow, ...]:
-    parsed: list[ParsedRow] = []
-    fallback_row_number = 0
-    for row in root.findall(f".//{{{SPREADSHEET_NS}}}row"):
-        fallback_row_number += 1
-        raw_row_number = row.attrib.get("r")
-        try:
-            row_number = int(raw_row_number) if raw_row_number is not None else fallback_row_number
-        except ValueError as error:
-            raise ValueError("Worksheet row number is invalid") from error
-        values: list[str] = []
-        fallback_column = 0
-        for cell in row.findall(f"{{{SPREADSHEET_NS}}}c"):
-            column = _column_index(cell.attrib.get("r", ""), fallback_column)
-            if column < 0 or column > 16_383:
-                raise ValueError("Worksheet column is outside the XLSX limit")
-            while len(values) <= column:
-                values.append("")
-            values[column] = _cell_text(cell, shared_strings)
-            fallback_column = column + 1
-        parsed.append(ParsedRow(row_number=row_number, values=tuple(values)))
-    return tuple(parsed)
+    parsed, _is_nonempty = _consume_rows(
+        root.iter(f"{{{SPREADSHEET_NS}}}row"),
+        shared_strings,
+        max_data_rows=max_data_rows,
+        clear_elements=False,
+    )
+    return parsed
 
 
-def parse_xlsx(content: bytes) -> ParsedWorkbook:
+def _stream_first_worksheet(
+    archive: zipfile.ZipFile,
+    path: str,
+    shared_strings: tuple[str, ...],
+    *,
+    max_data_rows: int,
+) -> tuple[tuple[ParsedRow, ...], bool]:
+    with archive.open(path) as source:
+        row_elements = (
+            element
+            for _event, element in ElementTree.iterparse(source, events=("end",))
+            if element.tag == f"{{{SPREADSHEET_NS}}}row"
+        )
+        return _consume_rows(
+            row_elements,
+            shared_strings,
+            max_data_rows=max_data_rows,
+            clear_elements=True,
+        )
+
+
+def _stream_worksheet_is_nonempty(
+    archive: zipfile.ZipFile,
+    path: str,
+    shared_strings: tuple[str, ...],
+) -> bool:
+    is_nonempty = False
+    with archive.open(path) as source:
+        for _event, element in ElementTree.iterparse(source, events=("end",)):
+            if element.tag == f"{{{SPREADSHEET_NS}}}c":
+                is_nonempty = is_nonempty or bool(_cell_text(element, shared_strings).strip())
+            if element.tag == f"{{{SPREADSHEET_NS}}}row":
+                element.clear()
+    return is_nonempty
+
+
+def parse_xlsx(content: bytes, *, max_rows: int = 5_000) -> ParsedWorkbook:
     """Parse first-sheet rows and count non-empty sheets after safety inspection."""
 
     with zipfile.ZipFile(BytesIO(content)) as archive:
         shared_strings = _shared_strings(archive)
         paths = _worksheet_paths(archive)
-        worksheets = tuple(_rows(_xml_root(archive, path), shared_strings) for path in paths)
-    first_rows = worksheets[0]
+        first_rows, first_is_nonempty = _stream_first_worksheet(
+            archive,
+            paths[0],
+            shared_strings,
+            max_data_rows=max_rows,
+        )
+        nonempty_sheet_count = int(first_is_nonempty)
+        for path in paths[1:]:
+            nonempty_sheet_count += int(
+                _stream_worksheet_is_nonempty(archive, path, shared_strings)
+            )
     header_row = next((row for row in first_rows if row.row_number == 1), None)
-    headers = header_row.values if header_row is not None else ()
+    headers = header_row.values if header_row is not None else ParsedCells(())
     data_rows = tuple(row for row in first_rows if row.row_number > 1)
-    nonempty_sheet_count = sum(
-        any(any(value.strip() for value in row.values) for row in worksheet)
-        for worksheet in worksheets
-    )
     return ParsedWorkbook(
         headers=headers,
         rows=data_rows,
@@ -278,9 +459,20 @@ def parse_xlsx(content: bytes) -> ParsedWorkbook:
     )
 
 
-def _parse_worker(sender: PipeConnection, content: bytes) -> None:
+def _parse_worker(sender: PipeConnection, content: bytes, max_rows: int) -> None:
     try:
-        sender.send(("success", parse_xlsx(content)))
+        sender.send(("success", parse_xlsx(content, max_rows=max_rows)))
+    except XlsxRejected as error:
+        sender.send(
+            (
+                "rejected",
+                error.code,
+                error.message,
+                error.detail,
+                error.status_code,
+                error.format_error,
+            )
+        )
     except Exception as error:
         sender.send(("failure", type(error).__name__, str(error)))
     finally:
@@ -306,12 +498,17 @@ async def parse_xlsx_with_timeout(
     content: bytes,
     *,
     timeout_seconds: float,
+    max_rows: int = 5_000,
 ) -> ParsedWorkbook:
     """Parse in a disposable process so timeout cancellation leaves no worker behind."""
 
     context = multiprocessing.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
-    process = context.Process(target=_parse_worker, args=(sender, content), daemon=True)
+    process = context.Process(
+        target=_parse_worker,
+        args=(sender, content, max_rows),
+        daemon=True,
+    )
     started_at = time.monotonic()
     process.start()
     sender.close()
@@ -350,6 +547,14 @@ async def parse_xlsx_with_timeout(
         if isinstance(workbook, ParsedWorkbook):
             return workbook
         raise RuntimeError("Parser returned an unexpected result")
+    if result[0] == "rejected":
+        raise XlsxRejected(
+            str(result[1]),
+            str(result[2]),
+            detail=dict(result[3]),
+            status_code=int(result[4]),
+            format_error=bool(result[5]),
+        )
     raise XlsxRejected(
         "invalid_xlsx",
         "XLSX 结构无法解析。",
