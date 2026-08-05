@@ -13,6 +13,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from product_pdf_qr.config import get_settings
 from product_pdf_qr.database import Database
 from product_pdf_qr.domains.audit import AuditEvent, append_independent_event
+from product_pdf_qr.domains.auth import AuthenticatedAdmin
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,10 @@ class UploadRequestLimitMiddleware:
                 candidate = 0
             if candidate > 0:
                 product_id = candidate
+        state = scope.get("state")
+        admin = state.get("admin") if isinstance(state, dict) else None
+        actor_type = "admin" if isinstance(admin, AuthenticatedAdmin) else "anonymous"
+        actor_id = admin.id if isinstance(admin, AuthenticatedAdmin) else None
         try:
             database = cast(Database, scope["app"].state.database)
             written = await append_independent_event(
@@ -145,7 +150,8 @@ class UploadRequestLimitMiddleware:
                 AuditEvent(
                     action="pdf_upload_rejected",
                     result="failure",
-                    actor_type="anonymous",
+                    actor_type=actor_type,
+                    actor_id=actor_id,
                     target_type="product",
                     target_id=product_id,
                     request_id=request_id,

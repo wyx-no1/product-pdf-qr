@@ -1,9 +1,13 @@
 """Tests for the local-safe process entry point."""
 
+import io
+
 import pytest
 
 from product_pdf_qr import __main__
+from product_pdf_qr import cli as admin_cli
 from product_pdf_qr.config import get_settings
+from product_pdf_qr.errors import AppError
 
 
 def test_run_uses_centralized_loopback_default(
@@ -28,3 +32,59 @@ def test_run_uses_centralized_loopback_default(
         get_settings.cache_clear()
 
     assert calls == [("127.0.0.1", 8000)]
+
+
+def test_admin_cli_exposes_no_password_value_argument() -> None:
+    parser = admin_cli.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "create-admin",
+                "--username",
+                "owner",
+                "--password",
+                "MustNeverBeAccepted",
+            ]
+        )
+
+    help_text = parser.format_help()
+    assert "--password PASSWORD" not in help_text
+
+
+def test_admin_cli_reads_password_from_stdin_without_echo(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "TemporaryPassword-123"
+    captured_passwords: list[str] = []
+
+    async def execute(_args: object, password: str) -> int:
+        captured_passwords.append(password)
+        return 0
+
+    monkeypatch.setattr(admin_cli, "_execute", execute)
+    monkeypatch.setattr("sys.stdin", io.StringIO(secret + "\n"))
+
+    result = admin_cli.main(["create-admin", "--username", "owner", "--password-stdin"])
+
+    output = capsys.readouterr()
+    assert result == 0
+    assert captured_passwords == [secret]
+    assert secret not in output.out
+    assert secret not in output.err
+
+
+def test_admin_cli_interactive_confirmation_must_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answers = iter(["FirstPassword-123", "DifferentPassword-456"])
+    monkeypatch.setattr(
+        "product_pdf_qr.cli.getpass.getpass",
+        lambda _prompt: next(answers),
+    )
+
+    with pytest.raises(AppError) as captured:
+        admin_cli.read_password(password_stdin=False)
+
+    assert captured.value.code == "password_confirmation_mismatch"

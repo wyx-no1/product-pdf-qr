@@ -115,6 +115,17 @@ def test_migration_lifecycle_schema_and_permissions() -> None:
             "FOREIGN KEY (id, current_version_id) REFERENCES pdf_versions(product_id, id)"
         ) in str(composite_fk[0])
 
+        name_column = connection.execute(
+            """
+            SELECT data_type, character_maximum_length, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'products'
+              AND column_name = 'name'
+            """
+        ).fetchone()
+        assert name_column == ("character varying", 120, "YES")
+
         runtime_table_grants = {
             (str(row[0]), str(row[1]))
             for row in connection.execute(
@@ -279,3 +290,65 @@ def test_migration_lifecycle_schema_and_permissions() -> None:
                 ) VALUES ('BACKUP-MUST-FAIL', 'DDDDDDDDDDDDDDDDDDDDDDDDDD', now(), now())
                 """
             )
+
+
+@pytest.mark.integration
+def test_product_name_migration_preserves_existing_rows_and_is_reversible() -> None:
+    migration_url = required_environment("TEST_MIGRATION_DATABASE_URL")
+    runtime_url = required_environment("TEST_DATABASE_URL")
+    assert_isolated_test_database(migration_url, runtime_url)
+    psycopg_migration_url = migration_url.replace(
+        "postgresql+psycopg://",
+        "postgresql://",
+    )
+    config = alembic_config()
+    historical_code = "NAME-MIGRATION-HISTORY"
+
+    with migration_environment(migration_url):
+        try:
+            command.upgrade(config, "head")
+            command.downgrade(config, "20260801_0001")
+            with psycopg.connect(psycopg_migration_url, autocommit=True) as connection:
+                connection.execute(
+                    "DELETE FROM products WHERE code = %s",
+                    (historical_code,),
+                )
+                inserted = connection.execute(
+                    """
+                    INSERT INTO products (
+                        code,
+                        public_token,
+                        created_at,
+                        updated_at
+                    ) VALUES (%s, 'EEEEEEEEEEEEEEEEEEEEEEEEEE', now(), now())
+                    RETURNING id
+                    """,
+                    (historical_code,),
+                ).fetchone()
+                assert inserted is not None
+                product_id = int(inserted[0])
+
+            command.upgrade(config, "head")
+            with psycopg.connect(psycopg_migration_url) as connection:
+                assert connection.execute(
+                    "SELECT name FROM products WHERE id = %s",
+                    (product_id,),
+                ).fetchone() == (None,)
+
+            command.downgrade(config, "20260801_0001")
+            with psycopg.connect(psycopg_migration_url) as connection:
+                assert connection.execute(
+                    """
+                    SELECT count(*)
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'products'
+                      AND column_name = 'name'
+                    """
+                ).fetchone() == (0,)
+                assert connection.execute(
+                    "SELECT code FROM products WHERE id = %s",
+                    (product_id,),
+                ).fetchone() == (historical_code,)
+        finally:
+            command.upgrade(config, "head")

@@ -7,8 +7,11 @@ from typing import cast
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
+from product_pdf_qr.admin import router as admin_router
+from product_pdf_qr.auth_middleware import AdminAuthenticationMiddleware
 from product_pdf_qr.config import get_settings
 from product_pdf_qr.database import Database
+from product_pdf_qr.domains.auth import LoginRateLimiter, PasswordManager
 from product_pdf_qr.domains.product.router import router as product_router
 from product_pdf_qr.domains.public import PublicMissLimiter
 from product_pdf_qr.domains.public.router import router as public_router
@@ -46,6 +49,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.public_miss_limit,
         settings.public_miss_window_seconds,
     )
+    app.state.password_manager = PasswordManager()
+    app.state.login_rate_limiter = LoginRateLimiter(
+        failure_limit=settings.login_failure_limit,
+        window_seconds=settings.login_failure_window_seconds,
+        base_backoff_seconds=settings.login_backoff_base_seconds,
+        max_backoff_seconds=settings.login_backoff_max_seconds,
+    )
     try:
         yield
     finally:
@@ -61,7 +71,9 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     application.add_middleware(UploadRequestLimitMiddleware)
+    application.add_middleware(AdminAuthenticationMiddleware)
     register_exception_handlers(application)
+    application.include_router(admin_router)
     application.include_router(product_router)
     application.include_router(qrcode_router)
     application.include_router(storage_router)

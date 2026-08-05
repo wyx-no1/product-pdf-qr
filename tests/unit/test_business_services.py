@@ -6,6 +6,7 @@ import asyncio
 import threading
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -15,7 +16,12 @@ from psycopg.types.json import Jsonb
 
 from product_pdf_qr.database import Connection, Database
 from product_pdf_qr.domains.audit import AuditEvent, append_event, append_independent_event
-from product_pdf_qr.domains.product import create_product
+from product_pdf_qr.domains.product import (
+    create_product,
+    get_product,
+    list_products,
+    normalize_product_name,
+)
 from product_pdf_qr.domains.public import resolve_public_document
 from product_pdf_qr.domains.storage import PublishedFile, StorageService, ValidatedUpload
 from product_pdf_qr.domains.version import DuplicateCurrentPDF, upload_pdf
@@ -122,6 +128,7 @@ async def test_create_product_commits_audit_with_normalized_code() -> None:
             {
                 "id": 7,
                 "code": "A001",
+                "name": "测试产品",
                 "public_token": "A" * 26,
                 "status": "active",
                 "current_version_id": None,
@@ -130,12 +137,22 @@ async def test_create_product_commits_audit_with_normalized_code() -> None:
         ]
     )
 
-    product = await create_product(as_database(ScriptedDatabase(connection)), " a001 ")
+    product = await create_product(
+        as_database(ScriptedDatabase(connection)),
+        " a001 ",
+        " 测试产品 ",
+        actor_id=9,
+    )
 
     assert product.code == "A001"
+    assert product.name == "测试产品"
     assert product.current_version_id is None
     assert "INSERT INTO products" in connection.queries[0]
+    assert cast(tuple[object, ...], connection.parameters[0])[:2] == ("A001", "测试产品")
     assert "INSERT INTO audit_events" in connection.queries[1]
+    audit_parameters = cast(tuple[object, ...], connection.parameters[1])
+    assert audit_parameters[:2] == ("admin", 9)
+    assert audit_parameters[2] == "product_create"
 
 
 @pytest.mark.anyio
@@ -153,10 +170,120 @@ async def test_create_product_rejects_duplicate_code(
     )
 
     with pytest.raises(AppError) as captured:
-        await create_product(as_database(ScriptedDatabase(connection)), "A001")
+        await create_product(
+            as_database(ScriptedDatabase(connection)),
+            "A001",
+            "测试产品",
+            actor_id=9,
+        )
 
     assert captured.value.code == "duplicate_product_code"
     assert captured.value.status_code == 409
+
+
+@pytest.mark.parametrize("name", ["", "   ", "A" * 121])
+def test_product_name_validation_is_bounded(name: str) -> None:
+    with pytest.raises(AppError) as captured:
+        normalize_product_name(name)
+
+    assert captured.value.code == "invalid_product_name"
+    assert captured.value.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_product_list_and_detail_support_historical_null_names() -> None:
+    updated = datetime(2026, 8, 4, 9, 30, tzinfo=UTC)
+    historical = {
+        "id": 4,
+        "code": "HISTORICAL",
+        "name": None,
+        "public_token": "H" * 26,
+        "status": "active",
+        "current_version_id": None,
+        "created_at": updated,
+        "updated_at": updated,
+    }
+    current = {
+        **historical,
+        "id": 5,
+        "code": "CURRENT",
+        "name": "当前产品",
+        "public_token": "C" * 26,
+        "current_version_id": 11,
+    }
+    list_connection = ScriptedConnection([[current, historical]])
+    detail_connection = ScriptedConnection([historical])
+    database = as_database(ScriptedDatabase(list_connection, detail_connection))
+
+    products = await list_products(database, limit=20, offset=10)
+    product = await get_product(database, 4)
+
+    assert [item.name for item in products] == ["当前产品", None]
+    assert product.name is None
+    assert product.updated_at == updated
+    assert "ORDER BY updated_at DESC, id DESC" in list_connection.queries[0]
+    assert list_connection.parameters[0] == (20, 10)
+    assert detail_connection.parameters[0] == (4,)
+
+
+@pytest.mark.anyio
+async def test_product_list_filters_in_sql_before_pagination_and_escapes_like() -> None:
+    search_connection = ScriptedConnection([[]])
+    uploaded_connection = ScriptedConnection([[]])
+    not_uploaded_connection = ScriptedConnection([[]])
+    database = as_database(
+        ScriptedDatabase(
+            search_connection,
+            uploaded_connection,
+            not_uploaded_connection,
+        )
+    )
+
+    await list_products(
+        database,
+        limit=5,
+        offset=10,
+        q=r" v1%_\legacy ",
+    )
+    await list_products(
+        database,
+        limit=20,
+        offset=0,
+        pdf_status="uploaded",
+    )
+    await list_products(
+        database,
+        limit=20,
+        offset=20,
+        pdf_status="not_uploaded",
+    )
+
+    search_sql = search_connection.queries[0]
+    assert "code ILIKE %s" in search_sql
+    assert "COALESCE(name, '') ILIKE %s" in search_sql
+    assert search_sql.index("WHERE") < search_sql.index("ORDER BY")
+    assert search_sql.index("ORDER BY") < search_sql.index("LIMIT")
+    assert search_connection.parameters[0] == (
+        r"%v1\%\_\\legacy%",
+        r"%v1\%\_\\legacy%",
+        5,
+        10,
+    )
+    assert "current_version_id IS NOT NULL" in uploaded_connection.queries[0]
+    assert uploaded_connection.parameters[0] == (20, 0)
+    assert "current_version_id IS NULL" in not_uploaded_connection.queries[0]
+    assert not_uploaded_connection.parameters[0] == (20, 20)
+
+
+@pytest.mark.anyio
+async def test_get_product_missing_uses_safe_error() -> None:
+    database = as_database(ScriptedDatabase(ScriptedConnection([None])))
+
+    with pytest.raises(AppError) as captured:
+        await get_product(database, 999)
+
+    assert captured.value.code == "product_not_found"
+    assert captured.value.status_code == 404
 
 
 def validated_upload(tmp_path: Path, content: bytes = b"%PDF-synthetic") -> ValidatedUpload:

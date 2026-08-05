@@ -2,24 +2,33 @@
 
 from __future__ import annotations
 
-from typing import Annotated, cast
+from datetime import datetime
+from typing import Annotated
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
 from product_pdf_qr.database import Database
 from product_pdf_qr.dependencies import (
+    get_current_admin,
     get_database,
     get_qrcode_service,
     get_storage_service,
 )
 from product_pdf_qr.domains.audit import AuditEvent, append_independent_event
-from product_pdf_qr.domains.product.service import Product, create_product
+from product_pdf_qr.domains.auth import AuthenticatedAdmin
+from product_pdf_qr.domains.product.service import (
+    PRODUCT_NAME_MAX_LENGTH,
+    Product,
+    ProductPDFStatus,
+    create_product,
+    get_product,
+    list_products,
+)
 from product_pdf_qr.domains.qrcode import QRCodeGenerationError, QRCodeResult, QRCodeService
 from product_pdf_qr.domains.storage import StorageService, UploadRejected
 from product_pdf_qr.domains.version import record_upload_rejection, upload_pdf
-from product_pdf_qr.errors import AppError
 
 router = APIRouter(prefix="/api/products", tags=["products"])
 
@@ -28,6 +37,7 @@ class ProductCreateRequest(BaseModel):
     """Product creation input."""
 
     code: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=PRODUCT_NAME_MAX_LENGTH)
 
 
 class ProductCreateResponse(BaseModel):
@@ -35,12 +45,40 @@ class ProductCreateResponse(BaseModel):
 
     id: int
     code: str
+    name: str
     public_token: str
     status: str
     current_version_id: int | None
     public_url: str
     qrcode_url: str
     qrcode_status: str
+
+
+class ProductListItemResponse(BaseModel):
+    """One persisted product shown in the administration list."""
+
+    id: int
+    code: str
+    name: str | None
+    pdf_status: ProductPDFStatus
+    updated_at: datetime
+
+
+class ProductDetailResponse(BaseModel):
+    """Complete persisted product state for a reloadable detail page."""
+
+    id: int
+    code: str
+    name: str | None
+    status: str
+    public_token: str
+    public_url: str
+    qrcode_url: str
+    qrcode_status: str
+    pdf_status: ProductPDFStatus
+    current_version_id: int | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class PDFUploadResponse(BaseModel):
@@ -83,26 +121,41 @@ async def _record_qrcode_outcome(
 
 
 async def _load_product(database: Database, product_id: int) -> Product:
-    async with database.connection() as connection:
-        cursor = await connection.execute(
-            """
-            SELECT id, code, public_token, status, current_version_id
-            FROM products
-            WHERE id = %s
-            """,
-            (product_id,),
-        )
-        row = await cursor.fetchone()
-    if row is None:
-        raise AppError("product_not_found", "产品不存在。", 404)
-    return Product(
-        id=cast(int, row["id"]),
-        code=str(row["code"]),
-        public_token=str(row["public_token"]),
-        status=str(row["status"]),
-        current_version_id=(
-            cast(int, row["current_version_id"]) if row["current_version_id"] is not None else None
-        ),
+    return await get_product(database, product_id)
+
+
+def _pdf_status(product: Product) -> ProductPDFStatus:
+    return "uploaded" if product.current_version_id is not None else "not_uploaded"
+
+
+def _required_timestamp(value: datetime | None) -> datetime:
+    if value is None:
+        raise RuntimeError("Persisted product is missing timestamps")
+    return value
+
+
+def _qrcode_status(qrcode_service: QRCodeService, product: Product) -> str:
+    cache_path = qrcode_service.cache_root / f"{product.code}.png"
+    return "ready" if cache_path.is_file() else "not_generated"
+
+
+def _detail_response(
+    product: Product,
+    qrcode_service: QRCodeService,
+) -> ProductDetailResponse:
+    return ProductDetailResponse(
+        id=product.id,
+        code=product.code,
+        name=product.name,
+        status=product.status,
+        public_token=product.public_token,
+        public_url=qrcode_service.public_url(product.public_token),
+        qrcode_url=f"/api/products/{product.id}/qrcode",
+        qrcode_status=_qrcode_status(qrcode_service, product),
+        pdf_status=_pdf_status(product),
+        current_version_id=product.current_version_id,
+        created_at=_required_timestamp(product.created_at),
+        updated_at=_required_timestamp(product.updated_at),
     )
 
 
@@ -136,12 +189,19 @@ async def _generate_with_audit(
 @router.post("", response_model=ProductCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_product_endpoint(
     payload: ProductCreateRequest,
+    admin: Annotated[AuthenticatedAdmin, Depends(get_current_admin)],
     database: Annotated[Database, Depends(get_database)],
     qrcode_service: Annotated[QRCodeService, Depends(get_qrcode_service)],
 ) -> ProductCreateResponse:
     """Create first, commit, then pre-generate the derived QR cache best-effort."""
 
-    product = await create_product(database, payload.code, request_id=uuid4())
+    product = await create_product(
+        database,
+        payload.code,
+        payload.name,
+        actor_id=admin.id,
+        request_id=uuid4(),
+    )
     qrcode_status = "ready"
     try:
         result = await _generate_with_audit(database, qrcode_service, product)
@@ -152,6 +212,7 @@ async def create_product_endpoint(
     return ProductCreateResponse(
         id=product.id,
         code=product.code,
+        name=product.name or payload.name.strip(),
         public_token=product.public_token,
         status=product.status,
         current_version_id=product.current_version_id,
@@ -159,6 +220,47 @@ async def create_product_endpoint(
         qrcode_url=f"/api/products/{product.id}/qrcode",
         qrcode_status=qrcode_status,
     )
+
+
+@router.get("", response_model=list[ProductListItemResponse])
+async def list_products_endpoint(
+    database: Annotated[Database, Depends(get_database)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    q: Annotated[str | None, Query(max_length=120)] = None,
+    pdf_status: Annotated[ProductPDFStatus | None, Query()] = None,
+) -> list[ProductListItemResponse]:
+    """Return a database-filtered page of persisted products for the admin index."""
+
+    products = await list_products(
+        database,
+        limit=limit,
+        offset=offset,
+        q=q,
+        pdf_status=pdf_status,
+    )
+    return [
+        ProductListItemResponse(
+            id=product.id,
+            code=product.code,
+            name=product.name,
+            pdf_status=_pdf_status(product),
+            updated_at=_required_timestamp(product.updated_at),
+        )
+        for product in products
+    ]
+
+
+@router.get("/{product_id}", response_model=ProductDetailResponse)
+async def get_product_endpoint(
+    product_id: int,
+    database: Annotated[Database, Depends(get_database)],
+    qrcode_service: Annotated[QRCodeService, Depends(get_qrcode_service)],
+) -> ProductDetailResponse:
+    """Return persisted detail state so admin pages survive reloads."""
+
+    product = await get_product(database, product_id)
+    return _detail_response(product, qrcode_service)
 
 
 @router.get("/{product_id}/qrcode")
@@ -204,12 +306,12 @@ async def retry_qrcode(
 )
 async def upload_pdf_endpoint(
     product_id: int,
-    actor_id: Annotated[int, Form(gt=0)],
     file: Annotated[UploadFile, File()],
+    admin: Annotated[AuthenticatedAdmin, Depends(get_current_admin)],
     database: Annotated[Database, Depends(get_database)],
     storage: Annotated[StorageService, Depends(get_storage_service)],
 ) -> PDFUploadResponse:
-    """Validate outside the lock, then serialize current-version mutation."""
+    """Use the authenticated administrator while serializing the version mutation."""
 
     request_id = uuid4()
     try:
@@ -218,7 +320,7 @@ async def upload_pdf_endpoint(
         await record_upload_rejection(
             database,
             product_id=product_id,
-            actor_id=actor_id,
+            actor_id=admin.id,
             reason=error.code,
             stage=error.stage,
             request_id=request_id,
@@ -228,7 +330,7 @@ async def upload_pdf_endpoint(
         database,
         storage,
         product_id=product_id,
-        actor_id=actor_id,
+        actor_id=admin.id,
         upload=validated,
         request_id=request_id,
     )
