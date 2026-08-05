@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import cast
 from uuid import UUID
 
@@ -33,6 +34,29 @@ class PDFVersion:
     size_bytes: int
     storage_path: str
     original_filename: str
+
+
+@dataclass(frozen=True, slots=True)
+class PDFVersionHistoryItem:
+    """One immutable version shown in the authenticated product history."""
+
+    id: int
+    product_id: int
+    version_no: int
+    original_filename: str
+    uploaded_by: int
+    uploaded_by_username: str
+    uploaded_at: datetime
+    is_current: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RestoredPDFVersion:
+    """The new product pointer after restoring an existing immutable version."""
+
+    product_id: int
+    version_id: int
+    version_no: int
 
 
 class DuplicateCurrentPDF(AppError):
@@ -105,6 +129,145 @@ async def record_upload_rejection(
             request_id=request_id,
             detail={"reason": reason, "stage": stage},
         ),
+    )
+
+
+async def list_pdf_versions(
+    database: Database,
+    product_id: int,
+) -> list[PDFVersionHistoryItem]:
+    """Return all immutable versions and mark the product's current pointer."""
+
+    async with database.connection() as connection:
+        product_cursor = await connection.execute(
+            "SELECT current_version_id FROM products WHERE id = %s",
+            (product_id,),
+        )
+        product_row = await product_cursor.fetchone()
+        if product_row is None:
+            raise AppError("product_not_found", "产品不存在。", 404)
+        cursor = await connection.execute(
+            """
+            SELECT
+                v.id,
+                v.product_id,
+                v.version_no,
+                v.original_filename,
+                v.uploaded_by,
+                a.username AS uploaded_by_username,
+                v.uploaded_at,
+                (v.id = p.current_version_id) AS is_current
+            FROM pdf_versions AS v
+            JOIN products AS p ON p.id = v.product_id
+            JOIN admins AS a ON a.id = v.uploaded_by
+            WHERE v.product_id = %s
+            ORDER BY v.version_no DESC
+            """,
+            (product_id,),
+        )
+        rows = await cursor.fetchall()
+    return [
+        PDFVersionHistoryItem(
+            id=cast(int, row["id"]),
+            product_id=cast(int, row["product_id"]),
+            version_no=cast(int, row["version_no"]),
+            original_filename=str(row["original_filename"]),
+            uploaded_by=cast(int, row["uploaded_by"]),
+            uploaded_by_username=str(row["uploaded_by_username"]),
+            uploaded_at=cast(datetime, row["uploaded_at"]),
+            is_current=bool(row["is_current"]),
+        )
+        for row in rows
+    ]
+
+
+async def restore_pdf_version(
+    database: Database,
+    *,
+    product_id: int,
+    version_id: int,
+    actor_id: int,
+    request_id: UUID | None = None,
+) -> RestoredPDFVersion:
+    """Move only the current-version pointer to an existing version of this product."""
+
+    async with database.connection() as connection:
+        async with connection.transaction():
+            product_cursor = await connection.execute(
+                """
+                SELECT id, code, current_version_id
+                FROM products
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (product_id,),
+            )
+            product_row = await product_cursor.fetchone()
+            if product_row is None:
+                raise AppError("product_not_found", "产品不存在。", 404)
+
+            version_cursor = await connection.execute(
+                """
+                SELECT
+                    target.id,
+                    target.version_no,
+                    (
+                        SELECT current.version_no
+                        FROM pdf_versions AS current
+                        WHERE current.product_id = %s
+                          AND current.id = %s
+                    ) AS from_version_no
+                FROM pdf_versions AS target
+                WHERE target.product_id = %s AND target.id = %s
+                """,
+                (
+                    product_id,
+                    product_row["current_version_id"],
+                    product_id,
+                    version_id,
+                ),
+            )
+            version_row = await version_cursor.fetchone()
+            if version_row is None:
+                raise AppError(
+                    "version_not_found_for_product",
+                    "指定版本不存在或不属于该产品。",
+                    404,
+                )
+            if version_row["from_version_no"] is None:
+                raise RuntimeError("Current version pointer cannot be resolved")
+
+            await connection.execute(
+                """
+                UPDATE products
+                SET current_version_id = %s, updated_at = now()
+                WHERE id = %s
+                """,
+                (version_id, product_id),
+            )
+            version_no = cast(int, version_row["version_no"])
+            from_version_no = cast(int, version_row["from_version_no"])
+            await append_event(
+                connection,
+                AuditEvent(
+                    action="version_restore",
+                    result="success",
+                    actor_type="admin",
+                    actor_id=actor_id,
+                    target_type="version",
+                    target_id=version_id,
+                    product_code=str(product_row["code"]),
+                    request_id=request_id,
+                    detail={
+                        "from_version_no": from_version_no,
+                        "to_version_no": version_no,
+                    },
+                ),
+            )
+    return RestoredPDFVersion(
+        product_id=product_id,
+        version_id=version_id,
+        version_no=version_no,
     )
 
 

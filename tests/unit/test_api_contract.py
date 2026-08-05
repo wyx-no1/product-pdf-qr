@@ -12,8 +12,10 @@ def test_business_loop_routes_are_present_and_out_of_scope_routes_absent() -> No
     assert "/api/products" in paths
     assert set(paths["/api/products"]) == {"get", "post"}
     assert "/api/products/{product_id}" in paths
-    assert set(paths["/api/products/{product_id}"]) == {"get"}
+    assert set(paths["/api/products/{product_id}"]) == {"get", "patch"}
     assert "/api/products/{product_id}/pdf" in paths
+    assert "/api/products/{product_id}/versions" in paths
+    assert "/api/products/{product_id}/versions/{version_id}/restore" in paths
     assert "/api/products/{product_id}/qrcode" in paths
     assert "/api/products/{product_id}/qrcode/retry" in paths
     assert "/api/storage/orphans" in paths
@@ -24,8 +26,24 @@ def test_business_loop_routes_are_present_and_out_of_scope_routes_absent() -> No
     assert "/login" not in serialized
     assert "/import" not in serialized
     assert "/delete" not in serialized
-    assert "/restore" not in serialized
     assert "/disable" not in serialized
+
+
+def test_lifecycle_and_version_contracts_are_explicit() -> None:
+    schema = create_app().openapi()
+    paths = schema["paths"]
+    status_operation = paths["/api/products/{product_id}"]["patch"]
+    history_operation = paths["/api/products/{product_id}/versions"]["get"]
+    restore_operation = paths["/api/products/{product_id}/versions/{version_id}/restore"]["post"]
+
+    status_reference = status_operation["requestBody"]["content"]["application/json"]["schema"][
+        "$ref"
+    ]
+    status_schema = schema["components"]["schemas"][status_reference.rsplit("/", 1)[-1]]
+    assert status_schema["required"] == ["status"]
+    assert set(status_schema["properties"]["status"]["enum"]) == {"active", "disabled"}
+    assert history_operation["responses"]["200"]["content"]["application/json"]
+    assert restore_operation["responses"]["200"]["content"]["application/json"]
 
 
 def test_product_create_and_read_contracts_include_persisted_name() -> None:

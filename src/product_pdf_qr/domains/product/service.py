@@ -23,6 +23,7 @@ PUBLIC_TOKEN_LENGTH = 26
 TOKEN_RETRY_LIMIT = 5
 PRODUCT_NAME_MAX_LENGTH = 120
 ProductPDFStatus = Literal["uploaded", "not_uploaded"]
+ProductStatus = Literal["active", "disabled"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,3 +247,80 @@ async def get_product(database: Database, product_id: int) -> Product:
     if row is None:
         raise AppError("product_not_found", "产品不存在。", 404)
     return _product_from_row(row)
+
+
+async def set_product_status(
+    database: Database,
+    product_id: int,
+    new_status: ProductStatus,
+    *,
+    actor_id: int,
+    request_id: UUID | None = None,
+) -> Product:
+    """Set the public-access status and audit an actual state transition atomically."""
+
+    async with database.connection() as connection:
+        async with connection.transaction():
+            cursor = await connection.execute(
+                """
+                SELECT
+                    id,
+                    code,
+                    name,
+                    public_token,
+                    status,
+                    current_version_id,
+                    created_at,
+                    updated_at
+                FROM products
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (product_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise AppError("product_not_found", "产品不存在。", 404)
+            previous_status = str(row["status"])
+            if previous_status == new_status:
+                return _product_from_row(row)
+
+            updated_cursor = await connection.execute(
+                """
+                UPDATE products
+                SET status = %s, updated_at = now()
+                WHERE id = %s
+                RETURNING
+                    id,
+                    code,
+                    name,
+                    public_token,
+                    status,
+                    current_version_id,
+                    created_at,
+                    updated_at
+                """,
+                (new_status, product_id),
+            )
+            updated_row = await updated_cursor.fetchone()
+            if updated_row is None:
+                raise RuntimeError("Product status update returned no row")
+            product = _product_from_row(updated_row)
+            await append_event(
+                connection,
+                AuditEvent(
+                    action="product_disable" if new_status == "disabled" else "product_enable",
+                    result="success",
+                    actor_type="admin",
+                    actor_id=actor_id,
+                    target_type="product",
+                    target_id=product.id,
+                    product_code=product.code,
+                    request_id=request_id,
+                    detail={
+                        "previous_status": previous_status,
+                        "status": new_status,
+                    },
+                ),
+            )
+    return product
