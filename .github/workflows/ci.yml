@@ -2,12 +2,20 @@ name: CI
 
 on:
   pull_request:
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
   push:
     branches:
       - main
 
 permissions:
   contents: read
+  checks: read
+  pull-requests: read
+  statuses: read
 
 jobs:
   quality:
@@ -103,3 +111,24 @@ jobs:
         run: docker compose logs
       - if: always()
         run: docker compose down --volumes
+
+  review-gate:
+    needs:
+      - quality
+      - database
+      - container
+    if: >-
+      always() &&
+      (github.event_name == 'pull_request' || github.event_name == 'pull_request_review')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run review integrity gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m scripts.ao review-gate --pr "${{ github.event.pull_request.number }}"
