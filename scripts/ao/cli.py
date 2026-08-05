@@ -15,6 +15,7 @@ from scripts.ao.evidence import EvidenceGenerator, verify_evidence_head
 from scripts.ao.git import GitRepository
 from scripts.ao.github import GhGitHubData
 from scripts.ao.models import EvidenceSkip
+from scripts.ao.review_gate import GhReviewGateData, evaluate_review_gate
 from scripts.ao.trust import compare_ci_definition
 from scripts.ao.workspace import (
     WorkspaceResolver,
@@ -55,6 +56,19 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.add_argument(
         "--trusted-ci-definition-hash",
         help="default-branch CI definition hash computed by the trusted publisher",
+    )
+
+    review_gate = commands.add_parser(
+        "review-gate",
+        help="verify CI and exact-SHA GitHub review coverage for every PR code commit",
+    )
+    review_gate.add_argument("--repo", type=Path, default=Path("."))
+    review_gate.add_argument("--pr", type=int, required=True)
+    review_gate.add_argument(
+        "--trusted-reviewer-id",
+        action="append",
+        type=int,
+        help="trusted GitHub numeric user ID; repeat to trust multiple reviewers",
     )
 
     verify_evidence = commands.add_parser(
@@ -116,6 +130,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _evidence(arguments)
         if arguments.command == "evidence-verify-head":
             return _evidence_verify_head(arguments)
+        if arguments.command == "review-gate":
+            return _review_gate(arguments)
         if arguments.command == "advisor-run":
             return _advisor_run(arguments)
         if arguments.command == "advisor-validate":
@@ -187,6 +203,23 @@ def _ci_verify_definition(arguments: argparse.Namespace) -> int:
     )
     _print_json(asdict(result))
     return 0
+
+
+def _review_gate(arguments: argparse.Namespace) -> int:
+    repository = GitRepository(arguments.repo)
+    github = GhReviewGateData(repository.remote_slug())
+    configured_ids = (
+        frozenset(arguments.trusted_reviewer_id)
+        if arguments.trusted_reviewer_id is not None
+        else None
+    )
+    result = evaluate_review_gate(
+        arguments.pr,
+        github,
+        trusted_reviewer_ids=configured_ids,
+    )
+    print(result.render())
+    return result.exit_code
 
 
 def _advisor_run(arguments: argparse.Namespace) -> int:

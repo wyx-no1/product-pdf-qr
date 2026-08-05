@@ -184,6 +184,50 @@ Generation uses `origin/<base>...<code-sha>` and excludes all of
 the repository's common Git directory at `ao/evidence-events.jsonl`, and does not
 enter review.
 
+## Review integrity gate
+
+The repository-side merge gate audits every commit in a pull request:
+
+```bash
+python -m scripts.ao review-gate --pr 123
+```
+
+A commit is metadata, and therefore exempt from CI and review, only when every
+changed path is below `docs/evidence/`. Every other commit must have successful
+`quality`, `database`, and `container` Checks (with Commit Statuses as a fallback)
+and at least one GitHub PR review whose `commit_id` exactly equals the commit SHA.
+The final code commit must have an approved verdict.
+
+AO submits reviews with GitHub state `COMMENTED`, so that state is not treated as a
+verdict. A verdict is accepted only from a configured trusted GitHub numeric user ID;
+the CI workflow pins that ID in its reviewed definition. When the command is run
+without `--trusted-reviewer-id`, it retrieves and trusts the repository owner's
+server-authenticated numeric ID. Review records retain GitHub's author ID, login,
+type, and author association for audit.
+
+The auditable verdict source is exactly one Markdown heading in a submitted,
+non-dismissed, trusted review body:
+
+```markdown
+## Review verdict: approved
+```
+
+or:
+
+```markdown
+## Review verdict: changes requested
+```
+
+When a commit has multiple trusted bodies with a valid heading, the latest submitted
+review is selected deterministically by `submitted_at` and then GitHub review ID.
+The parser first collects every `## Review verdict:` heading in a body and accepts
+only one complete known value. An absent, unknown, or ambiguous heading is a
+`REVIEW_GAP`; it is never inferred as approval. Exact-SHA trusted review activity
+that remains without a parseable verdict for more than 30 minutes is additionally
+reported as `STALLED`, without triggering a retry. The command exits `0` only for
+`PASS`, `2` for `REVIEW_GAP`, and `1` when required GitHub evidence cannot be
+retrieved or validated.
+
 ## Advisor workspace workflow
 
 The commit argument is intentionally absent. The resolver reads it only from the

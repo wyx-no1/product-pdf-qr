@@ -10,10 +10,18 @@ def test_pr_ci_is_read_only_and_does_not_persist_checkout_credentials() -> None:
 
     assert "permissions:\n  contents: read\n" in workflow
     assert "contents: write" not in workflow
-    assert "GH_TOKEN" not in workflow
+    assert workflow.count("GH_TOKEN: ${{ github.token }}") == 1
+    assert "checks: read" in workflow
+    assert "pull-requests: read" in workflow
+    assert "statuses: read" in workflow
     assert "python -m scripts.ao evidence" not in workflow
-    assert workflow.count("uses: actions/checkout@v4") == 3
-    assert workflow.count("persist-credentials: false") == 3
+    assert workflow.count("uses: actions/checkout@v4") == 4
+    assert workflow.count("persist-credentials: false") == 4
+    assert "pull_request_review:" in workflow
+    assert "review-gate:" in workflow
+    assert "python -m scripts.ao review-gate" in workflow
+    assert '--pr "${{ github.event.pull_request.number }}"' in workflow
+    assert "--trusted-reviewer-id 306825498" in workflow
 
 
 def test_trusted_publisher_never_executes_candidate_code_and_verifies_before_green() -> None:
