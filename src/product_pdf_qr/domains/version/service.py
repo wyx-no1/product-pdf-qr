@@ -208,11 +208,24 @@ async def restore_pdf_version(
 
             version_cursor = await connection.execute(
                 """
-                SELECT id, version_no
-                FROM pdf_versions
-                WHERE product_id = %s AND id = %s
+                SELECT
+                    target.id,
+                    target.version_no,
+                    (
+                        SELECT current.version_no
+                        FROM pdf_versions AS current
+                        WHERE current.product_id = %s
+                          AND current.id = %s
+                    ) AS from_version_no
+                FROM pdf_versions AS target
+                WHERE target.product_id = %s AND target.id = %s
                 """,
-                (product_id, version_id),
+                (
+                    product_id,
+                    product_row["current_version_id"],
+                    product_id,
+                    version_id,
+                ),
             )
             version_row = await version_cursor.fetchone()
             if version_row is None:
@@ -221,6 +234,8 @@ async def restore_pdf_version(
                     "指定版本不存在或不属于该产品。",
                     404,
                 )
+            if version_row["from_version_no"] is None:
+                raise RuntimeError("Current version pointer cannot be resolved")
 
             await connection.execute(
                 """
@@ -231,10 +246,11 @@ async def restore_pdf_version(
                 (version_id, product_id),
             )
             version_no = cast(int, version_row["version_no"])
+            from_version_no = cast(int, version_row["from_version_no"])
             await append_event(
                 connection,
                 AuditEvent(
-                    action="pdf_restore",
+                    action="version_restore",
                     result="success",
                     actor_type="admin",
                     actor_id=actor_id,
@@ -243,9 +259,8 @@ async def restore_pdf_version(
                     product_code=str(product_row["code"]),
                     request_id=request_id,
                     detail={
-                        "previous_version_id": product_row["current_version_id"],
-                        "restored_version_id": version_id,
-                        "version_no": version_no,
+                        "from_version_no": from_version_no,
+                        "to_version_no": version_no,
                     },
                 ),
             )

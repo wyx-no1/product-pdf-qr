@@ -385,7 +385,7 @@ async def test_version_history_marks_current_and_restore_only_moves_pointer() ->
     restore_connection = ScriptedConnection(
         [
             {"id": 5, "code": "A001", "current_version_id": 14},
-            {"id": 13, "version_no": 1},
+            {"id": 13, "version_no": 1, "from_version_no": 2},
             None,
             None,
         ]
@@ -405,12 +405,14 @@ async def test_version_history_marks_current_and_restore_only_moves_pointer() ->
     assert restored.version_id == 13
     assert restored.version_no == 1
     assert "FOR UPDATE" in restore_connection.queries[0]
-    assert restore_connection.parameters[1] == (5, 13)
+    assert restore_connection.parameters[1] == (5, 14, 5, 13)
     assert "UPDATE products" in restore_connection.queries[2]
     assert not any("INSERT INTO pdf_versions" in query for query in restore_connection.queries)
     assert not any("DELETE FROM pdf_versions" in query for query in restore_connection.queries)
     audit_parameters = cast(tuple[object, ...], restore_connection.parameters[3])
-    assert audit_parameters[:3] == ("admin", 9, "pdf_restore")
+    assert audit_parameters[:3] == ("admin", 9, "version_restore")
+    audit_detail = cast(Jsonb, audit_parameters[-1]).obj
+    assert audit_detail == {"from_version_no": 2, "to_version_no": 1}
 
 
 @pytest.mark.anyio

@@ -641,16 +641,24 @@ async def test_product_lifecycle_version_history_restore_and_access_controls(
                 assert uploaded_c.status_code == 201
                 assert "该产品资料已停用" in (await public_client.get(public_path)).text
 
+                enabled_after_disabled_upload = await client.patch(
+                    f"/api/products/{product_id}",
+                    json={"status": "active"},
+                )
+                assert enabled_after_disabled_upload.status_code == 200
+                assert enabled_after_disabled_upload.json()["status"] == "active"
+                assert (await public_client.get(public_path)).content == pdf_c
+
+                disabled_before_restore = await client.patch(
+                    f"/api/products/{product_id}",
+                    json={"status": "disabled"},
+                )
+                assert disabled_before_restore.status_code == 200
+
                 restored_b_while_disabled = await client.post(
                     f"/api/products/{product_id}/versions/{version_b_id}/restore"
                 )
                 assert restored_b_while_disabled.status_code == 200
-                assert "该产品资料已停用" in (await public_client.get(public_path)).text
-
-                restored_a_while_disabled = await client.post(
-                    f"/api/products/{product_id}/versions/{version_a_id}/restore"
-                )
-                assert restored_a_while_disabled.status_code == 200
                 assert "该产品资料已停用" in (await public_client.get(public_path)).text
 
                 enabled = await client.patch(
@@ -659,7 +667,7 @@ async def test_product_lifecycle_version_history_restore_and_access_controls(
                 )
                 assert enabled.status_code == 200
                 assert enabled.json()["status"] == "active"
-                assert (await public_client.get(public_path)).content == pdf_a
+                assert (await public_client.get(public_path)).content == pdf_b
 
                 final_history = await client.get(f"/api/products/{product_id}/versions")
                 assert final_history.status_code == 200
@@ -668,8 +676,8 @@ async def test_product_lifecycle_version_history_restore_and_access_controls(
                 current_version = next(
                     version for version in final_history.json() if version["is_current"]
                 )
-                assert current_version["id"] == version_a_id
-                assert current_version["original_filename"] == "version-a.pdf"
+                assert current_version["id"] == version_b_id
+                assert current_version["original_filename"] == "version-b.pdf"
 
                 empty_disabled_product = await create_product(
                     client,
@@ -747,9 +755,13 @@ async def test_product_lifecycle_version_history_restore_and_access_controls(
             ).fetchall()
             restore_audits = connection.execute(
                 """
-                SELECT actor_type, actor_id, detail->>'restored_version_id'
+                SELECT
+                    actor_type,
+                    actor_id,
+                    (detail->>'from_version_no')::integer,
+                    (detail->>'to_version_no')::integer
                 FROM audit_events
-                WHERE action = 'pdf_restore'
+                WHERE action = 'version_restore'
                   AND product_code = 'LIFECYCLE'
                 ORDER BY id
                 """
@@ -760,9 +772,13 @@ async def test_product_lifecycle_version_history_restore_and_access_controls(
             ("product_enable", "admin", auth.admin_id),
             ("product_disable", "admin", auth.admin_id),
             ("product_enable", "admin", auth.admin_id),
+            ("product_disable", "admin", auth.admin_id),
+            ("product_enable", "admin", auth.admin_id),
         ]
-        assert len(restore_audits) == 3
-        assert all(row[0:2] == ("admin", auth.admin_id) for row in restore_audits)
+        assert restore_audits == [
+            ("admin", auth.admin_id, 2, 1),
+            ("admin", auth.admin_id, 3, 2),
+        ]
     finally:
         get_settings.cache_clear()
 
