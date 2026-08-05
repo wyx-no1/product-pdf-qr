@@ -12,6 +12,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from product_pdf_qr.config import Settings, get_settings
 from product_pdf_qr.database import Database
+from product_pdf_qr.domains.audit import AuditEvent, append_independent_event
 from product_pdf_qr.domains.auth import (
     CSRF_HEADER_NAME,
     SESSION_COOKIE_NAME,
@@ -23,6 +24,7 @@ LOGIN_PATH = "/admin/login"
 CHANGE_PASSWORD_PATH = "/admin/change-password"
 LOGOUT_PATH = "/admin/logout"
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+PRODUCT_IMPORT_PATHS = frozenset({"/api/product-imports", "/admin/imports"})
 
 
 class AdminAuthenticationMiddleware(BaseHTTPMiddleware):
@@ -44,6 +46,17 @@ class AdminAuthenticationMiddleware(BaseHTTPMiddleware):
         if token is not None and database is not None:
             admin = await resolve_session(cast(Database, database), token)
         if admin is None:
+            if path in PRODUCT_IMPORT_PATHS and request.method == "POST" and database is not None:
+                await append_independent_event(
+                    cast(Database, database),
+                    AuditEvent(
+                        action="product_import",
+                        result="failure",
+                        actor_type="anonymous",
+                        target_type="product_batch",
+                        detail={"reason": "unauthenticated_rejection"},
+                    ),
+                )
             return self._redirect_without_session(request, settings)
 
         assert token is not None
@@ -63,6 +76,22 @@ class AdminAuthenticationMiddleware(BaseHTTPMiddleware):
                 csrf_token,
             )
         ):
+            if path in PRODUCT_IMPORT_PATHS:
+                candidate = request.headers.get(CSRF_HEADER_NAME)
+                await append_independent_event(
+                    cast(Database, database),
+                    AuditEvent(
+                        action="product_import",
+                        result="failure",
+                        actor_type="admin",
+                        actor_id=admin.id,
+                        target_type="product_batch",
+                        detail={
+                            "reason": "csrf_rejection",
+                            "actual": "missing" if candidate is None else "mismatch",
+                        },
+                    ),
+                )
             return JSONResponse(
                 status_code=403,
                 content={

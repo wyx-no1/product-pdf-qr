@@ -6,8 +6,9 @@ import hmac
 import math
 from pathlib import Path
 from typing import Annotated, cast
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
@@ -29,6 +30,7 @@ from product_pdf_qr.domains.auth import (
     create_authenticated_session,
     revoke_session,
 )
+from product_pdf_qr.domains.importer import ImportResult, ImportRowError, import_products
 from product_pdf_qr.errors import AppError
 
 router = APIRouter(prefix="/admin", include_in_schema=False)
@@ -307,6 +309,85 @@ async def admin_page(request: Request, product_id: int | None = None) -> HTMLRes
             "admin": admin,
             "csrf_token": cast(str, request.state.csrf_token),
         },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/imports", response_class=HTMLResponse)
+async def import_page(request: Request) -> HTMLResponse:
+    """Render the authenticated XLSX upload entry and result surface."""
+
+    admin = cast(AuthenticatedAdmin, request.state.admin)
+    response = templates.TemplateResponse(
+        request=request,
+        name="import.html",
+        context={
+            "admin": admin,
+            "csrf_token": cast(str, request.state.csrf_token),
+            "result": None,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/imports", response_class=HTMLResponse)
+async def submit_import_page(
+    request: Request,
+    file: Annotated[UploadFile, File()],
+    database: Annotated[Database, Depends(get_database)],
+    settings: Annotated[Settings, Depends(get_runtime_settings)],
+    csrf_token: Annotated[str | None, Form()] = None,
+) -> HTMLResponse:
+    """Validate CSRF, execute one import, and server-render every result entry."""
+
+    admin = cast(AuthenticatedAdmin, request.state.admin)
+    if not _valid_csrf_token(request, csrf_token):
+        await file.close()
+        await append_independent_event(
+            database,
+            AuditEvent(
+                action="product_import",
+                result="failure",
+                actor_type="admin",
+                actor_id=admin.id,
+                target_type="product_batch",
+                detail={"reason": "csrf_rejection", "actual": "missing_or_mismatch"},
+            ),
+        )
+        result = ImportResult(
+            success_count=0,
+            duplicate_count=0,
+            format_error_count=0,
+            errors=(
+                ImportRowError(
+                    row=None,
+                    reason="请求验证失败, 请刷新页面后重试。",
+                    kind="authentication",
+                ),
+            ),
+            status="failure",
+            error_code="invalid_csrf_token",
+            http_status=403,
+        )
+    else:
+        result = await import_products(
+            database,
+            file,
+            settings,
+            actor_id=admin.id,
+            request_id=uuid4(),
+        )
+    response = templates.TemplateResponse(
+        request=request,
+        name="import.html",
+        context={
+            "admin": admin,
+            "csrf_token": cast(str, request.state.csrf_token),
+            "result": result,
+        },
+        status_code=result.http_status,
     )
     response.headers["Cache-Control"] = "no-store"
     return response

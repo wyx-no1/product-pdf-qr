@@ -11,6 +11,11 @@ DEFAULT_PDF_VALIDATION_TIMEOUT_SECONDS = 5.0
 DEFAULT_PDF_VALIDATION_CPU_SECONDS = 3
 DEFAULT_PDF_VALIDATION_MEMORY_BYTES = 512 * 1024 * 1024
 DEFAULT_SESSION_TTL_SECONDS = 12 * 60 * 60
+DEFAULT_IMPORT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+DEFAULT_IMPORT_MAX_DECOMPRESSED_BYTES = 50 * 1024 * 1024
+DEFAULT_IMPORT_MAX_COMPRESSION_RATIO = 100.0
+DEFAULT_IMPORT_PARSE_TIMEOUT_SECONDS = 30.0
+DEFAULT_IMPORT_MAX_ROWS = 5_000
 
 
 class Settings(BaseSettings):
@@ -30,6 +35,20 @@ class Settings(BaseSettings):
     storage_root: Path = Path("storage/local")
     public_base_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:8000")
     max_pdf_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    import_max_upload_bytes: int = Field(default=DEFAULT_IMPORT_MAX_UPLOAD_BYTES, ge=1)
+    import_max_decompressed_bytes: int = Field(
+        default=DEFAULT_IMPORT_MAX_DECOMPRESSED_BYTES,
+        ge=1,
+    )
+    import_max_compression_ratio: float = Field(
+        default=DEFAULT_IMPORT_MAX_COMPRESSION_RATIO,
+        gt=0,
+    )
+    import_parse_timeout_seconds: float = Field(
+        default=DEFAULT_IMPORT_PARSE_TIMEOUT_SECONDS,
+        gt=0,
+    )
+    import_max_rows: int = Field(default=DEFAULT_IMPORT_MAX_ROWS, ge=1)
     pdf_validation_timeout_seconds: float = Field(
         default=DEFAULT_PDF_VALIDATION_TIMEOUT_SECONDS,
         gt=0,
