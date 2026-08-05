@@ -13,6 +13,20 @@ from scripts.ao.models import PullRequest
 REQUIRED_CI_JOBS = frozenset({"quality", "database", "container"})
 EVIDENCE_PREFIX = "docs/evidence/"
 STALL_THRESHOLD = timedelta(minutes=30)
+TERMINAL_CI_STATES = frozenset(
+    {
+        "action_required",
+        "cancelled",
+        "error",
+        "failure",
+        "neutral",
+        "skipped",
+        "stale",
+        "startup_failure",
+        "success",
+        "timed_out",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -431,9 +445,11 @@ def _latest_observations(
     for observation in observations:
         current = latest.get(observation.name)
         if current is None or (
+            observation.state in TERMINAL_CI_STATES,
             observation.observed_at,
             observation.observation_id,
         ) > (
+            current.state in TERMINAL_CI_STATES,
             current.observed_at,
             current.observation_id,
         ):

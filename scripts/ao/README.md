@@ -198,6 +198,12 @@ changed path is below `docs/evidence/`. Every other commit must have successful
 and at least one GitHub PR review whose `commit_id` exactly equals the commit SHA.
 The final code commit must have an approved verdict.
 
+When GitHub returns duplicate observations for one required job, the newest
+terminal observation is authoritative. A newer queued, pending, or running rerun
+cannot hide a completed result for the same immutable commit, while a newer
+terminal failure still supersedes an earlier success. If no terminal observation
+exists, the transient state remains a `REVIEW_GAP`.
+
 AO submits reviews with GitHub state `COMMENTED`, so that state is not treated as a
 verdict. A verdict is accepted only from a configured trusted GitHub numeric user ID;
 the CI workflow pins that ID in its reviewed definition. When the command is run

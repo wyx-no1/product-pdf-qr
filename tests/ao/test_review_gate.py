@@ -15,6 +15,7 @@ from scripts.ao.review_gate import (
     ReviewCommit,
     ReviewGateError,
     ReviewRecord,
+    _latest_observations,
     evaluate_review_gate,
 )
 
@@ -111,6 +112,50 @@ def test_code_commit_with_failed_ci_is_a_gap() -> None:
 
     assert result.status == "REVIEW_GAP"
     assert "required CI jobs not successful: quality=failure" in result.commits[0].gaps
+
+
+def test_newer_running_check_does_not_eclipse_completed_success() -> None:
+    observations = (
+        _ci_observation("success", observed_at=NOW, observation_id=1),
+        _ci_observation(
+            "in_progress",
+            observed_at=datetime(2026, 8, 5, 12, 1, tzinfo=UTC),
+            observation_id=2,
+        ),
+    )
+
+    selected = _latest_observations(observations)
+
+    assert selected["quality"].state == "success"
+
+
+def test_newer_completed_failure_supersedes_completed_success() -> None:
+    observations = (
+        _ci_observation("success", observed_at=NOW, observation_id=1),
+        _ci_observation(
+            "failure",
+            observed_at=datetime(2026, 8, 5, 12, 1, tzinfo=UTC),
+            observation_id=2,
+        ),
+    )
+
+    selected = _latest_observations(observations)
+
+    assert selected["quality"].state == "failure"
+
+
+def test_running_check_remains_a_gap_without_completed_observation() -> None:
+    selected = _latest_observations(
+        (
+            _ci_observation(
+                "in_progress",
+                observed_at=datetime(2026, 8, 5, 12, 1, tzinfo=UTC),
+                observation_id=2,
+            ),
+        )
+    )
+
+    assert selected["quality"].state == "in_progress"
 
 
 def test_metadata_only_commit_is_exempt_from_ci_and_review() -> None:
@@ -348,4 +393,19 @@ def _review(
         author_login="trusted-reviewer" if author_id == TRUSTED_REVIEWER_ID else "attacker",
         author_type="User",
         author_association="OWNER" if author_id == TRUSTED_REVIEWER_ID else "NONE",
+    )
+
+
+def _ci_observation(
+    state: str,
+    *,
+    observed_at: datetime,
+    observation_id: int,
+) -> CIObservation:
+    return CIObservation(
+        name="quality",
+        state=state,
+        source="check",
+        observed_at=observed_at,
+        observation_id=observation_id,
     )
