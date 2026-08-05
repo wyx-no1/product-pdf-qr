@@ -185,44 +185,6 @@ def oversized_multipart_body() -> bytes:
     )
 
 
-async def simulate_locked_restore(
-    runtime_url: str,
-    product_id: int,
-    version_id: int,
-) -> None:
-    """Model the Phase 2 restore writer without exposing a management endpoint."""
-
-    async with await psycopg.AsyncConnection.connect(runtime_url) as connection:
-        async with connection.transaction():
-            locked = await connection.execute(
-                """
-                SELECT id
-                FROM products
-                WHERE id = %s
-                FOR UPDATE
-                """,
-                (product_id,),
-            )
-            assert await locked.fetchone() == (product_id,)
-            target = await connection.execute(
-                """
-                SELECT id
-                FROM pdf_versions
-                WHERE product_id = %s AND id = %s
-                """,
-                (product_id, version_id),
-            )
-            assert await target.fetchone() == (version_id,)
-            await connection.execute(
-                """
-                UPDATE products
-                SET current_version_id = %s, updated_at = now()
-                WHERE id = %s
-                """,
-                (version_id, product_id),
-            )
-
-
 @pytest.mark.e2e
 async def test_login_force_change_session_revocation_and_logout(
     clean_business_database: AuthContext,
@@ -550,6 +512,257 @@ async def test_product_list_database_search_filter_and_filtered_pagination(
                 denied = await anonymous.get("/api/products", params={"q": "v1-acc"})
                 assert denied.status_code == 303
                 assert denied.headers["location"].startswith("/admin/login")
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.e2e
+async def test_product_lifecycle_version_history_restore_and_access_controls(
+    clean_business_database: AuthContext,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cover the required create → A → B → restore A → disable → enable mainline."""
+
+    auth = clean_business_database
+    runtime_url = required_environment("TEST_DATABASE_URL")
+    monkeypatch.setenv("DATABASE_URL", runtime_url)
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path))
+    monkeypatch.setenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
+    get_settings.cache_clear()
+    app = create_app()
+    pdf_a = synthetic_pdf(81)
+    pdf_b = synthetic_pdf(162)
+    pdf_c = synthetic_pdf(243)
+
+    try:
+        async with lifespan(app):
+            transport = httpx.ASGITransport(app=app)
+            async with (
+                httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://test",
+                    cookies={SESSION_COOKIE_NAME: auth.session_token},
+                    headers={CSRF_HEADER_NAME: auth.csrf_token},
+                ) as client,
+                httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://test",
+                    cookies={SESSION_COOKIE_NAME: auth.session_token},
+                ) as client_without_csrf,
+                httpx.AsyncClient(transport=transport, base_url="http://test") as public_client,
+            ):
+                created = await create_product(client, "LIFECYCLE", "生命周期产品")
+                product_id = cast(int, created["id"])
+                public_token = str(created["public_token"])
+                public_path = f"/p/{public_token}"
+
+                empty = await public_client.get(public_path)
+                assert empty.status_code == 200
+                assert "资料暂未上传" in empty.text
+
+                uploaded_a = await upload(client, product_id, pdf_a, "version-a.pdf")
+                assert uploaded_a.status_code == 201
+                version_a_id = cast(int, uploaded_a.json()["version_id"])
+                assert (await public_client.get(public_path)).content == pdf_a
+
+                uploaded_b = await upload(client, product_id, pdf_b, "version-b.pdf")
+                assert uploaded_b.status_code == 201
+                version_b_id = cast(int, uploaded_b.json()["version_id"])
+                assert (await public_client.get(public_path)).content == pdf_b
+
+                history_before_restore = await client.get(f"/api/products/{product_id}/versions")
+                assert history_before_restore.status_code == 200
+                assert [version["version_no"] for version in history_before_restore.json()] == [
+                    2,
+                    1,
+                ]
+                assert history_before_restore.json()[0]["is_current"] is True
+                assert history_before_restore.json()[1]["is_current"] is False
+                assert {
+                    "id",
+                    "version_no",
+                    "original_filename",
+                    "uploaded_at",
+                    "uploaded_by",
+                    "uploaded_by_username",
+                    "is_current",
+                } == set(history_before_restore.json()[0])
+
+                with psycopg.connect(runtime_url) as connection:
+                    version_count_before_restore = connection.execute(
+                        "SELECT count(*) FROM pdf_versions WHERE product_id = %s",
+                        (product_id,),
+                    ).fetchone()
+
+                restored_a = await client.post(
+                    f"/api/products/{product_id}/versions/{version_a_id}/restore"
+                )
+                assert restored_a.status_code == 200
+                assert restored_a.json()["current_version_id"] == version_a_id
+                assert restored_a.json()["version_no"] == 1
+                assert (await public_client.get(public_path)).content == pdf_a
+
+                with psycopg.connect(runtime_url) as connection:
+                    version_count_after_restore = connection.execute(
+                        "SELECT count(*) FROM pdf_versions WHERE product_id = %s",
+                        (product_id,),
+                    ).fetchone()
+                assert version_count_before_restore == version_count_after_restore == (2,)
+
+                disabled = await client.patch(
+                    f"/api/products/{product_id}",
+                    json={"status": "disabled"},
+                )
+                assert disabled.status_code == 200
+                assert disabled.json()["status"] == "disabled"
+                public_disabled = await public_client.get(public_path)
+                assert "该产品资料已停用" in public_disabled.text
+                assert "资料暂未上传" not in public_disabled.text
+
+                enabled_mainline = await client.patch(
+                    f"/api/products/{product_id}",
+                    json={"status": "active"},
+                )
+                assert enabled_mainline.status_code == 200
+                assert enabled_mainline.json()["status"] == "active"
+                assert (await public_client.get(public_path)).content == pdf_a
+
+                disabled_again = await client.patch(
+                    f"/api/products/{product_id}",
+                    json={"status": "disabled"},
+                )
+                assert disabled_again.status_code == 200
+
+                history_while_disabled = await client.get(f"/api/products/{product_id}/versions")
+                assert history_while_disabled.status_code == 200
+
+                uploaded_c = await upload(client, product_id, pdf_c, "version-c.pdf")
+                assert uploaded_c.status_code == 201
+                assert "该产品资料已停用" in (await public_client.get(public_path)).text
+
+                restored_b_while_disabled = await client.post(
+                    f"/api/products/{product_id}/versions/{version_b_id}/restore"
+                )
+                assert restored_b_while_disabled.status_code == 200
+                assert "该产品资料已停用" in (await public_client.get(public_path)).text
+
+                restored_a_while_disabled = await client.post(
+                    f"/api/products/{product_id}/versions/{version_a_id}/restore"
+                )
+                assert restored_a_while_disabled.status_code == 200
+                assert "该产品资料已停用" in (await public_client.get(public_path)).text
+
+                enabled = await client.patch(
+                    f"/api/products/{product_id}",
+                    json={"status": "active"},
+                )
+                assert enabled.status_code == 200
+                assert enabled.json()["status"] == "active"
+                assert (await public_client.get(public_path)).content == pdf_a
+
+                final_history = await client.get(f"/api/products/{product_id}/versions")
+                assert final_history.status_code == 200
+                assert len(final_history.json()) == 3
+                assert sum(version["is_current"] for version in final_history.json()) == 1
+                current_version = next(
+                    version for version in final_history.json() if version["is_current"]
+                )
+                assert current_version["id"] == version_a_id
+                assert current_version["original_filename"] == "version-a.pdf"
+
+                empty_disabled_product = await create_product(
+                    client,
+                    "EMPTY-DISABLED",
+                    "无 PDF 停用产品",
+                )
+                empty_disabled_id = cast(int, empty_disabled_product["id"])
+                empty_disabled_token = str(empty_disabled_product["public_token"])
+                assert (
+                    await client.patch(
+                        f"/api/products/{empty_disabled_id}",
+                        json={"status": "disabled"},
+                    )
+                ).status_code == 200
+                empty_disabled_public = await public_client.get(f"/p/{empty_disabled_token}")
+                assert "该产品资料已停用" in empty_disabled_public.text
+                assert "资料暂未上传" not in empty_disabled_public.text
+
+                other = await create_product(client, "OTHER-LIFECYCLE", "其他产品")
+                other_id = cast(int, other["id"])
+                other_upload = await upload(
+                    client,
+                    other_id,
+                    synthetic_pdf(324),
+                    "other.pdf",
+                )
+                assert other_upload.status_code == 201
+                other_version_id = cast(int, other_upload.json()["version_id"])
+                wrong_product = await client.post(
+                    f"/api/products/{product_id}/versions/{other_version_id}/restore"
+                )
+                assert wrong_product.status_code == 404
+                assert wrong_product.json()["error"]["code"] == ("version_not_found_for_product")
+                assert "不属于该产品" in wrong_product.json()["error"]["message"]
+
+                assert (
+                    await public_client.get(f"/api/products/{product_id}/versions")
+                ).status_code == 303
+                assert (
+                    await public_client.patch(
+                        f"/api/products/{product_id}",
+                        json={"status": "disabled"},
+                    )
+                ).status_code == 303
+                assert (
+                    await public_client.post(
+                        f"/api/products/{product_id}/versions/{version_a_id}/restore"
+                    )
+                ).status_code == 303
+
+                missing_csrf_status = await client_without_csrf.patch(
+                    f"/api/products/{product_id}",
+                    json={"status": "disabled"},
+                )
+                missing_csrf_restore = await client_without_csrf.post(
+                    f"/api/products/{product_id}/versions/{version_a_id}/restore"
+                )
+                assert missing_csrf_status.status_code == missing_csrf_restore.status_code == 403
+                assert missing_csrf_status.json()["error"]["code"] == "invalid_csrf_token"
+
+        with psycopg.connect(runtime_url) as connection:
+            final_version_count = connection.execute(
+                "SELECT count(*) FROM pdf_versions WHERE product_id = %s",
+                (product_id,),
+            ).fetchone()
+            lifecycle_audits = connection.execute(
+                """
+                SELECT action, actor_type, actor_id
+                FROM audit_events
+                WHERE target_id = %s
+                  AND action IN ('product_disable', 'product_enable')
+                ORDER BY id
+                """,
+                (product_id,),
+            ).fetchall()
+            restore_audits = connection.execute(
+                """
+                SELECT actor_type, actor_id, detail->>'restored_version_id'
+                FROM audit_events
+                WHERE action = 'pdf_restore'
+                  AND product_code = 'LIFECYCLE'
+                ORDER BY id
+                """
+            ).fetchall()
+        assert final_version_count == (3,)
+        assert lifecycle_audits == [
+            ("product_disable", "admin", auth.admin_id),
+            ("product_enable", "admin", auth.admin_id),
+            ("product_disable", "admin", auth.admin_id),
+            ("product_enable", "admin", auth.admin_id),
+        ]
+        assert len(restore_audits) == 3
+        assert all(row[0:2] == ("admin", auth.admin_id) for row in restore_audits)
     finally:
         get_settings.cache_clear()
 
@@ -943,10 +1156,8 @@ async def test_concurrent_identical_uploads_create_only_one_version(
                         synthetic_pdf(700),
                         "restore-v3.pdf",
                     ),
-                    simulate_locked_restore(
-                        runtime_url,
-                        restore_product_id,
-                        restore_v1_id,
+                    client.post(
+                        f"/api/products/{restore_product_id}/versions/{restore_v1_id}/restore"
                     ),
                 )
                 assert restore_v3.status_code == 201

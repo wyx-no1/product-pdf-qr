@@ -22,13 +22,20 @@ from product_pdf_qr.domains.product.service import (
     PRODUCT_NAME_MAX_LENGTH,
     Product,
     ProductPDFStatus,
+    ProductStatus,
     create_product,
     get_product,
     list_products,
+    set_product_status,
 )
 from product_pdf_qr.domains.qrcode import QRCodeGenerationError, QRCodeResult, QRCodeService
 from product_pdf_qr.domains.storage import StorageService, UploadRejected
-from product_pdf_qr.domains.version import record_upload_rejection, upload_pdf
+from product_pdf_qr.domains.version import (
+    list_pdf_versions,
+    record_upload_rejection,
+    restore_pdf_version,
+    upload_pdf,
+)
 
 router = APIRouter(prefix="/api/products", tags=["products"])
 
@@ -79,6 +86,41 @@ class ProductDetailResponse(BaseModel):
     current_version_id: int | None
     created_at: datetime
     updated_at: datetime
+
+
+class ProductStatusUpdateRequest(BaseModel):
+    """The only two lifecycle states accepted by the product model."""
+
+    status: ProductStatus
+
+
+class ProductStatusUpdateResponse(BaseModel):
+    """Persisted state after a disable or enable operation."""
+
+    id: int
+    status: ProductStatus
+    current_version_id: int | None
+    updated_at: datetime
+
+
+class PDFVersionHistoryResponse(BaseModel):
+    """One immutable entry in a product's complete PDF history."""
+
+    id: int
+    version_no: int
+    original_filename: str
+    uploaded_at: datetime
+    uploaded_by: int
+    uploaded_by_username: str
+    is_current: bool
+
+
+class PDFRestoreResponse(BaseModel):
+    """The product pointer after restoring an existing version."""
+
+    product_id: int
+    current_version_id: int
+    version_no: int
 
 
 class PDFUploadResponse(BaseModel):
@@ -261,6 +303,79 @@ async def get_product_endpoint(
 
     product = await get_product(database, product_id)
     return _detail_response(product, qrcode_service)
+
+
+@router.patch("/{product_id}", response_model=ProductStatusUpdateResponse)
+async def update_product_status_endpoint(
+    product_id: int,
+    payload: ProductStatusUpdateRequest,
+    admin: Annotated[AuthenticatedAdmin, Depends(get_current_admin)],
+    database: Annotated[Database, Depends(get_database)],
+) -> ProductStatusUpdateResponse:
+    """Disable or enable public access without restricting management operations."""
+
+    product = await set_product_status(
+        database,
+        product_id,
+        payload.status,
+        actor_id=admin.id,
+        request_id=uuid4(),
+    )
+    return ProductStatusUpdateResponse(
+        id=product.id,
+        status=payload.status,
+        current_version_id=product.current_version_id,
+        updated_at=_required_timestamp(product.updated_at),
+    )
+
+
+@router.get("/{product_id}/versions", response_model=list[PDFVersionHistoryResponse])
+async def list_pdf_versions_endpoint(
+    product_id: int,
+    _admin: Annotated[AuthenticatedAdmin, Depends(get_current_admin)],
+    database: Annotated[Database, Depends(get_database)],
+) -> list[PDFVersionHistoryResponse]:
+    """List every immutable PDF version for the authenticated administrator."""
+
+    versions = await list_pdf_versions(database, product_id)
+    return [
+        PDFVersionHistoryResponse(
+            id=version.id,
+            version_no=version.version_no,
+            original_filename=version.original_filename,
+            uploaded_at=version.uploaded_at,
+            uploaded_by=version.uploaded_by,
+            uploaded_by_username=version.uploaded_by_username,
+            is_current=version.is_current,
+        )
+        for version in versions
+    ]
+
+
+@router.post(
+    "/{product_id}/versions/{version_id}/restore",
+    response_model=PDFRestoreResponse,
+)
+async def restore_pdf_version_endpoint(
+    product_id: int,
+    version_id: int,
+    admin: Annotated[AuthenticatedAdmin, Depends(get_current_admin)],
+    database: Annotated[Database, Depends(get_database)],
+) -> PDFRestoreResponse:
+    """Restore by moving the product pointer; immutable version rows stay untouched."""
+
+    restored = await restore_pdf_version(
+        database,
+        product_id=product_id,
+        version_id=version_id,
+        actor_id=admin.id,
+        request_id=uuid4(),
+    )
+    return PDFRestoreResponse(
+        product_id=restored.product_id,
+        current_version_id=restored.version_id,
+        version_no=restored.version_no,
+    )
 
 
 @router.get("/{product_id}/qrcode")

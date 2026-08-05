@@ -196,6 +196,15 @@
       background: #dbe5ff;
     }
 
+    .danger-button {
+      color: #fff;
+      background: #b42318;
+    }
+
+    .danger-button:hover {
+      background: #8f1c13;
+    }
+
     .pagination {
       justify-content: flex-end;
       margin-top: 1rem;
@@ -276,6 +285,11 @@
       background: #fff4cd;
     }
 
+    .status[data-state="disabled"] {
+      color: #8f1c13;
+      background: #fee4e2;
+    }
+
     .empty-state {
       margin: 0;
       padding: 1.5rem;
@@ -314,6 +328,23 @@
       border: 1px solid #d9e0ea;
       border-radius: 0.65rem;
       background: #fafbfd;
+    }
+
+    .lifecycle-panel {
+      margin-bottom: 1.5rem;
+    }
+
+    .history-card {
+      margin-top: 1.5rem;
+    }
+
+    .history-card .table-wrap {
+      background: #fff;
+    }
+
+    .history-card button {
+      min-height: 38px;
+      padding: 0.5rem 0.8rem;
     }
 
     .qrcode {
@@ -486,7 +517,7 @@
           <dt>Public Token</dt>
           <dd><code id="detail-token"></code></dd>
           <dt>产品状态</dt>
-          <dd id="detail-status"></dd>
+          <dd><span id="detail-status" class="status"></span></dd>
           <dt>PDF 状态</dt>
           <dd id="detail-pdf-status"></dd>
           <dt>当前版本 ID</dt>
@@ -500,6 +531,17 @@
           <dt>公开访问地址</dt>
           <dd><a id="detail-public-url" target="_blank" rel="noopener noreferrer"></a></dd>
         </dl>
+
+        <section class="subcard lifecycle-panel" aria-labelledby="lifecycle-heading">
+          <div class="section-heading">
+            <div>
+              <h3 id="lifecycle-heading">公开访问状态</h3>
+              <p id="lifecycle-hint" class="hint"></p>
+            </div>
+            <button id="status-toggle-button" type="button"></button>
+          </div>
+          <p id="lifecycle-feedback" class="feedback" role="status" aria-live="polite"></p>
+        </section>
 
         <div class="detail-grid">
           <section class="subcard" aria-labelledby="upload-heading">
@@ -529,6 +571,32 @@
           </section>
         </div>
 
+        <section class="subcard history-card" aria-labelledby="history-heading">
+          <div class="section-heading">
+            <div>
+              <h3 id="history-heading">PDF 历史版本</h3>
+              <p class="hint">历史版本永久保留；恢复只会切换当前版本，不会复制或删除文件。</p>
+            </div>
+            <button id="reload-versions" class="secondary-button" type="button">刷新版本</button>
+          </div>
+          <p id="history-feedback" class="feedback" role="status" aria-live="polite"></p>
+          <p id="empty-history" class="empty-state" hidden>尚未上传 PDF。</p>
+          <div id="version-table" class="table-wrap" hidden>
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">版本</th>
+                  <th scope="col">原始文件名</th>
+                  <th scope="col">上传时间</th>
+                  <th scope="col">上传者</th>
+                  <th scope="col">状态 / 操作</th>
+                </tr>
+              </thead>
+              <tbody id="version-rows"></tbody>
+            </table>
+          </div>
+        </section>
+
         <a class="secondary-link" href="/admin" data-action="back-to-list">返回产品列表</a>
       </div>
     </section>
@@ -544,6 +612,7 @@
       let listOffset = 0;
       let listHasNext = false;
       let listRequestSequence = 0;
+      let versionsRequestSequence = 0;
 
       const indexView = document.querySelector("#index-view");
       const detailView = document.querySelector("#detail-view");
@@ -559,6 +628,13 @@
       const createFeedback = document.querySelector("#create-feedback");
       const listFeedback = document.querySelector("#list-feedback");
       const uploadFeedback = document.querySelector("#upload-feedback");
+      const lifecycleFeedback = document.querySelector("#lifecycle-feedback");
+      const lifecycleHint = document.querySelector("#lifecycle-hint");
+      const statusToggleButton = document.querySelector("#status-toggle-button");
+      const historyFeedback = document.querySelector("#history-feedback");
+      const emptyHistory = document.querySelector("#empty-history");
+      const versionTable = document.querySelector("#version-table");
+      const versionRows = document.querySelector("#version-rows");
       const qrcodeFeedback = document.querySelector("#qrcode-feedback");
       const qrcodeImage = document.querySelector("#qrcode-image");
       const emptyList = document.querySelector("#empty-list");
@@ -626,6 +702,10 @@
         return status === "uploaded" ? "已上传" : "未上传";
       }
 
+      function productStatusLabel(status) {
+        return status === "disabled" ? "已停用" : "已启用";
+      }
+
       function parseProductId() {
         const match = window.location.pathname.match(/^\/admin\/products\/(\d+)\/?$/);
         return match ? Number(match[1]) : null;
@@ -648,7 +728,11 @@
         qrcodeImage.hidden = true;
         qrcodeImage.removeAttribute("src");
         setFeedback(uploadFeedback, "");
+        setFeedback(lifecycleFeedback, "");
+        setFeedback(historyFeedback, "");
         setFeedback(qrcodeFeedback, "");
+        emptyHistory.hidden = true;
+        versionTable.hidden = true;
         document.title = "加载产品详情 · 产品 PDF 管理";
       }
 
@@ -662,7 +746,9 @@
         document.querySelector("#detail-code").textContent = product.code;
         document.querySelector("#detail-name").textContent = productName(product);
         document.querySelector("#detail-token").textContent = product.public_token;
-        document.querySelector("#detail-status").textContent = product.status;
+        const detailStatus = document.querySelector("#detail-status");
+        detailStatus.textContent = productStatusLabel(product.status);
+        detailStatus.dataset.state = product.status === "disabled" ? "disabled" : "ready";
         document.querySelector("#detail-pdf-status").textContent =
           pdfStatusLabel(product.pdf_status);
         document.querySelector("#detail-version").textContent =
@@ -677,6 +763,14 @@
         const publicUrl = document.querySelector("#detail-public-url");
         publicUrl.textContent = product.public_url;
         publicUrl.href = product.public_url;
+
+        const isDisabled = product.status === "disabled";
+        statusToggleButton.textContent = isDisabled ? "重新启用" : "停用公开访问";
+        statusToggleButton.classList.toggle("danger-button", !isDisabled);
+        statusToggleButton.classList.toggle("secondary-button", isDisabled);
+        lifecycleHint.textContent = isDisabled
+          ? "客户扫码始终显示停用提示；管理员仍可上传和恢复版本。"
+          : "客户扫码将按当前版本状态打开 PDF 或显示未上传提示。";
 
         qrcodeImage.hidden = false;
         qrcodeImage.src = product.qrcode_url;
@@ -703,7 +797,9 @@
           if (!response.ok) {
             throw new Error(await apiErrorMessage(response));
           }
-          renderProduct(await response.json());
+          const product = await response.json();
+          renderProduct(product);
+          await loadVersions(productId);
         } catch (error) {
           const message = error instanceof Error ? error.message : "产品详情加载失败。";
           showMissingProduct(`${message} 请稍后重试或返回产品列表。`);
@@ -715,6 +811,66 @@
         cell.textContent = value;
         row.append(cell);
         return cell;
+      }
+
+      function renderVersions(versions) {
+        versionRows.replaceChildren();
+        emptyHistory.hidden = versions.length !== 0;
+        versionTable.hidden = versions.length === 0;
+
+        for (const version of versions) {
+          const row = document.createElement("tr");
+          appendTextCell(row, `第 ${version.version_no} 版`);
+          appendTextCell(row, version.original_filename);
+          appendTextCell(row, formatDate(version.uploaded_at));
+          appendTextCell(
+            row,
+            `${version.uploaded_by_username}（ID ${version.uploaded_by}）`,
+          );
+
+          const actionCell = appendTextCell(row, "");
+          if (version.is_current) {
+            const current = document.createElement("span");
+            current.className = "status";
+            current.dataset.state = "ready";
+            current.textContent = "当前版本";
+            actionCell.append(current);
+          } else {
+            const restoreButton = document.createElement("button");
+            restoreButton.type = "button";
+            restoreButton.className = "secondary-button";
+            restoreButton.dataset.restoreVersion = String(version.id);
+            restoreButton.dataset.versionNo = String(version.version_no);
+            restoreButton.textContent = "恢复";
+            actionCell.append(restoreButton);
+          }
+          versionRows.append(row);
+        }
+      }
+
+      async function loadVersions(productId) {
+        const requestSequence = ++versionsRequestSequence;
+        setFeedback(historyFeedback, "正在加载历史版本…");
+        try {
+          const response = await managementFetch(`/api/products/${productId}/versions`);
+          if (!response.ok) {
+            throw new Error(await apiErrorMessage(response));
+          }
+          const versions = await response.json();
+          if (requestSequence !== versionsRequestSequence) {
+            return;
+          }
+          renderVersions(versions);
+          setFeedback(historyFeedback, "");
+        } catch (error) {
+          if (requestSequence !== versionsRequestSequence) {
+            return;
+          }
+          emptyHistory.hidden = true;
+          versionTable.hidden = true;
+          const message = error instanceof Error ? error.message : "历史版本加载失败。";
+          setFeedback(historyFeedback, `${message} 请稍后重试。`, "error");
+        }
       }
 
       function hasListFilters() {
@@ -880,11 +1036,81 @@
             uploadFeedback,
             `上传成功：第 ${uploaded.version_no} 版，${uploaded.original_filename}`,
           );
+          await loadVersions(currentProduct.id);
         } catch (error) {
           const message = error instanceof Error ? error.message : "上传失败，请重试。";
           setFeedback(uploadFeedback, message, "error");
         } finally {
           uploadButton.disabled = false;
+        }
+      });
+
+      statusToggleButton.addEventListener("click", async () => {
+        if (currentProduct === null) {
+          setFeedback(lifecycleFeedback, "产品尚未加载完成，请稍后重试。", "error");
+          return;
+        }
+        const nextStatus = currentProduct.status === "disabled" ? "active" : "disabled";
+        statusToggleButton.disabled = true;
+        setFeedback(
+          lifecycleFeedback,
+          nextStatus === "disabled" ? "正在停用公开访问…" : "正在重新启用…",
+        );
+        try {
+          const response = await managementFetch(`/api/products/${currentProduct.id}`, {
+            method: "PATCH",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({status: nextStatus}),
+          });
+          if (!response.ok) {
+            throw new Error(await apiErrorMessage(response));
+          }
+          const updated = await response.json();
+          currentProduct.status = updated.status;
+          currentProduct.updated_at = updated.updated_at;
+          renderProduct(currentProduct);
+          setFeedback(
+            lifecycleFeedback,
+            updated.status === "disabled"
+              ? "产品已停用，公开入口现在显示停用提示。"
+              : "产品已重新启用，公开入口已恢复访问。",
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "状态更新失败，请重试。";
+          setFeedback(lifecycleFeedback, message, "error");
+        } finally {
+          statusToggleButton.disabled = false;
+        }
+      });
+
+      versionRows.addEventListener("click", async (event) => {
+        const restoreButton = event.target.closest("[data-restore-version]");
+        if (!restoreButton || currentProduct === null) {
+          return;
+        }
+        const versionId = Number(restoreButton.dataset.restoreVersion);
+        const versionNo = Number(restoreButton.dataset.versionNo);
+        restoreButton.disabled = true;
+        setFeedback(historyFeedback, `正在恢复第 ${versionNo} 版…`);
+        try {
+          const response = await managementFetch(
+            `/api/products/${currentProduct.id}/versions/${versionId}/restore`,
+            {method: "POST"},
+          );
+          if (!response.ok) {
+            throw new Error(await apiErrorMessage(response));
+          }
+          const restored = await response.json();
+          currentProduct.current_version_id = restored.current_version_id;
+          currentProduct.pdf_status = "uploaded";
+          document.querySelector("#detail-version").textContent = restored.current_version_id;
+          document.querySelector("#detail-pdf-status").textContent = "已上传";
+          await loadVersions(currentProduct.id);
+          setFeedback(historyFeedback, `已恢复第 ${restored.version_no} 版。`);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "版本恢复失败，请重试。";
+          setFeedback(historyFeedback, message, "error");
+          restoreButton.disabled = false;
         }
       });
 
@@ -901,6 +1127,12 @@
 
       document.querySelector("#reload-list").addEventListener("click", () => {
         void loadProducts();
+      });
+
+      document.querySelector("#reload-versions").addEventListener("click", () => {
+        if (currentProduct !== null) {
+          void loadVersions(currentProduct.id);
+        }
       });
 
       listControls.addEventListener("submit", (event) => {

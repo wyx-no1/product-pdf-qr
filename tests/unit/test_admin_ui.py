@@ -68,6 +68,8 @@ async def test_authenticated_admin_pages_render(
     assert 'id="create-form"' in response.text
     assert 'id="product-table"' in response.text
     assert 'id="detail-view"' in response.text
+    assert 'id="status-toggle-button"' in response.text
+    assert 'id="version-table"' in response.text
     assert "管理员：business-owner" in response.text  # noqa: RUF001
     assert f'value="{csrf_token_for_session("browser-token")}"' in response.text
 
@@ -102,6 +104,13 @@ async def test_admin_page_uses_session_identity_for_complete_browser_workflow(
     assert 'headers.set("X-CSRF-Token", csrfToken)' in page
     assert csrf_token_for_session("browser-token") in page
     assert "/api/products/${currentProduct.id}/pdf" in page
+    assert 'method: "PATCH"' in page
+    assert "/api/products/${currentProduct.id}/versions" in page
+    assert "/versions/${versionId}/restore" in page
+    assert "历史版本永久保留" in page
+    assert "不会复制或删除文件" in page
+    assert "data-restore-version" in page
+    assert "删除版本" not in page
     assert 'name="q"' in page
     assert 'name="pdf_status"' in page
     assert '<option value="uploaded">已上传 PDF</option>' in page

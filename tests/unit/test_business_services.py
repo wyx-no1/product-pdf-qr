@@ -21,10 +21,16 @@ from product_pdf_qr.domains.product import (
     get_product,
     list_products,
     normalize_product_name,
+    set_product_status,
 )
 from product_pdf_qr.domains.public import resolve_public_document
 from product_pdf_qr.domains.storage import PublishedFile, StorageService, ValidatedUpload
-from product_pdf_qr.domains.version import DuplicateCurrentPDF, upload_pdf
+from product_pdf_qr.domains.version import (
+    DuplicateCurrentPDF,
+    list_pdf_versions,
+    restore_pdf_version,
+    upload_pdf,
+)
 from product_pdf_qr.errors import AppError
 
 
@@ -284,6 +290,152 @@ async def test_get_product_missing_uses_safe_error() -> None:
 
     assert captured.value.code == "product_not_found"
     assert captured.value.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_product_status_transition_is_locked_and_audited() -> None:
+    previous = {
+        "id": 5,
+        "code": "A001",
+        "name": "测试产品",
+        "public_token": "A" * 26,
+        "status": "active",
+        "current_version_id": 13,
+        "created_at": datetime(2026, 8, 4, 9, 0, tzinfo=UTC),
+        "updated_at": datetime(2026, 8, 4, 9, 0, tzinfo=UTC),
+    }
+    updated = {
+        **previous,
+        "status": "disabled",
+        "updated_at": datetime(2026, 8, 4, 10, 0, tzinfo=UTC),
+    }
+    connection = ScriptedConnection([previous, updated, None])
+
+    product = await set_product_status(
+        as_database(ScriptedDatabase(connection)),
+        5,
+        "disabled",
+        actor_id=9,
+    )
+
+    assert product.status == "disabled"
+    assert "FOR UPDATE" in connection.queries[0]
+    assert "SET status = %s" in connection.queries[1]
+    audit_parameters = cast(tuple[object, ...], connection.parameters[2])
+    assert audit_parameters[:3] == ("admin", 9, "product_disable")
+    audit_detail = cast(Jsonb, audit_parameters[-1]).obj
+    assert audit_detail == {"previous_status": "active", "status": "disabled"}
+
+
+@pytest.mark.anyio
+async def test_setting_existing_product_status_is_idempotent() -> None:
+    existing = {
+        "id": 5,
+        "code": "A001",
+        "name": "测试产品",
+        "public_token": "A" * 26,
+        "status": "active",
+        "current_version_id": None,
+        "created_at": datetime(2026, 8, 4, 9, 0, tzinfo=UTC),
+        "updated_at": datetime(2026, 8, 4, 9, 0, tzinfo=UTC),
+    }
+    connection = ScriptedConnection([existing])
+
+    product = await set_product_status(
+        as_database(ScriptedDatabase(connection)),
+        5,
+        "active",
+        actor_id=9,
+    )
+
+    assert product.status == "active"
+    assert len(connection.queries) == 1
+
+
+@pytest.mark.anyio
+async def test_version_history_marks_current_and_restore_only_moves_pointer() -> None:
+    uploaded_at = datetime(2026, 8, 4, 9, 30, tzinfo=UTC)
+    history_connection = ScriptedConnection(
+        [
+            {"current_version_id": 13},
+            [
+                {
+                    "id": 14,
+                    "product_id": 5,
+                    "version_no": 2,
+                    "original_filename": "second.pdf",
+                    "uploaded_by": 9,
+                    "uploaded_by_username": "owner",
+                    "uploaded_at": uploaded_at,
+                    "is_current": False,
+                },
+                {
+                    "id": 13,
+                    "product_id": 5,
+                    "version_no": 1,
+                    "original_filename": "first.pdf",
+                    "uploaded_by": 9,
+                    "uploaded_by_username": "owner",
+                    "uploaded_at": uploaded_at,
+                    "is_current": True,
+                },
+            ],
+        ]
+    )
+    restore_connection = ScriptedConnection(
+        [
+            {"id": 5, "code": "A001", "current_version_id": 14},
+            {"id": 13, "version_no": 1},
+            None,
+            None,
+        ]
+    )
+    database = as_database(ScriptedDatabase(history_connection, restore_connection))
+
+    versions = await list_pdf_versions(database, 5)
+    restored = await restore_pdf_version(
+        database,
+        product_id=5,
+        version_id=13,
+        actor_id=9,
+    )
+
+    assert [version.version_no for version in versions] == [2, 1]
+    assert [version.is_current for version in versions] == [False, True]
+    assert restored.version_id == 13
+    assert restored.version_no == 1
+    assert "FOR UPDATE" in restore_connection.queries[0]
+    assert restore_connection.parameters[1] == (5, 13)
+    assert "UPDATE products" in restore_connection.queries[2]
+    assert not any("INSERT INTO pdf_versions" in query for query in restore_connection.queries)
+    assert not any("DELETE FROM pdf_versions" in query for query in restore_connection.queries)
+    audit_parameters = cast(tuple[object, ...], restore_connection.parameters[3])
+    assert audit_parameters[:3] == ("admin", 9, "pdf_restore")
+
+
+@pytest.mark.anyio
+async def test_version_history_and_restore_reject_missing_ownership() -> None:
+    history_database = as_database(ScriptedDatabase(ScriptedConnection([None])))
+    with pytest.raises(AppError) as missing_product:
+        await list_pdf_versions(history_database, 999)
+    assert missing_product.value.code == "product_not_found"
+
+    restore_connection = ScriptedConnection(
+        [
+            {"id": 5, "code": "A001", "current_version_id": 14},
+            None,
+        ]
+    )
+    with pytest.raises(AppError) as wrong_version:
+        await restore_pdf_version(
+            as_database(ScriptedDatabase(restore_connection)),
+            product_id=5,
+            version_id=99,
+            actor_id=9,
+        )
+    assert wrong_version.value.code == "version_not_found_for_product"
+    assert "不属于该产品" in wrong_version.value.message
+    assert not any("UPDATE products" in query for query in restore_connection.queries)
 
 
 def validated_upload(tmp_path: Path, content: bytes = b"%PDF-synthetic") -> ValidatedUpload:
