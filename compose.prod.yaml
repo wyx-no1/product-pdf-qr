@@ -1,0 +1,312 @@
+name: product-pdf-qr-prod
+
+x-runtime-security: &runtime-security
+  privileged: false
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  init: true
+
+x-log-policy: &log-policy
+  driver: local
+  options:
+    compress: "true"
+    max-file: "7"
+    max-size: "10m"
+
+services:
+  proxy:
+    <<: *runtime-security
+    image: ${PROXY_IMAGE:?PROXY_IMAGE must be an immutable tag@sha256 reference}
+    user: "101:101"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        umask 077;
+        touch /var/cache/nginx/access.log /var/cache/nginx/error.log;
+        chmod 0600 /var/cache/nginx/access.log /var/cache/nginx/error.log;
+        exec /docker-entrypoint.sh nginx -g 'daemon off;'
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?PUBLIC_DOMAIN is required}
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx/conf.d
+      NGINX_ENTRYPOINT_QUIET_LOGS: "1"
+    ports:
+      - target: 8080
+        published: "80"
+        protocol: tcp
+      - target: 8443
+        published: "443"
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ./deploy/production/nginx/nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./deploy/production/nginx/templates
+        target: /etc/nginx/templates
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: certificates
+        target: /etc/certbot
+        read_only: true
+      - type: volume
+        source: acme_challenge
+        target: /var/www/acme
+        read_only: true
+      - type: volume
+        source: proxy_logs
+        target: /var/cache/nginx
+    tmpfs:
+      - /tmp:size=128m,mode=0700,uid=101,gid=101,noexec,nosuid,nodev
+      - /etc/nginx/conf.d:size=1m,mode=0700,uid=101,gid=101,noexec,nosuid,nodev
+    shm_size: 32m
+    networks:
+      frontend:
+        ipv4_address: 172.30.0.10
+    depends_on:
+      certbot:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    logging: *log-policy
+    labels:
+      com.product-pdf-qr.log.rotation-period: "24h"
+      com.product-pdf-qr.log.rotation-size: "10485760"
+      com.product-pdf-qr.log.retained-files: "7"
+      com.product-pdf-qr.log.total-limit: "73400320"
+    pids_limit: 128
+    restart: unless-stopped
+
+  certbot:
+    <<: *runtime-security
+    image: ${CERTBOT_IMAGE:?CERTBOT_IMAGE must be an immutable tag@sha256 reference}
+    user: "1000:101"
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - >-
+        umask 027;
+        mkdir -p
+        /tmp/letsencrypt
+        /run/certbot/home
+        /run/certbot/logs
+        /run/certbot/work;
+        touch /run/certbot/ready;
+        exec sleep 2147483647
+    environment:
+      HOME: /run/certbot/home
+      ACME_CA_DIRECTORY: ${ACME_CA_DIRECTORY:?ACME_CA_DIRECTORY is required}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required}
+      ACME_ALERT_WEBHOOK_URL: ${ACME_ALERT_WEBHOOK_URL:?ACME_ALERT_WEBHOOK_URL is required}
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?PUBLIC_DOMAIN is required}
+    volumes:
+      - type: volume
+        source: certificates
+        target: /tmp
+      - type: volume
+        source: acme_challenge
+        target: /var/tmp
+    tmpfs:
+      - /run/certbot:size=16m,mode=0700,uid=1000,gid=101,noexec,nosuid,nodev
+    networks:
+      acme_egress:
+        ipv4_address: 172.32.0.10
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/certbot/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 3s
+    logging: *log-policy
+    pids_limit: 64
+    restart: unless-stopped
+
+  app:
+    <<: *runtime-security
+    image: ${APP_IMAGE:?APP_IMAGE must be an immutable tag@sha256 reference}
+    user: "10001:10001"
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        umask 077;
+        exec python -m product_pdf_qr
+        >>/var/log/product-pdf-qr/application.log 2>&1
+    environment:
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:?DEPLOYMENT_MODE is required}
+      APP_BIND_HOST: ${APP_BIND_HOST:?APP_BIND_HOST is required}
+      APP_PORT: ${APP_PORT:?APP_PORT is required}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:?FORWARDED_ALLOW_IPS is required}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:?DB_POOL_MIN_SIZE is required}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:?DB_POOL_MAX_SIZE is required}
+      STORAGE_ROOT: ${STORAGE_ROOT:?STORAGE_ROOT is required}
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?PUBLIC_DOMAIN is required}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
+      MAX_PDF_BYTES: ${MAX_PDF_BYTES:?MAX_PDF_BYTES is required}
+      IMPORT_MAX_UPLOAD_BYTES: ${IMPORT_MAX_UPLOAD_BYTES:?IMPORT_MAX_UPLOAD_BYTES is required}
+      IMPORT_MAX_DECOMPRESSED_BYTES: ${IMPORT_MAX_DECOMPRESSED_BYTES:?IMPORT_MAX_DECOMPRESSED_BYTES is required}
+      IMPORT_MAX_COMPRESSION_RATIO: ${IMPORT_MAX_COMPRESSION_RATIO:?IMPORT_MAX_COMPRESSION_RATIO is required}
+      IMPORT_PARSE_TIMEOUT_SECONDS: ${IMPORT_PARSE_TIMEOUT_SECONDS:?IMPORT_PARSE_TIMEOUT_SECONDS is required}
+      IMPORT_PARSE_MEMORY_BYTES: ${IMPORT_PARSE_MEMORY_BYTES:?IMPORT_PARSE_MEMORY_BYTES is required}
+      IMPORT_MAX_ROWS: ${IMPORT_MAX_ROWS:?IMPORT_MAX_ROWS is required}
+      PDF_VALIDATION_TIMEOUT_SECONDS: ${PDF_VALIDATION_TIMEOUT_SECONDS:?PDF_VALIDATION_TIMEOUT_SECONDS is required}
+      PDF_VALIDATION_CPU_SECONDS: ${PDF_VALIDATION_CPU_SECONDS:?PDF_VALIDATION_CPU_SECONDS is required}
+      PDF_VALIDATION_MEMORY_BYTES: ${PDF_VALIDATION_MEMORY_BYTES:?PDF_VALIDATION_MEMORY_BYTES is required}
+      PUBLIC_MISS_LIMIT: ${PUBLIC_MISS_LIMIT:?PUBLIC_MISS_LIMIT is required}
+      PUBLIC_MISS_WINDOW_SECONDS: ${PUBLIC_MISS_WINDOW_SECONDS:?PUBLIC_MISS_WINDOW_SECONDS is required}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:?SESSION_COOKIE_SECURE is required}
+      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:?SESSION_TTL_SECONDS is required}
+      LOGIN_FAILURE_LIMIT: ${LOGIN_FAILURE_LIMIT:?LOGIN_FAILURE_LIMIT is required}
+      LOGIN_FAILURE_WINDOW_SECONDS: ${LOGIN_FAILURE_WINDOW_SECONDS:?LOGIN_FAILURE_WINDOW_SECONDS is required}
+      LOGIN_BACKOFF_BASE_SECONDS: ${LOGIN_BACKOFF_BASE_SECONDS:?LOGIN_BACKOFF_BASE_SECONDS is required}
+      LOGIN_BACKOFF_MAX_SECONDS: ${LOGIN_BACKOFF_MAX_SECONDS:?LOGIN_BACKOFF_MAX_SECONDS is required}
+    volumes:
+      - type: volume
+        source: file_data
+        target: /data/files
+      - type: volume
+        source: app_logs
+        target: /var/log/product-pdf-qr
+    tmpfs:
+      - /tmp:size=64m,mode=0700,uid=10001,gid=10001,noexec,nosuid,nodev
+    networks:
+      frontend:
+        ipv4_address: 172.30.0.20
+      database:
+        ipv4_address: 172.31.0.20
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://172.30.0.20:8000/health/ready', timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    logging: *log-policy
+    labels:
+      com.product-pdf-qr.log.rotation-period: "24h"
+      com.product-pdf-qr.log.rotation-size: "10485760"
+      com.product-pdf-qr.log.retained-files: "7"
+      com.product-pdf-qr.log.total-limit: "73400320"
+    pids_limit: 256
+    restart: unless-stopped
+
+  db:
+    <<: *runtime-security
+    image: ${DB_IMAGE:?DB_IMAGE must be an immutable tag@sha256 reference}
+    user: "70:70"
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:?POSTGRES_SUPERUSER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?POSTGRES_SUPERUSER_PASSWORD is required}
+      POSTGRES_DB: postgres
+      POSTGRES_SUPERUSER: ${POSTGRES_SUPERUSER:?POSTGRES_SUPERUSER is required}
+      APP_MIGRATE_PASSWORD: ${APP_MIGRATE_PASSWORD:?APP_MIGRATE_PASSWORD is required}
+      APP_RW_PASSWORD: ${APP_RW_PASSWORD:?APP_RW_PASSWORD is required}
+      APP_BACKUP_PASSWORD: ${APP_BACKUP_PASSWORD:?APP_BACKUP_PASSWORD is required}
+      APP_DATABASE_NAME: ${POSTGRES_DB:?POSTGRES_DB is required}
+    volumes:
+      - type: volume
+        source: postgres_data
+        target: /var/lib/postgresql/data
+      - type: bind
+        source: ./deploy/production/postgres/init
+        target: /docker-entrypoint-initdb.d
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./deploy/production/postgres/healthcheck.sh
+        target: /usr/local/bin/app-db-healthcheck
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:size=64m,mode=0700,uid=70,gid=70,noexec,nosuid,nodev
+      - /var/run/postgresql:size=16m,mode=0700,uid=70,gid=70,nosuid,nodev
+    networks:
+      database:
+        ipv4_address: 172.31.0.10
+    healthcheck:
+      test: ["CMD", "/bin/sh", "/usr/local/bin/app-db-healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    logging: *log-policy
+    pids_limit: 256
+    restart: unless-stopped
+
+  migrate:
+    <<: *runtime-security
+    image: ${APP_IMAGE:?APP_IMAGE must be an immutable tag@sha256 reference}
+    user: "10001:10001"
+    environment:
+      DATABASE_URL: ${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}
+    command: ["alembic", "upgrade", "head"]
+    tmpfs:
+      - /tmp:size=32m,mode=0700,uid=10001,gid=10001,noexec,nosuid,nodev
+    networks:
+      database:
+        ipv4_address: 172.31.0.30
+    depends_on:
+      db:
+        condition: service_healthy
+    logging: *log-policy
+    pids_limit: 128
+    restart: "no"
+
+networks:
+  frontend:
+    name: product_pdf_qr_frontend
+    internal: false
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  database:
+    name: product_pdf_qr_database
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+  acme_egress:
+    name: product_pdf_qr_acme_egress
+    internal: false
+    ipam:
+      config:
+        - subnet: 172.32.0.0/24
+
+volumes:
+  file_data:
+    name: product_pdf_qr_files
+  postgres_data:
+    name: product_pdf_qr_postgres
+  certificates:
+    name: product_pdf_qr_certificates
+  acme_challenge:
+    name: product_pdf_qr_acme_challenge
+  proxy_logs:
+    name: product_pdf_qr_proxy_logs
+  app_logs:
+    name: product_pdf_qr_app_logs

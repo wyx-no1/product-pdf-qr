@@ -86,7 +86,11 @@ async def public_scan(
                     result="failure",
                     actor_type="anonymous",
                     request_id=uuid4(),
-                    detail={"miss_limit": limiter.limit},
+                    detail={
+                        "miss_limit": limiter.limit,
+                        "observed_misses": limiter.limit,
+                        "source_ip": source,
+                    },
                 ),
             )
         return _status_page(STATUS_MESSAGES["missing"])

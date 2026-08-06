@@ -21,7 +21,8 @@ from product_pdf_qr.domains.auth import (
 )
 
 LOGIN_PATH = "/admin/login"
-CHANGE_PASSWORD_PATH = "/admin/change-password"
+# This is a URL path, not a credential.
+CHANGE_PASSWORD_PATH = "/admin/change-password"  # nosec B105
 LOGOUT_PATH = "/admin/logout"
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 PRODUCT_IMPORT_PATHS = frozenset({"/api/product-imports", "/admin/imports"})
@@ -59,7 +60,8 @@ class AdminAuthenticationMiddleware(BaseHTTPMiddleware):
                 )
             return self._redirect_without_session(request, settings)
 
-        assert token is not None
+        if token is None:
+            raise RuntimeError("Resolved administrator session has no source token")
         request.state.admin = admin
         csrf_token = csrf_token_for_session(token)
         request.state.csrf_token = csrf_token

@@ -1,0 +1,154 @@
+upstream product_pdf_qr_app {
+    server 172.30.0.20:8000;
+    keepalive 16;
+}
+
+# Unknown Host values on cleartext never redirect or reach the application.
+server {
+    listen 8080 default_server;
+    server_name _;
+    access_log off;
+    return 444;
+}
+
+server {
+    listen 8080;
+    server_name ${PUBLIC_DOMAIN};
+
+    location ~ "^/\.well-known/acme-challenge/(?<acme_token>[A-Za-z0-9_-]{1,128})$" {
+        limit_except GET {
+            deny all;
+        }
+        alias /var/www/acme/.well-known/acme-challenge/$acme_token;
+        disable_symlinks on from=/var/www/acme;
+        default_type text/plain;
+        add_header X-Content-Type-Options nosniff always;
+        access_log off;
+        log_not_found off;
+    }
+
+    location /.well-known/acme-challenge/ {
+        return 404;
+    }
+
+    location / {
+        return 308 https://${PUBLIC_DOMAIN}$request_uri;
+    }
+}
+
+# Reject unknown SNI before presenting any certificate.
+server {
+    listen 8443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+    access_log off;
+}
+
+server {
+    listen 8443 ssl;
+    server_name ${PUBLIC_DOMAIN};
+
+    ssl_certificate /etc/certbot/active/fullchain.pem;
+    ssl_certificate_key /etc/certbot/active/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:TLS:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # G-02 HSTS constant: one year, this host and all subdomains, no preload.
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Cache-Control "no-store" always;
+
+    client_max_body_size 1m;
+
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host ${PUBLIC_DOMAIN};
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Real-IP "";
+    proxy_set_header Forwarded "";
+    proxy_set_header Referer "";
+    proxy_set_header X-Request-ID $request_id;
+    proxy_hide_header Cache-Control;
+    proxy_hide_header Server;
+    proxy_cache off;
+    proxy_no_cache 1;
+    proxy_cache_bypass 1;
+
+    location = /health/ready {
+        return 404;
+    }
+
+    location ~* "^/health/ready(?:/|$)" {
+        return 404;
+    }
+
+    location ^~ /.well-known/acme-challenge/ {
+        return 404;
+    }
+
+    location ^~ /p/ {
+        limit_req zone=public_scan burst=120 nodelay;
+        error_page 429 = @public_rate_limited;
+        proxy_pass http://product_pdf_qr_app;
+    }
+
+    location = /admin/login {
+        limit_req zone=admin_login burst=60 nodelay;
+        error_page 429 = @login_rate_limited;
+        proxy_pass http://product_pdf_qr_app;
+    }
+
+    # 50 MiB file + 100 KiB bounded multipart envelope.
+    location ~ ^/api/products/[1-9][0-9]*/pdf$ {
+        client_max_body_size 51300k;
+        error_page 413 = @pdf_too_large;
+        proxy_pass http://product_pdf_qr_app;
+    }
+
+    # 10 MiB file + 100 KiB bounded multipart envelope.
+    location = /api/product-imports {
+        client_max_body_size 10340k;
+        error_page 413 = @xlsx_too_large;
+        proxy_pass http://product_pdf_qr_app;
+    }
+
+    location = /admin/imports {
+        client_max_body_size 10340k;
+        error_page 413 = @xlsx_too_large;
+        proxy_pass http://product_pdf_qr_app;
+    }
+
+    location / {
+        proxy_pass http://product_pdf_qr_app;
+    }
+
+    location @public_rate_limited {
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header Cache-Control "no-store" always;
+        add_header Retry-After "1" always;
+        return 429;
+    }
+
+    location @login_rate_limited {
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header Cache-Control "no-store" always;
+        add_header Retry-After "2" always;
+        return 429;
+    }
+
+    location @pdf_too_large {
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header Cache-Control "no-store" always;
+        default_type application/json;
+        return 413 '{"error":{"code":"pdf_too_large","message":"PDF file exceeds the 50 MiB limit."}}';
+    }
+
+    location @xlsx_too_large {
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header Cache-Control "no-store" always;
+        default_type application/json;
+        return 413 '{"error":{"code":"xlsx_too_large","message":"XLSX file exceeds the 10 MiB limit."}}';
+    }
+}

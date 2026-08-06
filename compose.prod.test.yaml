@@ -1,0 +1,103 @@
+# Local synthetic verification overlay only. Never use this file for production.
+services:
+  proxy:
+    networks:
+      acme_test:
+        ipv4_address: 172.33.0.10
+
+  certbot:
+    environment:
+      ACME_CA_DIRECTORY: https://pebble:14000/dir
+      ACME_EMAIL: synthetic-operator@example.test
+      ACME_ALERT_WEBHOOK_URL: http://alert_sink:8090/alert
+    networks:
+      acme_test:
+        ipv4_address: 172.33.0.40
+
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:2@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+    user: "1000:1000"
+    command:
+      - -config
+      - /test/config/product-pdf-qr.json
+      - -dnsserver
+      - 172.33.0.20:8053
+      - -strict=false
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_WFE_NONCEREJECT: "0"
+    volumes:
+      - type: bind
+        source: ./deploy/production/test/pebble-config.json
+        target: /test/config/product-pdf-qr.json
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      acme_test:
+        ipv4_address: 172.33.0.30
+    privileged: false
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    restart: "no"
+
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:2@sha256:12ce21884def456bcf9786542113949e1f19dc7738d2c70e156c2d0c38a1405b
+    user: "1000:1000"
+    command:
+      - -defaultIPv4
+      - 172.33.0.10
+      - -defaultIPv6
+      - ""
+    networks:
+      acme_test:
+        ipv4_address: 172.33.0.20
+    privileged: false
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    restart: "no"
+
+  alert_sink:
+    image: ${APP_IMAGE:?APP_IMAGE must be an immutable tag@sha256 reference}
+    user: "10001:10001"
+    command:
+      - python
+      - -c
+      - >-
+        from http.server import BaseHTTPRequestHandler,HTTPServer;
+        P='/tmp/alert-count';
+        H=type('H',(BaseHTTPRequestHandler,),{
+        'do_POST':lambda s:(open(P,'a').write('1\n'),s.send_response(204),s.end_headers()),
+        'log_message':lambda *a:None});
+        HTTPServer(('0.0.0.0',8090),H).serve_forever()
+    tmpfs:
+      - /tmp:size=1m,mode=0700,uid=10001,gid=10001,noexec,nosuid,nodev
+    networks:
+      acme_test:
+        ipv4_address: 172.33.0.50
+    privileged: false
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    restart: "no"
+
+networks:
+  acme_egress:
+    internal: true
+  acme_test:
+    name: product_pdf_qr_acme_test
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.33.0.0/24

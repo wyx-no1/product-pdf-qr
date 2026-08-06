@@ -223,8 +223,8 @@ async def list_products(
     where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     parameters.extend((limit, offset))
     async with database.connection() as connection:
-        cursor = await connection.execute(
-            f"""
+        # Every clause is selected from fixed literals above; values stay parameters.
+        query = f"""
             SELECT
                 id,
                 code,
@@ -238,7 +238,9 @@ async def list_products(
             {where_clause}
             ORDER BY updated_at DESC, id DESC
             LIMIT %s OFFSET %s
-            """,
+            """  # nosec B608
+        cursor = await connection.execute(
+            query,
             tuple(parameters),
         )
         rows = await cursor.fetchall()

@@ -1,0 +1,19 @@
+# Fully resolved Certbot runtime set. Keep every direct and transitive input pinned.
+acme==5.7.0
+certbot==5.1.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.4.9
+ConfigArgParse==1.7.5
+configobj==5.0.9
+cryptography==50.0.0
+distro==1.9.0
+idna==3.18
+josepy==2.2.0
+parsedatetime==2.6
+pycparser==3.0
+PyOpenSSL==26.4.0
+pyRFC3339==2.1.0
+requests==2.34.2
+typing-extensions==4.16.0
+urllib3==2.7.0
