@@ -302,6 +302,85 @@ def test_duplicate_chinese_headings_are_ambiguous() -> None:
     assert result.commits[0].verdict == "indeterminate"
 
 
+def test_bare_approved_heading_passes_the_gate() -> None:
+    review = replace(
+        _review(CODE_SHA, "approved"),
+        body="## Approved\n\nAuditable review details.",
+    )
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (review,),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "PASS"
+    assert result.exit_code == 0
+    assert result.commits[0].verdict == "approved"
+
+
+def test_bare_changes_requested_heading_is_recognized() -> None:
+    review = replace(
+        _review(CODE_SHA, "approved"),
+        body="## Changes requested\n\nAuditable review details.",
+    )
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (review,),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "REVIEW_GAP"
+    assert result.commits[0].verdict == "changes_requested"
+    assert "final code commit verdict must be approved" in result.commits[0].gaps[0]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "## Approved (with notes)\n\nDecorated bare heading.",
+        "## Approved!\n\nDecorated bare heading.",
+        "## Approved \n\nTrailing whitespace on the heading line.",
+        "## approved\n\nLowercase variant of the bare heading.",
+        "## Changes requested urgently\n\nDecorated bare heading.",
+        "## Changes Requested\n\nUnexpected capitalization of the bare heading.",
+    ],
+)
+def test_decorated_bare_headings_fail_closed(body: str) -> None:
+    review = replace(_review(CODE_SHA, "approved"), body=body)
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (review,),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "REVIEW_GAP"
+    assert result.commits[0].verdict == "indeterminate"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "## Review verdict: approved\n\n## Approved\n\nSame meaning twice.",
+        "## 审查结论：通过\n\n## Approved\n\n跨语法重复结论。",  # noqa: RUF001
+        "## Approved\n\n## Changes requested\n\nConflicting bare headings.",
+    ],
+)
+def test_bare_and_canonical_headings_together_are_ambiguous(body: str) -> None:
+    review = replace(_review(CODE_SHA, "approved"), body=body)
+    github = FakeReviewGateData(
+        (ReviewCommit(CODE_SHA, ("scripts/ao/review_gate.py",)),),
+        (review,),
+    )
+
+    result = evaluate_review_gate(19, github, now=lambda: NOW)
+
+    assert result.status == "REVIEW_GAP"
+    assert result.commits[0].verdict == "indeterminate"
+
+
 @pytest.mark.parametrize(
     "body",
     [
