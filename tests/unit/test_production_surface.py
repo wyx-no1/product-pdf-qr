@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from product_pdf_qr.config import PRODUCTION_PROXY_IP, Settings
+from product_pdf_qr.config import PRODUCTION_APP_IP, PRODUCTION_PROXY_IP, Settings
+from scripts.production.validate_compose import (
+    validate_app_boundary_environment,
+    validate_image_reference,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 DATABASE_URL = "postgresql://app_rw:synthetic@db:5432/product_pdf_qr"
@@ -36,6 +40,7 @@ def test_production_origin_and_proxy_trust_accept_exact_contract() -> None:
 
     assert settings.public_base_url == "https://qr.example.test"
     assert settings.public_domain == "qr.example.test"
+    assert settings.app_bind_host == PRODUCTION_APP_IP
     assert settings.forwarded_allow_ips == "172.30.0.10"
 
 
@@ -74,6 +79,54 @@ def test_production_origin_rejects_every_noncanonical_form(
 def test_production_rejects_broad_or_wrong_proxy_trust(trusted_proxy: str) -> None:
     with pytest.raises(ValidationError):
         production_settings(forwarded_allow_ips=trusted_proxy)
+
+
+@pytest.mark.parametrize("bind_host", ["0.0.0.0", "172.31.0.20", "127.0.0.1", ""])
+def test_production_rejects_non_frontend_bind(bind_host: str) -> None:
+    with pytest.raises(ValidationError):
+        production_settings(app_bind_host=bind_host)
+
+
+@pytest.mark.parametrize("mode", [None, "", "development", "Production"])
+def test_compose_validator_rejects_missing_or_invalid_production_mode(
+    mode: object,
+) -> None:
+    environment = {
+        "DEPLOYMENT_MODE": mode,
+        "APP_BIND_HOST": PRODUCTION_APP_IP,
+        "FORWARDED_ALLOW_IPS": PRODUCTION_PROXY_IP,
+    }
+
+    with pytest.raises(ValueError, match="production mode must be hard-coded"):
+        validate_app_boundary_environment(environment)
+
+
+@pytest.mark.parametrize("bind_host", [None, "", "0.0.0.0", "172.31.0.20"])
+def test_compose_validator_rejects_missing_or_invalid_app_bind(bind_host: object) -> None:
+    environment = {
+        "DEPLOYMENT_MODE": "production",
+        "APP_BIND_HOST": bind_host,
+        "FORWARDED_ALLOW_IPS": PRODUCTION_PROXY_IP,
+    }
+
+    with pytest.raises(ValueError, match="app bind address changed"):
+        validate_app_boundary_environment(environment)
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        None,
+        "",
+        "postgres:latest",
+        "postgres:16",
+        f"postgres:latest@sha256:{'0' * 64}",
+        f"postgres@sha256:{'0' * 64}",
+    ],
+)
+def test_compose_validator_rejects_mutable_or_malformed_image(image: object) -> None:
+    with pytest.raises(ValueError):
+        validate_image_reference("db", image)
 
 
 def test_nginx_security_constants_are_explicit_and_token_safe() -> None:
@@ -136,16 +189,40 @@ def test_acme_is_the_only_static_location() -> None:
 
 def test_production_preflight_is_network_isolated_and_repeatable() -> None:
     wrapper = (ROOT / "scripts/production/prod-compose.sh").read_text(encoding="utf-8")
+    compose = (ROOT / "compose.prod.yaml").read_text(encoding="utf-8")
 
     for expected in (
+        "config --format json",
+        'python3 "$repository_root/scripts/production/validate_compose.py"',
         "--network none",
         "--read-only",
         "--cap-drop ALL",
         "--security-opt no-new-privileges:true",
         '--env-file "$environment_file"',
+        "--env DEPLOYMENT_MODE=production",
+        "--env APP_BIND_HOST=172.30.0.20",
+        "--env FORWARDED_ALLOW_IPS=172.30.0.10",
     ):
         assert expected in wrapper
     assert "compose run" not in wrapper
+    assert wrapper.index("config --format json") < wrapper.index("docker run --rm")
+    assert "DEPLOYMENT_MODE: production" in compose
+    assert "APP_BIND_HOST: 172.30.0.20" in compose
+    assert "FORWARDED_ALLOW_IPS: 172.30.0.10" in compose
+    assert "${DEPLOYMENT_MODE" not in compose
+    assert "${APP_BIND_HOST" not in compose
+    assert "${FORWARDED_ALLOW_IPS" not in compose
+
+
+def test_production_wrapper_bootstraps_an_empty_certificate_volume() -> None:
+    wrapper = (ROOT / "scripts/production/prod-compose.sh").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "scripts/production/bootstrap-certificate.sh").read_text(encoding="utf-8")
+
+    assert "ensure_bootstrap_certificate" in wrapper
+    assert "test -s /tmp/active/fullchain.pem" in wrapper
+    assert "test -s /tmp/active/privkey.pem" in wrapper
+    assert "PRODUCTION_CERTIFICATE_BOOTSTRAP=1" in wrapper
+    assert 'PRODUCTION_CERTIFICATE_BOOTSTRAP=1 "$compose" up --detach certbot' in bootstrap
 
 
 def test_proxy_and_rotation_enforce_private_log_modes() -> None:

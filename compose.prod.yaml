@@ -147,10 +147,10 @@ services:
         exec python -m product_pdf_qr
         >>/var/log/product-pdf-qr/application.log 2>&1
     environment:
-      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:?DEPLOYMENT_MODE is required}
-      APP_BIND_HOST: ${APP_BIND_HOST:?APP_BIND_HOST is required}
+      DEPLOYMENT_MODE: production
+      APP_BIND_HOST: 172.30.0.20
       APP_PORT: ${APP_PORT:?APP_PORT is required}
-      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:?FORWARDED_ALLOW_IPS is required}
+      FORWARDED_ALLOW_IPS: 172.30.0.10
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:?DB_POOL_MIN_SIZE is required}
       DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:?DB_POOL_MAX_SIZE is required}

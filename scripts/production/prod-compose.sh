@@ -27,7 +27,17 @@ compose() {
   docker compose --env-file "$environment_file" -f "$compose_file" "$@"
 }
 
-compose config --quiet
+compose config --format json |
+  python3 "$repository_root/scripts/production/validate_compose.py" >/dev/null
+
+ensure_bootstrap_certificate() {
+  compose up --detach certbot
+  if ! compose exec --no-TTY certbot sh -eu -c \
+    'test -s /tmp/active/fullchain.pem && test -s /tmp/active/privkey.pem'; then
+    PRODUCTION_CERTIFICATE_BOOTSTRAP=1 \
+      "$repository_root/scripts/production/bootstrap-certificate.sh"
+  fi
+}
 
 case "${1:-}" in
   up | start | restart)
@@ -41,9 +51,15 @@ case "${1:-}" in
       --cap-drop ALL \
       --security-opt no-new-privileges:true \
       --env-file "$environment_file" \
+      --env DEPLOYMENT_MODE=production \
+      --env APP_BIND_HOST=172.30.0.20 \
+      --env FORWARDED_ALLOW_IPS=172.30.0.10 \
       --entrypoint python \
       "$app_image" \
       -c 'from product_pdf_qr.config import get_settings; get_settings(); print("production configuration valid")'
+    if [ "${PRODUCTION_CERTIFICATE_BOOTSTRAP:-0}" != "1" ]; then
+      ensure_bootstrap_certificate
+    fi
     ;;
 esac
 

@@ -50,6 +50,31 @@ def _network_names(service: dict[str, Any]) -> set[str]:
     return set(networks)
 
 
+def validate_image_reference(service_name: str, image: object) -> None:
+    """Reject every mutable or malformed production image reference."""
+
+    reference = str(image or "")
+    require(
+        IMAGE_PATTERN.fullmatch(reference) is not None,
+        f"{service_name} image is not digest pinned",
+    )
+    require(":latest@" not in reference, f"{service_name} image uses latest")
+
+
+def validate_app_boundary_environment(environment: dict[str, Any]) -> None:
+    """Require production mode and both fixed frontend trust-boundary addresses."""
+
+    require(
+        environment.get("DEPLOYMENT_MODE") == "production",
+        "production mode must be hard-coded",
+    )
+    require(
+        environment.get("FORWARDED_ALLOW_IPS") == "172.30.0.10",
+        "Uvicorn proxy trust changed",
+    )
+    require(environment.get("APP_BIND_HOST") == "172.30.0.20", "app bind address changed")
+
+
 def validate(document: dict[str, Any]) -> None:
     """Apply T34-01 through T34-04 static topology assertions."""
 
@@ -64,11 +89,7 @@ def validate(document: dict[str, Any]) -> None:
     observed_binds: set[tuple[str, str]] = set()
     for service_name, service in services.items():
         require(not service.get("build"), f"{service_name} must use a prebuilt image")
-        image = str(service.get("image") or "")
-        require(
-            IMAGE_PATTERN.fullmatch(image) is not None, f"{service_name} image is not digest pinned"
-        )
-        require(":latest@" not in image, f"{service_name} image uses latest")
+        validate_image_reference(service_name, service.get("image"))
         require(service.get("privileged") is not True, f"{service_name} is privileged")
         require(service.get("read_only") is True, f"{service_name} root filesystem is writable")
         require(
@@ -134,13 +155,7 @@ def validate(document: dict[str, Any]) -> None:
         networks["acme_egress"].get("internal") is not True,
         "ACME network must permit outbound ACME",
     )
-    require(
-        services["app"]["environment"]["FORWARDED_ALLOW_IPS"] == "172.30.0.10",
-        "Uvicorn proxy trust changed",
-    )
-    require(
-        services["app"]["environment"]["APP_BIND_HOST"] == "172.30.0.20", "app bind address changed"
-    )
+    validate_app_boundary_environment(services["app"]["environment"])
     require(services["app"].get("healthcheck") is not None, "app readiness healthcheck is missing")
 
     volume_names = {

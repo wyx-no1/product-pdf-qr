@@ -21,6 +21,7 @@ DEFAULT_IMPORT_PARSE_TIMEOUT_SECONDS = 30.0
 DEFAULT_IMPORT_PARSE_MEMORY_BYTES = 512 * 1024 * 1024
 DEFAULT_IMPORT_MAX_ROWS = 5_000
 PRODUCTION_PROXY_IP = "172.30.0.10"
+PRODUCTION_APP_IP = "172.30.0.20"
 _DNS_NAME = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z",
@@ -116,6 +117,8 @@ class Settings(BaseSettings):
             )
         if self.deployment_mode == "production":
             self._validate_production_origin()
+            if self.app_bind_host != PRODUCTION_APP_IP:
+                raise ValueError("APP_BIND_HOST must be the fixed production frontend address")
             if self.forwarded_allow_ips != PRODUCTION_PROXY_IP:
                 raise ValueError("FORWARDED_ALLOW_IPS must be the fixed production proxy address")
         return self

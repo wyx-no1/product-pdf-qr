@@ -12,6 +12,11 @@ ENV_EXAMPLE = ROOT / ".env.prod.example"
 COMPOSE = ROOT / "compose.prod.yaml"
 INTERPOLATION = re.compile(r"\$\{([A-Z][A-Z0-9_]*)")
 ASSIGNMENT = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+FIXED_APP_FIELDS = {
+    "APP_BIND_HOST",
+    "DEPLOYMENT_MODE",
+    "FORWARDED_ALLOW_IPS",
+}
 
 
 def main() -> int:
@@ -19,7 +24,14 @@ def main() -> int:
 
     app_fields = {name.upper() for name in Settings.model_fields}
     compose_fields = set(INTERPOLATION.findall(COMPOSE.read_text(encoding="utf-8")))
-    expected = app_fields | compose_fields | {"MIGRATION_DATABASE_URL"}
+    missing_app_consumers = app_fields - compose_fields - FIXED_APP_FIELDS
+    if missing_app_consumers:
+        print(
+            "production application fields are neither externally consumed nor fixed: "
+            f"{sorted(missing_app_consumers)}"
+        )
+        return 1
+    expected = compose_fields
 
     actual: dict[str, str] = {}
     for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():

@@ -5,7 +5,7 @@ script_directory="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 compose="$script_directory/prod-compose.sh"
 
 if ! "$compose" ps --status running --services | grep -qx certbot; then
-  "$compose" up --detach certbot
+  PRODUCTION_CERTIFICATE_BOOTSTRAP=1 "$compose" up --detach certbot
 fi
 "$compose" exec --no-TTY certbot sh -eu -c '
   stage="/run/certbot/bootstrap.$$"
