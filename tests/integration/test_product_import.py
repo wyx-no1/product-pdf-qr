@@ -40,7 +40,12 @@ from product_pdf_qr.domains.product import (
     create_product_in_transaction,
 )
 from product_pdf_qr.main import create_app, lifespan
-from tests.xlsx_helpers import Worksheet, build_sparse_wide_xlsx, build_xlsx
+from tests.xlsx_helpers import (
+    Worksheet,
+    build_sparse_wide_xlsx,
+    build_structurally_invalid_xlsx,
+    build_xlsx,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -647,6 +652,27 @@ async def test_parser_memory_limit_rejection_is_bounded_and_audited(
     assert detail["success_count"] == 0
     assert detail["duplicate_count"] == 0
     assert detail["format_error_count"] == 0
+
+
+@pytest.mark.api
+async def test_structurally_invalid_xlsx_is_format_rejection_and_audited(
+    clean_import_database: ImportAuth,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with running_clients(clean_import_database, tmp_path, monkeypatch) as (client, _):
+        response = await post_import(client, build_structurally_invalid_xlsx())
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "invalid_xlsx"
+    assert product_rows() == []
+    failure_audits = audit_rows("failure")
+    assert len(failure_audits) == 1
+    detail = cast(dict[str, object], failure_audits[0][4])
+    assert detail["reason"] == "xml_or_workbook_parse_failed"
+    assert detail["error_type"] == "ValueError"
+    assert detail["success_count"] == 0
+    assert detail["duplicate_count"] == 0
+    assert detail["format_error_count"] == 1
 
 
 @pytest.mark.api

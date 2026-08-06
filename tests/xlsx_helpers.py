@@ -135,3 +135,16 @@ def build_sparse_wide_xlsx(row_count: int) -> bytes:
             )
             output_archive.writestr(entry.filename, payload)
     return output.getvalue()
+
+
+def build_structurally_invalid_xlsx() -> bytes:
+    """Build a valid ZIP container without required XLSX workbook entries."""
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/'
+            'package/2006/content-types"/>',
+        )
+    return output.getvalue()

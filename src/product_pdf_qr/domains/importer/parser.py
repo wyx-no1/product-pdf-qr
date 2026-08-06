@@ -513,26 +513,29 @@ def _parse_worker(
     parser: XlsxParser,
 ) -> None:
     try:
-        _set_xlsx_worker_memory_limit(memory_bytes)
-        _send_worker_result(sender, ("success", parser(content, max_rows)))
-    except MemoryError:
-        _send_worker_result(sender, ("resource_limit", memory_bytes))
-    except (OSError, ValueError):
-        _send_worker_result(sender, ("resource_limit", memory_bytes))
-    except XlsxRejected as error:
-        _send_worker_result(
-            sender,
-            (
-                "rejected",
-                error.code,
-                error.message,
-                error.detail,
-                error.status_code,
-                error.format_error,
-            ),
-        )
-    except Exception as error:
-        _send_worker_result(sender, ("failure", type(error).__name__, str(error)))
+        try:
+            _set_xlsx_worker_memory_limit(memory_bytes)
+        except (MemoryError, OSError, ValueError):
+            _send_worker_result(sender, ("resource_limit", memory_bytes))
+            return
+        try:
+            _send_worker_result(sender, ("success", parser(content, max_rows)))
+        except MemoryError:
+            _send_worker_result(sender, ("resource_limit", memory_bytes))
+        except XlsxRejected as error:
+            _send_worker_result(
+                sender,
+                (
+                    "rejected",
+                    error.code,
+                    error.message,
+                    error.detail,
+                    error.status_code,
+                    error.format_error,
+                ),
+            )
+        except Exception as error:
+            _send_worker_result(sender, ("failure", type(error).__name__, str(error)))
     finally:
         sender.close()
 

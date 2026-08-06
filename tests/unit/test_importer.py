@@ -68,7 +68,11 @@ from tests.unit.test_business_services import (
     ScriptedDatabase,
     as_database,
 )
-from tests.xlsx_helpers import build_sparse_wide_xlsx, build_xlsx
+from tests.xlsx_helpers import (
+    build_sparse_wide_xlsx,
+    build_structurally_invalid_xlsx,
+    build_xlsx,
+)
 
 DATABASE_URL = "postgresql://app_rw:synthetic@127.0.0.1:5432/test"
 
@@ -557,6 +561,11 @@ def test_xlsx_worker_reports_only_bounded_results(
 
     assert run(invalid) == ("failure", "RuntimeError", "invalid")
 
+    def malformed(_content: bytes, _max_rows: int) -> ParsedWorkbook:
+        raise ValueError("bad workbook")
+
+    assert run(malformed) == ("failure", "ValueError", "bad workbook")
+
 
 @pytest.mark.anyio
 async def test_xlsx_worker_memory_ceiling_returns_bounded_rejection() -> None:
@@ -634,6 +643,23 @@ async def test_parser_worker_failure_and_timeout_are_distinct_and_reaped(
         )
     assert timed_out.value.code == "xlsx_parse_timeout"
     assert timed_out.value.detail["max_parse_seconds"] == 0.01
+
+
+@pytest.mark.anyio
+async def test_structurally_invalid_zip_is_not_a_resource_limit() -> None:
+    with pytest.raises(XlsxRejected) as captured:
+        await parse_xlsx_with_timeout(
+            build_structurally_invalid_xlsx(),
+            timeout_seconds=5,
+        )
+
+    assert captured.value.code == "invalid_xlsx"
+    assert captured.value.status_code == 422
+    assert captured.value.format_error is True
+    assert captured.value.detail == {
+        "reason": "xml_or_workbook_parse_failed",
+        "error_type": "ValueError",
+    }
 
 
 def test_valid_signature_with_broken_zip_is_rejected_as_container() -> None:
