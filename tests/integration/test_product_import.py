@@ -561,9 +561,11 @@ async def test_tc22_parse_timeout_is_audited_and_never_enters_phase_two(
         *,
         timeout_seconds: float,
         max_rows: int,
+        memory_bytes: int,
     ) -> object:
         del content
         assert max_rows == 5_000
+        assert memory_bytes == 512 * 1024 * 1024
         raise XlsxRejected(
             "xlsx_parse_timeout",
             "XLSX 解析超过 30 秒上限, 已中止。",
@@ -589,6 +591,62 @@ async def test_tc22_parse_timeout_is_audited_and_never_enters_phase_two(
     detail = cast(dict[str, object], audit_rows("failure")[-1][4])
     assert detail["max_parse_seconds"] == 30
     assert detail["actual_elapsed_seconds"] == 30.1
+
+
+@pytest.mark.api
+async def test_parser_memory_limit_rejection_is_bounded_and_audited(
+    clean_import_database: ImportAuth,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory_budget = 128 * 1024 * 1024
+
+    async def memory_limited_parser(
+        content: bytes,
+        *,
+        timeout_seconds: float,
+        max_rows: int,
+        memory_bytes: int,
+    ) -> object:
+        del content
+        assert timeout_seconds == 30
+        assert max_rows == 5_000
+        assert memory_bytes == memory_budget
+        raise XlsxRejected(
+            "xlsx_parse_resource_limit",
+            "XLSX 解析超过内存资源上限。",
+            detail={
+                "reason": "parser_memory_limit_exceeded",
+                "max_memory_bytes": memory_bytes,
+            },
+            status_code=413,
+        )
+
+    monkeypatch.setattr(
+        "product_pdf_qr.domains.importer.service.parse_xlsx_with_timeout",
+        memory_limited_parser,
+    )
+    async with running_clients(
+        clean_import_database,
+        tmp_path,
+        monkeypatch,
+        import_parse_memory_bytes=str(memory_budget),
+    ) as (client, _):
+        response = await post_import(
+            client,
+            sheet([(1, ("编码",)), (2, ("NEVER-WRITTEN",))]),
+        )
+    assert response.status_code == 413
+    assert response.json()["error_code"] == "xlsx_parse_resource_limit"
+    assert product_rows() == []
+    failure_audits = audit_rows("failure")
+    assert len(failure_audits) == 1
+    detail = cast(dict[str, object], failure_audits[0][4])
+    assert detail["reason"] == "parser_memory_limit_exceeded"
+    assert detail["max_memory_bytes"] == memory_budget
+    assert detail["success_count"] == 0
+    assert detail["duplicate_count"] == 0
+    assert detail["format_error_count"] == 0
 
 
 @pytest.mark.api

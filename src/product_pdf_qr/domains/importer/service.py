@@ -299,6 +299,7 @@ async def import_products(
             content,
             timeout_seconds=settings.import_parse_timeout_seconds,
             max_rows=settings.import_max_rows,
+            memory_bytes=settings.import_parse_memory_bytes,
         )
         candidates, file_duplicate_count, notices = validate_workbook(
             workbook,

@@ -15,6 +15,7 @@ DEFAULT_IMPORT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 DEFAULT_IMPORT_MAX_DECOMPRESSED_BYTES = 50 * 1024 * 1024
 DEFAULT_IMPORT_MAX_COMPRESSION_RATIO = 100.0
 DEFAULT_IMPORT_PARSE_TIMEOUT_SECONDS = 30.0
+DEFAULT_IMPORT_PARSE_MEMORY_BYTES = 512 * 1024 * 1024
 DEFAULT_IMPORT_MAX_ROWS = 5_000
 
 
@@ -47,6 +48,10 @@ class Settings(BaseSettings):
     import_parse_timeout_seconds: float = Field(
         default=DEFAULT_IMPORT_PARSE_TIMEOUT_SECONDS,
         gt=0,
+    )
+    import_parse_memory_bytes: int = Field(
+        default=DEFAULT_IMPORT_PARSE_MEMORY_BYTES,
+        ge=128 * 1024 * 1024,
     )
     import_max_rows: int = Field(default=DEFAULT_IMPORT_MAX_ROWS, ge=1)
     pdf_validation_timeout_seconds: float = Field(

@@ -21,6 +21,7 @@ def test_settings_are_local_by_default() -> None:
     assert settings.import_max_decompressed_bytes == 50 * 1024 * 1024
     assert settings.import_max_compression_ratio == 100
     assert settings.import_parse_timeout_seconds == 30
+    assert settings.import_parse_memory_bytes == 512 * 1024 * 1024
     assert settings.import_max_rows == 5_000
     assert settings.pdf_validation_timeout_seconds == 5
     assert settings.pdf_validation_cpu_seconds == 3

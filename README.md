@@ -66,7 +66,7 @@ docker compose run --rm app \
 
 上传入口在 multipart 解析前限制整个请求体，PDF 本体在隔离区再次执行 50 MB 精确限制。结构解析只在可终止子进程中运行，默认墙钟 5 秒、CPU 3 秒、地址空间 512 MiB；地址空间约为最大文件的十倍，为正常解析保留余量，同时限制紧凑恶意文件的放大效应。以上值由 `MAX_PDF_BYTES`、`PDF_VALIDATION_TIMEOUT_SECONDS`、`PDF_VALIDATION_CPU_SECONDS` 和 `PDF_VALIDATION_MEMORY_BYTES` 集中配置。
 
-Excel 导入同样在 multipart 解析前限制请求体，并按固定顺序执行 10 MB 文件限制、ZIP 签名、50 MB 解压总大小、100:1 压缩比、DTD/外部实体拒绝、30 秒进程级解析超时和 5,000 行限制。对应配置为 `IMPORT_MAX_UPLOAD_BYTES`、`IMPORT_MAX_DECOMPRESSED_BYTES`、`IMPORT_MAX_COMPRESSION_RATIO`、`IMPORT_PARSE_TIMEOUT_SECONDS` 与 `IMPORT_MAX_ROWS`。格式错误批次零产品写入并显示全部物理行错误；数据库、文件内及并发重复均只计入“重复跳过”。导入只创建产品与随机 token，不生成二维码。
+Excel 导入同样在 multipart 解析前限制请求体，并按固定顺序执行 10 MB 文件限制、ZIP 签名、50 MB 解压总大小、100:1 压缩比、DTD/外部实体拒绝、30 秒进程级解析超时、512 MiB 地址空间上限和 5,000 行限制。对应配置为 `IMPORT_MAX_UPLOAD_BYTES`、`IMPORT_MAX_DECOMPRESSED_BYTES`、`IMPORT_MAX_COMPRESSION_RATIO`、`IMPORT_PARSE_TIMEOUT_SECONDS`、`IMPORT_PARSE_MEMORY_BYTES` 与 `IMPORT_MAX_ROWS`。其中内存预算是解析 worker 的实现级资源限制：Linux 使用绝对 `RLIMIT_AS`，Darwin 按 worker 启动时虚拟地址空间加配置预算限制后续增长；该值不属于业务默认值。格式错误批次零产品写入并显示全部物理行错误；数据库、文件内及并发重复均只计入“重复跳过”。导入只创建产品与随机 token，不生成二维码。
 
 公开扫码地址 `/p/{public_token}` 不要求登录。取得产品详情页显示的公开 URL 后可直接验证：
 

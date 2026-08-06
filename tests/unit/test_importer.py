@@ -5,6 +5,10 @@ from __future__ import annotations
 import asyncio
 import io
 import math
+import multiprocessing
+import resource
+import subprocess
+import sys
 import zipfile
 from collections import Counter
 from collections.abc import Coroutine, Sequence
@@ -26,6 +30,7 @@ from product_pdf_qr.config import (
     DEFAULT_IMPORT_MAX_DECOMPRESSED_BYTES,
     DEFAULT_IMPORT_MAX_ROWS,
     DEFAULT_IMPORT_MAX_UPLOAD_BYTES,
+    DEFAULT_IMPORT_PARSE_MEMORY_BYTES,
     DEFAULT_IMPORT_PARSE_TIMEOUT_SECONDS,
     Settings,
 )
@@ -38,7 +43,9 @@ from product_pdf_qr.domains.importer.parser import (
     XlsxRejected,
     _cell_text,
     _column_index,
+    _parse_worker,
     _rows,
+    _set_xlsx_worker_memory_limit,
     _wait_for_process,
     inspect_xlsx_container,
     parse_xlsx,
@@ -64,6 +71,16 @@ from tests.unit.test_business_services import (
 from tests.xlsx_helpers import build_sparse_wide_xlsx, build_xlsx
 
 DATABASE_URL = "postgresql://app_rw:synthetic@127.0.0.1:5432/test"
+
+
+def memory_exhausting_xlsx_parser(
+    _content: bytes,
+    _max_rows: int,
+) -> ParsedWorkbook:
+    """Attempt growth well beyond the worker budget to exercise RLIMIT_AS."""
+
+    bytearray(256 * 1024 * 1024)
+    raise AssertionError("allocation unexpectedly escaped the address-space limit")
 
 
 def workbook(
@@ -462,6 +479,104 @@ async def test_timeout_parser_success_returns_complete_workbook() -> None:
     )
 
 
+def test_xlsx_worker_memory_limit_uses_absolute_linux_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(
+        resource,
+        "setrlimit",
+        lambda resource_id, values: limits.append((resource_id, values)),
+    )
+
+    _set_xlsx_worker_memory_limit(512)
+
+    assert limits == [(resource.RLIMIT_AS, (512, 512))]
+
+
+def test_xlsx_worker_memory_limit_bounds_growth_on_darwin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(subprocess, "check_output", lambda *_args, **_kwargs: "1000\n")
+    monkeypatch.setattr(
+        resource,
+        "setrlimit",
+        lambda resource_id, values: limits.append((resource_id, values)),
+    )
+
+    _set_xlsx_worker_memory_limit(512)
+
+    assert limits == [(resource.RLIMIT_AS, (1000 * 1024 + 512, 1000 * 1024 + 512))]
+
+
+def test_xlsx_worker_reports_only_bounded_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "product_pdf_qr.domains.importer.parser._set_xlsx_worker_memory_limit",
+        lambda _memory_bytes: None,
+    )
+
+    def run(parser: Any) -> tuple[object, ...]:
+        receiver, sender = multiprocessing.get_context("spawn").Pipe(duplex=False)
+        _parse_worker(sender, b"content", 5_000, 512, parser)
+        result = cast(tuple[object, ...], receiver.recv())
+        receiver.close()
+        return result
+
+    expected = workbook(("编码",), [(2, ("A",))])
+    assert run(lambda _content, _max_rows: expected) == ("success", expected)
+
+    def memory_error(_content: bytes, _max_rows: int) -> ParsedWorkbook:
+        raise MemoryError
+
+    assert run(memory_error) == ("resource_limit", 512)
+
+    def rejected(_content: bytes, _max_rows: int) -> ParsedWorkbook:
+        raise XlsxRejected(
+            "bounded",
+            "bounded rejection",
+            detail={"reason": "bounded"},
+            status_code=413,
+        )
+
+    assert run(rejected) == (
+        "rejected",
+        "bounded",
+        "bounded rejection",
+        {"reason": "bounded"},
+        413,
+        False,
+    )
+
+    def invalid(_content: bytes, _max_rows: int) -> ParsedWorkbook:
+        raise RuntimeError("invalid")
+
+    assert run(invalid) == ("failure", "RuntimeError", "invalid")
+
+
+@pytest.mark.anyio
+async def test_xlsx_worker_memory_ceiling_returns_bounded_rejection() -> None:
+    memory_budget = 64 * 1024 * 1024
+    with pytest.raises(XlsxRejected) as captured:
+        await parse_xlsx_with_timeout(
+            build_xlsx([[(1, ("编码",)), (2, ("A001",))]]),
+            timeout_seconds=5,
+            memory_bytes=memory_budget,
+            parser=memory_exhausting_xlsx_parser,
+        )
+
+    assert captured.value.code == "xlsx_parse_resource_limit"
+    assert captured.value.status_code == 413
+    assert captured.value.detail == {
+        "reason": "parser_memory_limit_exceeded",
+        "max_memory_bytes": memory_budget,
+    }
+
+
 def test_parser_cell_variants_coordinates_and_invalid_rows() -> None:
     inline = ElementTree.fromstring(
         '<c xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
@@ -553,9 +668,11 @@ def patch_valid_phase_one(monkeypatch: pytest.MonkeyPatch) -> None:
         *,
         timeout_seconds: float,
         max_rows: int,
+        memory_bytes: int,
     ) -> ParsedWorkbook:
         assert timeout_seconds == 30
         assert max_rows == 5_000
+        assert memory_bytes == DEFAULT_IMPORT_PARSE_MEMORY_BYTES
         return workbook(("编码",), [(2, ("A",))])
 
     monkeypatch.setattr(

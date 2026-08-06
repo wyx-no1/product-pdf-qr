@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import os
 import posixpath
 import re
+import resource
+
+# A fixed /bin/ps invocation reads this worker's own Darwin virtual size.
+import subprocess  # nosec B404
+import sys
 import time
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from io import BytesIO
 from multiprocessing.connection import Connection as PipeConnection
@@ -16,6 +22,8 @@ from multiprocessing.process import BaseProcess
 from pathlib import PurePosixPath
 
 from defusedxml import ElementTree  # type: ignore[import-untyped]
+
+from product_pdf_qr.config import DEFAULT_IMPORT_PARSE_MEMORY_BYTES
 
 XLSX_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 XML_DANGER_PATTERN = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
@@ -80,6 +88,9 @@ class ParsedWorkbook:
     headers: ParsedCells
     rows: tuple[ParsedRow, ...]
     nonempty_sheet_count: int
+
+
+XlsxParser = Callable[[bytes, int], ParsedWorkbook]
 
 
 class XlsxRejected(Exception):
@@ -459,11 +470,58 @@ def parse_xlsx(content: bytes, *, max_rows: int = 5_000) -> ParsedWorkbook:
     )
 
 
-def _parse_worker(sender: PipeConnection, content: bytes, max_rows: int) -> None:
+def _parse_xlsx_for_worker(content: bytes, max_rows: int) -> ParsedWorkbook:
+    return parse_xlsx(content, max_rows=max_rows)
+
+
+def _set_xlsx_worker_memory_limit(memory_bytes: int) -> None:
+    """Limit parser address-space growth before consuming untrusted XML."""
+
+    if sys.platform == "darwin":
+        # dyld reserves hundreds of GiB of sparse virtual address space before
+        # this worker starts. Bound additional growth by the configured budget.
+        current_vsize_bytes = (
+            int(
+                subprocess.check_output(  # nosec B603
+                    ["/bin/ps", "-o", "vsz=", "-p", str(os.getpid())],
+                    text=True,
+                ).strip()
+            )
+            * 1024
+        )
+        address_space_limit = current_vsize_bytes + memory_bytes
+        resource.setrlimit(
+            resource.RLIMIT_AS,
+            (address_space_limit, address_space_limit),
+        )
+        return
+    resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+
+
+def _send_worker_result(sender: PipeConnection, result: tuple[object, ...]) -> None:
     try:
-        sender.send(("success", parse_xlsx(content, max_rows=max_rows)))
+        sender.send(result)
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+
+
+def _parse_worker(
+    sender: PipeConnection,
+    content: bytes,
+    max_rows: int,
+    memory_bytes: int,
+    parser: XlsxParser,
+) -> None:
+    try:
+        _set_xlsx_worker_memory_limit(memory_bytes)
+        _send_worker_result(sender, ("success", parser(content, max_rows)))
+    except MemoryError:
+        _send_worker_result(sender, ("resource_limit", memory_bytes))
+    except (OSError, ValueError):
+        _send_worker_result(sender, ("resource_limit", memory_bytes))
     except XlsxRejected as error:
-        sender.send(
+        _send_worker_result(
+            sender,
             (
                 "rejected",
                 error.code,
@@ -471,10 +529,10 @@ def _parse_worker(sender: PipeConnection, content: bytes, max_rows: int) -> None
                 error.detail,
                 error.status_code,
                 error.format_error,
-            )
+            ),
         )
     except Exception as error:
-        sender.send(("failure", type(error).__name__, str(error)))
+        _send_worker_result(sender, ("failure", type(error).__name__, str(error)))
     finally:
         sender.close()
 
@@ -499,6 +557,8 @@ async def parse_xlsx_with_timeout(
     *,
     timeout_seconds: float,
     max_rows: int = 5_000,
+    memory_bytes: int = DEFAULT_IMPORT_PARSE_MEMORY_BYTES,
+    parser: XlsxParser = _parse_xlsx_for_worker,
 ) -> ParsedWorkbook:
     """Parse in a disposable process so timeout cancellation leaves no worker behind."""
 
@@ -506,7 +566,7 @@ async def parse_xlsx_with_timeout(
     receiver, sender = context.Pipe(duplex=False)
     process = context.Process(
         target=_parse_worker,
-        args=(sender, content, max_rows),
+        args=(sender, content, max_rows, memory_bytes, parser),
         daemon=True,
     )
     started_at = time.monotonic()
@@ -534,6 +594,17 @@ async def parse_xlsx_with_timeout(
     except (EOFError, OSError):
         await asyncio.to_thread(_terminate_and_reap, process)
         receiver.close()
+        if process.exitcode is not None and process.exitcode < 0:
+            raise XlsxRejected(
+                "xlsx_parse_resource_limit",
+                "XLSX 解析超过内存资源上限。",
+                detail={
+                    "reason": "parser_memory_limit_exceeded",
+                    "max_memory_bytes": memory_bytes,
+                    "exit_code": process.exitcode,
+                },
+                status_code=413,
+            ) from None
         raise XlsxRejected(
             "invalid_xlsx",
             "XLSX 解析失败。",
@@ -554,6 +625,16 @@ async def parse_xlsx_with_timeout(
             detail=dict(result[3]),
             status_code=int(result[4]),
             format_error=bool(result[5]),
+        )
+    if result[0] == "resource_limit":
+        raise XlsxRejected(
+            "xlsx_parse_resource_limit",
+            "XLSX 解析超过内存资源上限。",
+            detail={
+                "reason": "parser_memory_limit_exceeded",
+                "max_memory_bytes": int(result[1]),
+            },
+            status_code=413,
         )
     raise XlsxRejected(
         "invalid_xlsx",
