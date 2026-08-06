@@ -64,6 +64,16 @@ jobs:
           TEST_DATABASE_URL: postgresql://app_rw:local-runtime-only@127.0.0.1:5432/product_pdf_qr_test
           TEST_MIGRATION_DATABASE_URL: postgresql+psycopg://app_migrate:local-migrate-only@127.0.0.1:5432/product_pdf_qr_test
           TEST_BACKUP_DATABASE_URL: postgresql://app_backup:local-backup-only@127.0.0.1:5432/product_pdf_qr_test
+      - run: uv run pytest -m api --junitxml=reports/pytest-api.xml
+        env:
+          TEST_DATABASE_URL: postgresql://app_rw:local-runtime-only@127.0.0.1:5432/product_pdf_qr_test
+          TEST_MIGRATION_DATABASE_URL: postgresql+psycopg://app_migrate:local-migrate-only@127.0.0.1:5432/product_pdf_qr_test
+          TEST_BACKUP_DATABASE_URL: postgresql://app_backup:local-backup-only@127.0.0.1:5432/product_pdf_qr_test
+      - run: uv run pytest -m e2e --junitxml=reports/pytest-e2e.xml
+        env:
+          TEST_DATABASE_URL: postgresql://app_rw:local-runtime-only@127.0.0.1:5432/product_pdf_qr_test
+          TEST_MIGRATION_DATABASE_URL: postgresql+psycopg://app_migrate:local-migrate-only@127.0.0.1:5432/product_pdf_qr_test
+          TEST_BACKUP_DATABASE_URL: postgresql://app_backup:local-backup-only@127.0.0.1:5432/product_pdf_qr_test
       - uses: actions/upload-artifact@v4
         if: always()
         with:

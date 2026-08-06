@@ -12,7 +12,7 @@ from uuid import UUID
 
 from psycopg.errors import UniqueViolation
 
-from product_pdf_qr.database import Database
+from product_pdf_qr.database import Connection, Database
 from product_pdf_qr.domains.audit import AuditEvent, append_event
 from product_pdf_qr.errors import AppError
 
@@ -107,42 +107,64 @@ async def create_product(
 ) -> Product:
     """Atomically create a product and its success audit event."""
 
+    async with database.connection() as connection:
+        return await create_product_in_transaction(
+            connection,
+            raw_code,
+            raw_name,
+            actor_id=actor_id,
+            request_id=request_id,
+            audit_action="product_create",
+        )
+
+
+async def create_product_in_transaction(
+    connection: Connection,
+    raw_code: str,
+    raw_name: str,
+    *,
+    actor_id: int,
+    request_id: UUID | None = None,
+    audit_action: str | None = None,
+) -> Product:
+    """Create one product inside the caller's transaction, using a savepoint per attempt."""
+
     code = normalize_product_code(raw_code)
     name = normalize_product_name(raw_name)
     for _attempt in range(TOKEN_RETRY_LIMIT):
         token = generate_public_token()
         try:
-            async with database.connection() as connection:
-                async with connection.transaction():
-                    cursor = await connection.execute(
-                        """
-                        INSERT INTO products (
-                            code,
-                            name,
-                            public_token,
-                            created_at,
-                            updated_at
-                        ) VALUES (%s, %s, %s, now(), now())
-                        RETURNING
-                            id,
-                            code,
-                            name,
-                            public_token,
-                            status,
-                            current_version_id,
-                            created_at,
-                            updated_at
-                        """,
-                        (code, name, token),
-                    )
-                    row = await cursor.fetchone()
-                    if row is None:
-                        raise RuntimeError("Product insert returned no row")
-                    product = _product_from_row(row)
+            async with connection.transaction():
+                cursor = await connection.execute(
+                    """
+                    INSERT INTO products (
+                        code,
+                        name,
+                        public_token,
+                        created_at,
+                        updated_at
+                    ) VALUES (%s, %s, %s, now(), now())
+                    RETURNING
+                        id,
+                        code,
+                        name,
+                        public_token,
+                        status,
+                        current_version_id,
+                        created_at,
+                        updated_at
+                    """,
+                    (code, name, token),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise RuntimeError("Product insert returned no row")
+                product = _product_from_row(row)
+                if audit_action is not None:
                     await append_event(
                         connection,
                         AuditEvent(
-                            action="product_create",
+                            action=audit_action,
                             result="success",
                             actor_type="admin",
                             actor_id=actor_id,

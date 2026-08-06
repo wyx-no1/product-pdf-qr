@@ -1,0 +1,276 @@
+{% extends "base.html" %}
+
+{% block title %}Excel 批量导入产品{% endblock %}
+
+{% block head %}
+  <style>
+    :root {
+      color-scheme: light;
+      font-family:
+        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        sans-serif;
+      color: #172033;
+      background: #f3f6fa;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    button {
+      min-height: 44px;
+      padding: 0.7rem 1rem;
+      border: 0;
+      border-radius: 0.5rem;
+      color: #fff;
+      background: #2457d6;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    a:focus-visible {
+      outline: 3px solid #7aa2ff;
+      outline-offset: 2px;
+    }
+
+    a {
+      color: #1748bd;
+    }
+
+    .page-header {
+      padding: 1.1rem max(1rem, calc((100% - 920px) / 2));
+      color: #fff;
+      background: #172033;
+    }
+
+    .page-header-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .page-header h1 {
+      margin: 0;
+      font-size: 1.2rem;
+    }
+
+    .page-header a {
+      color: #fff;
+    }
+
+    main {
+      display: grid;
+      width: min(100% - 2rem, 920px);
+      gap: 1.5rem;
+      margin: 2rem auto;
+    }
+
+    .card {
+      padding: clamp(1.1rem, 3vw, 2rem);
+      border: 1px solid #d9e0ea;
+      border-radius: 0.75rem;
+      background: #fff;
+      box-shadow: 0 8px 24px rgb(23 32 51 / 7%);
+    }
+
+    .card h2 {
+      margin-top: 0;
+    }
+
+    .hint {
+      color: #5d687a;
+    }
+
+    .field {
+      margin: 1.25rem 0;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 0.5rem;
+      font-weight: 650;
+    }
+
+    input[type="file"] {
+      width: 100%;
+      padding: 0.75rem;
+      border: 1px solid #aeb9cb;
+      border-radius: 0.5rem;
+      background: #fff;
+    }
+
+    .feedback {
+      min-height: 1.5rem;
+      margin-bottom: 0;
+      color: #176138;
+    }
+
+    .feedback[data-kind="error"] {
+      color: #b42318;
+    }
+
+    .counts {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1rem;
+      margin: 1.25rem 0;
+    }
+
+    .count {
+      padding: 1rem;
+      border: 1px solid #d9e0ea;
+      border-radius: 0.65rem;
+      background: #f8faff;
+    }
+
+    .count dt {
+      color: #5d687a;
+      font-size: 0.9rem;
+      font-weight: 650;
+    }
+
+    .count dd {
+      margin: 0.35rem 0 0;
+      font-size: 1.8rem;
+      font-weight: 750;
+    }
+
+    .notice {
+      padding: 0.85rem 1rem;
+      border-radius: 0.5rem;
+      color: #66531c;
+      background: #fff4cd;
+    }
+
+    .error-list {
+      max-height: 36rem;
+      margin-bottom: 0;
+      padding-left: 1.5rem;
+      overflow-y: auto;
+    }
+
+    .error-list li {
+      padding: 0.25rem 0;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    @media (max-width: 620px) {
+      .page-header-inner {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .counts {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+      }
+    }
+  </style>
+{% endblock %}
+
+{% block content %}
+  <header class="page-header">
+    <div class="page-header-inner">
+      <h1>Excel 批量导入产品</h1>
+      <a href="/admin">返回产品管理</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="card" aria-labelledby="import-heading">
+      <h2 id="import-heading">上传 .xlsx 文件</h2>
+      <p class="hint">
+        仅读取第一个工作表。文件不超过 10 MB、数据不超过 5,000 行；
+        发现格式错误时整批不会写入。
+      </p>
+      <form
+        id="import-form"
+        action="/admin/imports"
+        method="post"
+        enctype="multipart/form-data"
+      >
+        <div class="field">
+          <label for="xlsx-file">选择 Excel 文件</label>
+          <input
+            id="xlsx-file"
+            name="file"
+            type="file"
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            required
+          >
+        </div>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button id="import-button" type="submit">开始导入</button>
+        <p id="import-feedback" class="feedback" role="status" aria-live="polite"></p>
+      </form>
+    </section>
+
+    {% if result %}
+    <section id="import-result" class="card" aria-labelledby="result-heading">
+      <h2 id="result-heading">导入结果</h2>
+      <dl class="counts">
+        <div class="count">
+          <dt>成功新增</dt>
+          <dd id="success-count">{{ result.success_count }}</dd>
+        </div>
+        <div class="count">
+          <dt>重复跳过</dt>
+          <dd id="duplicate-count">{{ result.duplicate_count }}</dd>
+        </div>
+        <div class="count">
+          <dt>格式错误</dt>
+          <dd id="format-error-count">{{ result.format_error_count }}</dd>
+        </div>
+      </dl>
+      <div id="import-notices" aria-label="导入提示">
+        {% for notice in result.notices %}
+          <p class="notice">{{ notice }}</p>
+        {% endfor %}
+      </div>
+      {% if result.errors %}
+      <div id="import-errors">
+        <h3>错误清单</h3>
+        <ol id="import-error-list" class="error-list">
+          {% for error in result.errors %}
+            <li
+              data-import-error
+              data-row="{{ error.row if error.row is not none else '' }}"
+              data-kind="{{ error.kind }}"
+            >
+              {% if error.row is not none %}第 {{ error.row }} 行：{% endif %}{{ error.reason }}
+            </li>
+          {% endfor %}
+        </ol>
+      </div>
+      {% endif %}
+    </section>
+    {% endif %}
+  </main>
+{% endblock %}

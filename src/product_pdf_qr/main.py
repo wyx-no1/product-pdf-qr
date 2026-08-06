@@ -12,6 +12,7 @@ from product_pdf_qr.auth_middleware import AdminAuthenticationMiddleware
 from product_pdf_qr.config import get_settings
 from product_pdf_qr.database import Database
 from product_pdf_qr.domains.auth import LoginRateLimiter, PasswordManager
+from product_pdf_qr.domains.importer.router import router as importer_router
 from product_pdf_qr.domains.product.router import router as product_router
 from product_pdf_qr.domains.public import PublicMissLimiter
 from product_pdf_qr.domains.public.router import router as public_router
@@ -75,6 +76,7 @@ def create_app() -> FastAPI:
     register_exception_handlers(application)
     application.include_router(admin_router)
     application.include_router(product_router)
+    application.include_router(importer_router)
     application.include_router(qrcode_router)
     application.include_router(storage_router)
     application.include_router(public_router)
