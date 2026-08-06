@@ -17,6 +17,12 @@ def test_settings_are_local_by_default() -> None:
     assert settings.app_port == 8000
     assert settings.storage_root == Path("storage/local")
     assert settings.max_pdf_bytes == 50 * 1024 * 1024
+    assert settings.import_max_upload_bytes == 10 * 1024 * 1024
+    assert settings.import_max_decompressed_bytes == 50 * 1024 * 1024
+    assert settings.import_max_compression_ratio == 100
+    assert settings.import_parse_timeout_seconds == 30
+    assert settings.import_parse_memory_bytes == 512 * 1024 * 1024
+    assert settings.import_max_rows == 5_000
     assert settings.pdf_validation_timeout_seconds == 5
     assert settings.pdf_validation_cpu_seconds == 3
     assert settings.pdf_validation_memory_bytes == 512 * 1024 * 1024

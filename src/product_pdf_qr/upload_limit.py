@@ -22,6 +22,7 @@ PDF_UPLOAD_PATH = re.compile(
     r"^/api/products/(?P<product_id>[^/]+)/pdf$",
     re.ASCII,
 )
+PRODUCT_IMPORT_PATHS = frozenset({"/api/product-imports", "/admin/imports"})
 
 
 class UploadRequestLimitMiddleware:
@@ -39,28 +40,32 @@ class UploadRequestLimitMiddleware:
         self.multipart_overhead_bytes = multipart_overhead_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if not self._is_pdf_upload(scope):
+        is_pdf_upload = self._is_pdf_upload(scope)
+        is_product_import = self._is_product_import(scope)
+        if not is_pdf_upload and not is_product_import:
             await self.app(scope, receive, send)
             return
 
-        max_pdf_bytes = self.configured_max_pdf_bytes
-        if max_pdf_bytes is None:
-            max_pdf_bytes = get_settings().max_pdf_bytes
-        max_request_bytes = max_pdf_bytes + self.multipart_overhead_bytes
+        settings = get_settings()
+        max_payload_bytes = self.configured_max_pdf_bytes
+        if max_payload_bytes is None:
+            max_payload_bytes = (
+                settings.max_pdf_bytes if is_pdf_upload else settings.import_max_upload_bytes
+            )
+        max_request_bytes = max_payload_bytes + self.multipart_overhead_bytes
         content_length = self._content_length(scope)
         if content_length is not None and content_length > max_request_bytes:
             request_id = uuid4()
-            await self._audit_rejection(
-                scope,
-                request_id=request_id,
-                detail={
-                    "reason": "content_length_exceeded",
-                    "stage": "pre_parser_size",
-                    "declared_content_length": content_length,
-                    "declared_request_body_verified": False,
-                    "complete_pdf_byte_length_known": False,
-                },
-            )
+            detail: dict[str, object] = {
+                "reason": "content_length_exceeded",
+                "stage": "pre_parser_size",
+                "declared_content_length": content_length,
+                "declared_request_body_verified": False,
+                "complete_pdf_byte_length_known": False,
+            }
+            if is_product_import:
+                detail["max_payload_bytes"] = max_payload_bytes
+            await self._audit_rejection(scope, request_id=request_id, detail=detail)
             await self._reject(scope, receive, send, request_id=request_id)
             return
 
@@ -91,16 +96,15 @@ class UploadRequestLimitMiddleware:
                 raise
         if too_large:
             request_id = uuid4()
-            await self._audit_rejection(
-                scope,
-                request_id=request_id,
-                detail={
-                    "reason": "chunked_stream_exceeded",
-                    "stage": "pre_parser_size",
-                    "received_bytes_before_abort": received_bytes,
-                    "complete_pdf_byte_length_known": False,
-                },
-            )
+            detail = {
+                "reason": "chunked_stream_exceeded",
+                "stage": "pre_parser_size",
+                "received_bytes_before_abort": received_bytes,
+                "complete_pdf_byte_length_known": False,
+            }
+            if is_product_import:
+                detail["max_payload_bytes"] = max_payload_bytes
+            await self._audit_rejection(scope, request_id=request_id, detail=detail)
             await self._reject(scope, receive, send, request_id=request_id)
 
     @staticmethod
@@ -109,6 +113,14 @@ class UploadRequestLimitMiddleware:
             scope["type"] == "http"
             and scope.get("method") == "POST"
             and PDF_UPLOAD_PATH.fullmatch(scope.get("path", "")) is not None
+        )
+
+    @staticmethod
+    def _is_product_import(scope: Scope) -> bool:
+        return (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path") in PRODUCT_IMPORT_PATHS
         )
 
     @staticmethod
@@ -130,7 +142,8 @@ class UploadRequestLimitMiddleware:
         request_id: UUID,
         detail: dict[str, object],
     ) -> None:
-        match = PDF_UPLOAD_PATH.fullmatch(scope.get("path", ""))
+        path = scope.get("path", "")
+        match = PDF_UPLOAD_PATH.fullmatch(path)
         product_id: int | None = None
         if match is not None:
             try:
@@ -145,14 +158,15 @@ class UploadRequestLimitMiddleware:
         actor_id = admin.id if isinstance(admin, AuthenticatedAdmin) else None
         try:
             database = cast(Database, scope["app"].state.database)
+            is_product_import = path in PRODUCT_IMPORT_PATHS
             written = await append_independent_event(
                 database,
                 AuditEvent(
-                    action="pdf_upload_rejected",
+                    action="product_import" if is_product_import else "pdf_upload_rejected",
                     result="failure",
                     actor_type=actor_type,
                     actor_id=actor_id,
-                    target_type="product",
+                    target_type="product_batch" if is_product_import else "product",
                     target_id=product_id,
                     request_id=request_id,
                     detail=detail,
@@ -177,12 +191,15 @@ class UploadRequestLimitMiddleware:
         *,
         request_id: UUID,
     ) -> None:
+        is_product_import = scope.get("path") in PRODUCT_IMPORT_PATHS
         response = JSONResponse(
             status_code=413,
             content={
                 "error": {
-                    "code": "pdf_too_large",
-                    "message": "PDF 文件不得超过 50 MB。",
+                    "code": "xlsx_too_large" if is_product_import else "pdf_too_large",
+                    "message": (
+                        "文件超过 10 MB 上限。" if is_product_import else "PDF 文件不得超过 50 MB。"
+                    ),
                 }
             },
             headers={

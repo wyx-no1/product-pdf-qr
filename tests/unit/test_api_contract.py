@@ -20,6 +20,8 @@ def test_business_loop_routes_are_present_and_out_of_scope_routes_absent() -> No
     assert "/api/products/{product_id}/qrcode/retry" in paths
     assert "/api/storage/orphans" in paths
     assert "/api/qrcode/failures" in paths
+    assert "/api/product-imports" in paths
+    assert set(paths["/api/product-imports"]) == {"post"}
     assert "/p/{public_token}" in paths
 
     serialized = str(schema).lower()
@@ -81,5 +83,15 @@ def test_pdf_upload_no_longer_accepts_a_client_actor_identity() -> None:
     body_schema = schema["components"]["schemas"][body_reference.rsplit("/", 1)[-1]]
 
     assert "actor_id" not in str(operation)
+    assert body_schema["required"] == ["file"]
+    assert set(body_schema["properties"]) == {"file"}
+
+
+def test_excel_import_accepts_only_one_multipart_file() -> None:
+    schema = create_app().openapi()
+    operation = schema["paths"]["/api/product-imports"]["post"]
+    body_reference = operation["requestBody"]["content"]["multipart/form-data"]["schema"]["$ref"]
+    body_schema = schema["components"]["schemas"][body_reference.rsplit("/", 1)[-1]]
+
     assert body_schema["required"] == ["file"]
     assert set(body_schema["properties"]) == {"file"}

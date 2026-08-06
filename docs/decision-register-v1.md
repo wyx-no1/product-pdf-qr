@@ -222,6 +222,9 @@
 - 【理由】有界拒绝可恢复，无界接收可能拖垮服务；配置化使调整无需改变业务数据。
 - 【影响】可能误拒绝真实大文件或大批次，因此公网验收前应以脱敏规模统计校准，并记录调整依据。
 - 【状态】已采用安全默认值。
+- 【Issue #27 显式授权技术默认值 1】Excel 解压后总大小上限为 50 MB，由 `IMPORT_MAX_DECOMPRESSED_BYTES` 配置。
+- 【Issue #27 显式授权技术默认值 2】Excel 压缩比上限为 100:1，由 `IMPORT_MAX_COMPRESSION_RATIO` 配置。
+- 【Issue #27 显式授权技术默认值 3】Excel 解析超时为 30 秒，由 `IMPORT_PARSE_TIMEOUT_SECONDS` 配置。
 
 ### T-10 公开随机标识的熵与生成
 

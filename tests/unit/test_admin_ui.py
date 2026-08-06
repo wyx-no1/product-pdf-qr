@@ -133,3 +133,29 @@ async def test_admin_page_routes_do_not_expand_openapi_surface() -> None:
     assert "/admin/login" not in paths
     assert "/admin/change-password" not in paths
     assert "/admin/products/{product_id}" not in paths
+    assert "/admin/imports" not in paths
+
+
+async def test_authenticated_import_page_has_protected_upload_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def resolve(_database: object, _token: str) -> AuthenticatedAdmin:
+        return admin_identity()
+
+    monkeypatch.setattr("product_pdf_qr.auth_middleware.resolve_session", resolve)
+    app = create_app()
+    app.state.database = object()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        cookies={SESSION_COOKIE_NAME: "browser-token"},
+    ) as client:
+        response = await client.get("/admin/imports")
+
+    assert response.status_code == 200
+    assert 'action="/admin/imports"' in response.text
+    assert 'method="post"' in response.text
+    assert 'enctype="multipart/form-data"' in response.text
+    assert 'name="csrf_token"' in response.text
+    assert 'accept=".xlsx,' in response.text
