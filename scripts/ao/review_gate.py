@@ -13,14 +13,49 @@ from scripts.ao.models import PullRequest
 REQUIRED_CI_JOBS = frozenset({"quality", "database", "container"})
 EVIDENCE_PREFIX = "docs/evidence/"
 STALL_THRESHOLD = timedelta(minutes=30)
-VERDICT_HEADING_PATTERN = re.compile(
-    r"^## Review verdict: (.*)$",
-    flags=re.MULTILINE,
+TERMINAL_CI_STATES = frozenset(
+    {
+        "action_required",
+        "cancelled",
+        "error",
+        "failure",
+        "neutral",
+        "skipped",
+        "stale",
+        "startup_failure",
+        "success",
+        "timed_out",
+    }
 )
-KNOWN_VERDICTS = {
-    "approved": "approved",
-    "changes requested": "changes_requested",
-}
+
+
+@dataclass(frozen=True)
+class VerdictGrammar:
+    """One canonical verdict-heading language: its pattern and exact known values."""
+
+    heading: re.Pattern[str]
+    verdicts: Mapping[str, str]
+
+
+# Each grammar accepts only its own complete values; a heading from one grammar
+# with a value from the other stays unknown, and headings from both grammars in
+# a single body count together toward the exactly-one requirement.
+VERDICT_GRAMMARS: tuple[VerdictGrammar, ...] = (
+    VerdictGrammar(
+        heading=re.compile(r"^## Review verdict: (.*)$", flags=re.MULTILINE),
+        verdicts={
+            "approved": "approved",
+            "changes requested": "changes_requested",
+        },
+    ),
+    VerdictGrammar(
+        heading=re.compile(r"^## 审查结论：(.*)$", flags=re.MULTILINE),  # noqa: RUF001
+        verdicts={
+            "通过": "approved",
+            "需要修改": "changes_requested",
+        },
+    ),
+)
 
 
 class ReviewGateError(RuntimeError):
@@ -391,12 +426,16 @@ def evaluate_review_gate(
 
 
 def _review_verdict(body: str) -> str | None:
+    normalized = body.replace("\r\n", "\n")
     matches = tuple(
-        match.group(1) for match in VERDICT_HEADING_PATTERN.finditer(body.replace("\r\n", "\n"))
+        (grammar, match.group(1))
+        for grammar in VERDICT_GRAMMARS
+        for match in grammar.heading.finditer(normalized)
     )
     if len(matches) != 1:
         return None
-    return KNOWN_VERDICTS.get(matches[0])
+    grammar, value = matches[0]
+    return grammar.verdicts.get(value)
 
 
 def _latest_observations(
@@ -406,9 +445,11 @@ def _latest_observations(
     for observation in observations:
         current = latest.get(observation.name)
         if current is None or (
+            observation.state in TERMINAL_CI_STATES,
             observation.observed_at,
             observation.observation_id,
         ) > (
+            current.state in TERMINAL_CI_STATES,
             current.observed_at,
             current.observation_id,
         ):
