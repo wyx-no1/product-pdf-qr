@@ -193,19 +193,25 @@ def test_production_preflight_is_network_isolated_and_repeatable() -> None:
 
     for expected in (
         "config --format json",
-        'python3 "$repository_root/scripts/production/validate_compose.py"',
+        "python:3.12.13-alpine3.24@sha256:"
+        "6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df",
+        "/validate_compose.py",
+        "--pull missing",
+        "--interactive",
         "--network none",
         "--read-only",
         "--cap-drop ALL",
         "--security-opt no-new-privileges:true",
+        "--user 65534:65534",
         '--env-file "$environment_file"',
         "--env DEPLOYMENT_MODE=production",
         "--env APP_BIND_HOST=172.30.0.20",
         "--env FORWARDED_ALLOW_IPS=172.30.0.10",
     ):
         assert expected in wrapper
+    assert "python3 " not in wrapper
     assert "compose run" not in wrapper
-    assert wrapper.index("config --format json") < wrapper.index("docker run --rm")
+    assert wrapper.index("config --format json") < wrapper.index("docker run --rm --interactive")
     assert "DEPLOYMENT_MODE: production" in compose
     assert "APP_BIND_HOST: 172.30.0.20" in compose
     assert "FORWARDED_ALLOW_IPS: 172.30.0.10" in compose
@@ -219,8 +225,14 @@ def test_production_wrapper_bootstraps_an_empty_certificate_volume() -> None:
     bootstrap = (ROOT / "scripts/production/bootstrap-certificate.sh").read_text(encoding="utf-8")
 
     assert "ensure_bootstrap_certificate" in wrapper
-    assert "test -s /tmp/active/fullchain.pem" in wrapper
-    assert "test -s /tmp/active/privkey.pem" in wrapper
+    assert "test ! -e /tmp/active && test ! -L /tmp/active" in wrapper
+    assert 'certificate_path="/tmp/active/fullchain.pem"' in wrapper
+    assert 'private_key_path="/tmp/active/privkey.pem"' in wrapper
+    assert 'test -s "$certificate_path"' in wrapper
+    assert 'test -s "$private_key_path"' in wrapper
+    assert "-noout -checkend 86400" in wrapper
+    assert '-noout -checkhost "$PUBLIC_DOMAIN"' in wrapper
+    assert 'test "$certificate_key" = "$private_key"' in wrapper
     assert "PRODUCTION_CERTIFICATE_BOOTSTRAP=1" in wrapper
     assert 'PRODUCTION_CERTIFICATE_BOOTSTRAP=1 "$compose" up --detach certbot' in bootstrap
 

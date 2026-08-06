@@ -27,15 +27,46 @@ compose() {
   docker compose --env-file "$environment_file" -f "$compose_file" "$@"
 }
 
+validator_image="python:3.12.13-alpine3.24@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df"
 compose config --format json |
-  python3 "$repository_root/scripts/production/validate_compose.py" >/dev/null
+  docker run --rm --interactive \
+    --pull missing \
+    --network none \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --user 65534:65534 \
+    --volume "$repository_root/scripts/production/validate_compose.py:/validate_compose.py:ro" \
+    --entrypoint python \
+    "$validator_image" \
+    /validate_compose.py >/dev/null
 
 ensure_bootstrap_certificate() {
   compose up --detach certbot
-  if ! compose exec --no-TTY certbot sh -eu -c \
-    'test -s /tmp/active/fullchain.pem && test -s /tmp/active/privkey.pem'; then
+  if compose exec --no-TTY certbot sh -eu -c \
+    'test ! -e /tmp/active && test ! -L /tmp/active'; then
     PRODUCTION_CERTIFICATE_BOOTSTRAP=1 \
       "$repository_root/scripts/production/bootstrap-certificate.sh"
+  fi
+  if ! compose exec --no-TTY certbot sh -eu -c '
+    certificate_path="/tmp/active/fullchain.pem"
+    private_key_path="/tmp/active/privkey.pem"
+    test -s "$certificate_path"
+    test -s "$private_key_path"
+    openssl x509 -in "$certificate_path" -noout -checkend 86400
+    openssl x509 -in "$certificate_path" -noout -checkhost "$PUBLIC_DOMAIN"
+    certificate_key="$(
+      openssl x509 -in "$certificate_path" -pubkey -noout |
+        openssl pkey -pubin -outform DER 2>/dev/null |
+        openssl sha256
+    )"
+    private_key="$(
+      openssl pkey -in "$private_key_path" -pubout -outform DER 2>/dev/null |
+        openssl sha256
+    )"
+    test "$certificate_key" = "$private_key"
+  '; then
+    fail "active certificate is invalid; repair it or run bootstrap-certificate.sh explicitly"
   fi
 }
 

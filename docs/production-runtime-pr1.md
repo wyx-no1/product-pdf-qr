@@ -98,8 +98,10 @@ scripts/production/prod-compose.sh up --detach --wait
 包装器拒绝 symlink、非当前用户所有或不是 0600 的环境文件，先以
 `docker compose config --format json` 通过管道送入非回显结构验证器，实际镜像、
 拓扑和固定安全值不合规时在拉取/运行任何生产镜像前失败；随后用最终 app 镜像运行
-生产 Settings 预检。生产模式、app 前端监听地址和 proxy 信任地址在生产 Compose
-中硬编码，不接受 `.env.prod` 覆盖。生产模式要求：
+生产 Settings 预检。结构验证器使用仓库固定 digest 的 Python 镜像，断网、只读、
+丢弃全部 capability 且以非 root 身份运行；宿主机只需 Docker Compose，无需安装
+Python。生产模式、app 前端监听地址和 proxy 信任地址在生产 Compose 中硬编码，
+不接受 `.env.prod` 覆盖。生产模式要求：
 
 - `PUBLIC_BASE_URL` 精确等于 `https://PUBLIC_DOMAIN`；
 - 域名小写、无末尾点、不是 IP/localhost/占位域；
@@ -116,18 +118,22 @@ make prod-env-check
 生产环境禁止保存、上传、粘贴或附在 PR/聊天中的真实 `docker compose config`
 输出。`.env.prod` 已被 Git 与 Docker build context 排除，不得进入镜像。
 
-首次 `up` 时包装器先只启动隔离的 certbot，检查证书卷中的 active 证书；若卷为空或
-证书对不完整，会自动调用 `bootstrap-certificate.sh` 生成两天有效的合成启动证书，
-再启动完整栈。因此全新卷的上述 `up --wait` 命令可重复执行。该证书只用于建立
-HTTP challenge 所需的冷启动链路，必须在任何公网开放或 G-17 前由授权人换成验证
-通过的正式证书。
+首次 `up` 时包装器先只启动隔离的 certbot。只有 `active` 路径完全不存在的全新卷
+才会自动调用 `bootstrap-certificate.sh` 生成两天有效的合成启动证书。随后每次启动
+都强制检查证书至少剩余 24 小时、主机名精确匹配 `PUBLIC_DOMAIN`，且公钥与私钥
+匹配；已有但过期、旧域名、密钥不匹配或文件不完整的 `active` 一律阻断启动，不会
+静默覆盖，运维者必须修复证书或显式运行 `bootstrap-certificate.sh`。因此全新卷的
+上述 `up --wait` 命令可重复执行，同时既有错误 TLS 身份保持 fail-closed。合成证书
+只用于建立 HTTP challenge 所需的冷启动链路，必须在任何公网开放或 G-17 前由授权人
+换成验证通过的正式证书。
 
 ## ACME、续期与回滚
 
 证书控制链不向任何容器挂 Docker socket：
 
-1. `prod-compose.sh up/start/restart` 在 active 证书缺失时自动调用
-   `bootstrap-certificate.sh`，后者只生成两天有效的本地/启动临时证书；
+1. `prod-compose.sh up/start/restart` 仅在全新卷没有 active 路径时自动调用
+   `bootstrap-certificate.sh`，后者只生成两天有效的本地/启动临时证书；既有无效
+   active 必须显式修复或引导；
 2. 授权人启动正式 Host 的 HTTP challenge 路由后运行 `issue-certificate.sh`；
 3. certbot 只通过独立出站网写 certificate/challenge 卷；
 4. 新证书必须通过有效期、主机名、公私钥匹配检查，才原子切换 active 目录；
