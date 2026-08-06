@@ -38,7 +38,7 @@ class VerdictGrammar:
 
 
 # Each grammar accepts only its own complete values; a heading from one grammar
-# with a value from the other stays unknown, and headings from both grammars in
+# with a value from another stays unknown, and headings from several grammars in
 # a single body count together toward the exactly-one requirement.
 VERDICT_GRAMMARS: tuple[VerdictGrammar, ...] = (
     VerdictGrammar(
@@ -53,6 +53,16 @@ VERDICT_GRAMMARS: tuple[VerdictGrammar, ...] = (
         verdicts={
             "通过": "approved",
             "需要修改": "changes_requested",
+        },
+    ),
+    # Bare headings as emitted by the AO review harness (see issue #30). The
+    # heading is the value itself, so the pattern admits only the two exact
+    # whole lines; decorated forms never match and stay unknown.
+    VerdictGrammar(
+        heading=re.compile(r"^## (Approved|Changes requested)$", flags=re.MULTILINE),
+        verdicts={
+            "Approved": "approved",
+            "Changes requested": "changes_requested",
         },
     ),
 )
