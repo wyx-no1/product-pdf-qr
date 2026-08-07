@@ -38,7 +38,8 @@ def read_password(*, password_stdin: bool) -> str:
 
     if password_stdin:
         password = sys.stdin.readline()
-        if password == "":
+        # The empty string is an input sentinel, not a hard-coded credential.
+        if password == "":  # nosec B105
             raise AppError("password_input_empty", "标准输入中没有密码。", 422)
         return password.removesuffix("\n").removesuffix("\r")
 

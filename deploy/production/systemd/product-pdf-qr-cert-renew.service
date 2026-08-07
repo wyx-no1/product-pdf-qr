@@ -1,0 +1,16 @@
+[Unit]
+Description=Renew Product PDF QR certificate and gracefully reload Nginx
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=product-pdf-qr
+Group=product-pdf-qr
+WorkingDirectory=/opt/product-pdf-qr/current
+ExecStart=/opt/product-pdf-qr/current/scripts/production/renew-and-reload.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/docker.sock

@@ -1,0 +1,11 @@
+[Unit]
+Description=Twice-daily Product PDF QR certificate renewal check
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=3600
+Persistent=true
+Unit=product-pdf-qr-cert-renew.service
+
+[Install]
+WantedBy=timers.target

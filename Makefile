@@ -1,7 +1,7 @@
 .PHONY: \
 	build build-reproducible check-docs dev down format format-check \
 	lint migration-downgrade migration-upgrade test test-integration test-unit typecheck \
-	verify-clean-start
+	prod-config-check prod-env-check verify-clean-start
 
 UV ?= uv
 CLEAN_START_ATTEMPTS ?= 3
@@ -52,6 +52,13 @@ migration-downgrade:
 
 check-docs:
 	$(UV) run python scripts/check_markdown_links.py
+
+prod-config-check:
+	docker compose --env-file .env.prod.example -f compose.prod.yaml \
+		config --format json | $(UV) run python scripts/production/validate_compose.py
+
+prod-env-check:
+	$(UV) run python scripts/production/validate_env_contract.py
 
 dev:
 	@test -f .env || cp .env.example .env

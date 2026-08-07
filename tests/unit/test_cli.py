@@ -13,10 +13,10 @@ from product_pdf_qr.errors import AppError
 def test_run_uses_centralized_loopback_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, int]] = []
+    calls: list[dict[str, object]] = []
 
-    def fake_run(_app: object, *, host: str, port: int) -> None:
-        calls.append((host, port))
+    def fake_run(_app: object, **kwargs: object) -> None:
+        calls.append(kwargs)
 
     monkeypatch.setenv(
         "DATABASE_URL",
@@ -31,7 +31,15 @@ def test_run_uses_centralized_loopback_default(
     finally:
         get_settings.cache_clear()
 
-    assert calls == [("127.0.0.1", 8000)]
+    assert calls == [
+        {
+            "host": "127.0.0.1",
+            "port": 8000,
+            "proxy_headers": True,
+            "forwarded_allow_ips": "127.0.0.1",
+            "access_log": False,
+        }
+    ]
 
 
 def test_admin_cli_exposes_no_password_value_argument() -> None:
