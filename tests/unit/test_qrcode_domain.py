@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import os
+import stat
 import struct
 from pathlib import Path
 
@@ -78,7 +80,29 @@ async def test_cache_miss_generates_and_next_request_hits(tmp_path: Path) -> Non
     assert first.cache_error is None
     assert second.cache_hit
     assert second.image_bytes == first.image_bytes
-    assert (service.cache_root / "A001.png").read_bytes() == first.image_bytes
+    cache_path = service.cache_root / "A001.png"
+    assert cache_path.read_bytes() == first.image_bytes
+    assert stat.S_IMODE(cache_path.stat().st_mode) == 0o660
+    assert stat.S_IMODE(cache_path.stat().st_mode) & 0o007 == 0
+
+
+@pytest.mark.anyio
+async def test_cache_acl_mask_failure_leaves_no_file_or_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
+
+    def fail_fchmod(_descriptor: int, _mode: int) -> None:
+        raise OSError("synthetic ACL mask failure")
+
+    monkeypatch.setattr(os, "fchmod", fail_fchmod)
+
+    result = await service.get_or_generate("A001", TOKEN)
+
+    assert result.cache_error == "OSError"
+    assert not (service.cache_root / "A001.png").exists()
+    assert list(service.cache_root.glob(".*.tmp")) == []
 
 
 @pytest.mark.anyio

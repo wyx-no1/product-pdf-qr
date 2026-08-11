@@ -1,0 +1,199 @@
+# Explicit PR2A one-shot capabilities. This overlay never changes the five
+# services in compose.prod.yaml and both profiles are off by default.
+x-backup-security: &backup-security
+  image: ${BACKUP_IMAGE:?BACKUP_IMAGE must be an immutable tag@sha256 reference}
+  user: "10002:10002"
+  privileged: false
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  init: true
+  pids_limit: 128
+  restart: "no"
+
+services:
+  backup-file-access-init:
+    <<: *backup-security
+    # UID 10001 owns every PR1 file object, so it can grant the named ACL
+    # without root or capabilities. This profile has no network or secrets.
+    user: "10001:10001"
+    profiles: ["backup-volume-init"]
+    entrypoint: ["/bin/sh", "/opt/backup-recovery/scripts/backup_recovery/init-file-access.sh"]
+    command: []
+    volumes:
+      - type: volume
+        source: file_data
+        target: /data/files
+    network_mode: none
+
+  backup:
+    <<: *backup-security
+    profiles: ["backup"]
+    command: ["python", "-m", "scripts.backup_recovery.cli"]
+    environment:
+      BACKUP_CONTRACT: /run/config/contract.json
+      BACKUP_AGE_RECIPIENT: ${BACKUP_AGE_RECIPIENT:?BACKUP_AGE_RECIPIENT is required}
+      BACKUP_RECIPIENT_KEY_ID: ${BACKUP_RECIPIENT_KEY_ID:?BACKUP_RECIPIENT_KEY_ID is required}
+      BACKUP_MANIFEST_AUTHENTICATION_KEY: /run/secrets/manifest-authentication.key
+      BACKUP_MANIFEST_AUTHENTICATION_KEY_ID: ${BACKUP_MANIFEST_AUTHENTICATION_KEY_ID:?BACKUP_MANIFEST_AUTHENTICATION_KEY_ID is required}
+      BACKUP_REMOTE: ${BACKUP_REMOTE:?BACKUP_REMOTE is required}
+      BACKUP_REMOTE_PREFIX: ${BACKUP_REMOTE_PREFIX:?BACKUP_REMOTE_PREFIX is required}
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:?POSTGRES_DB is required}
+      PGUSER: app_backup
+      PGPASSFILE: /run/secrets/app_backup_pgpass
+      SOURCE_COMMIT: ${SOURCE_COMMIT:?SOURCE_COMMIT is required}
+      APP_IMAGE: ${APP_IMAGE:?APP_IMAGE is required}
+      DB_IMAGE: ${DB_IMAGE:?DB_IMAGE is required}
+      PROXY_IMAGE: ${PROXY_IMAGE:?PROXY_IMAGE is required}
+      CERTBOT_IMAGE: ${CERTBOT_IMAGE:?CERTBOT_IMAGE is required}
+      BACKUP_IMAGE: ${BACKUP_IMAGE:?BACKUP_IMAGE is required}
+    volumes:
+      - type: volume
+        source: file_data
+        target: /data/files
+        read_only: true
+      - type: volume
+        source: backup_state
+        target: /var/lib/backup
+      - type: bind
+        source: .
+        target: /source
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BACKUP_CONFIG_FILE:?BACKUP_CONFIG_FILE is required}
+        target: /run/config/contract.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BACKUP_PGPASS_FILE:?BACKUP_PGPASS_FILE is required}
+        target: /run/secrets/app_backup_pgpass
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BACKUP_RCLONE_CONFIG_FILE:?BACKUP_RCLONE_CONFIG_FILE is required}
+        target: /run/secrets/rclone.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BACKUP_MANIFEST_AUTHENTICATION_KEY_FILE:?BACKUP_MANIFEST_AUTHENTICATION_KEY_FILE is required}
+        target: /run/secrets/manifest-authentication.key
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /run/work:size=256m,mode=0700,uid=10002,gid=10002,noexec,nosuid,nodev
+    networks:
+      database: {}
+
+  restore:
+    <<: *backup-security
+    profiles: ["restore"]
+    command: ["python", "-m", "scripts.backup_recovery.cli"]
+    environment:
+      BACKUP_CONTRACT: /run/config/contract.json
+      BACKUP_REMOTE: ${BACKUP_REMOTE:?BACKUP_REMOTE is required}
+      BACKUP_REMOTE_PREFIX: ${BACKUP_REMOTE_PREFIX:?BACKUP_REMOTE_PREFIX is required}
+      RESTORE_ENVIRONMENT_ID: ${RESTORE_ENVIRONMENT_ID:?RESTORE_ENVIRONMENT_ID is required}
+      BACKUP_AGE_RECIPIENT: ${BACKUP_AGE_RECIPIENT:?BACKUP_AGE_RECIPIENT is required}
+      BACKUP_RECIPIENT_KEY_ID: ${BACKUP_RECIPIENT_KEY_ID:?BACKUP_RECIPIENT_KEY_ID is required}
+      RESTORE_MANIFEST_VERIFICATION_KEY: /run/secrets/manifest-verification.key
+      BACKUP_MANIFEST_AUTHENTICATION_KEY_ID: ${BACKUP_MANIFEST_AUTHENTICATION_KEY_ID:?BACKUP_MANIFEST_AUTHENTICATION_KEY_ID is required}
+      RESTORE_VERIFICATION_AUTHENTICATION_KEY: /run/secrets/restore-verification-authentication.key
+      RESTORE_VERIFICATION_AUTHENTICATION_KEY_ID: ${RESTORE_VERIFICATION_AUTHENTICATION_KEY_ID:?RESTORE_VERIFICATION_AUTHENTICATION_KEY_ID is required}
+      RESTORE_CONFIRMATION: ${RESTORE_CONFIRMATION:?RESTORE_CONFIRMATION is required}
+      SOURCE_COMMIT: ${SOURCE_COMMIT:?SOURCE_COMMIT is required}
+      APP_IMAGE: ${APP_IMAGE:?APP_IMAGE is required}
+      DB_IMAGE: ${DB_IMAGE:?DB_IMAGE is required}
+      PROXY_IMAGE: ${PROXY_IMAGE:?PROXY_IMAGE is required}
+      CERTBOT_IMAGE: ${CERTBOT_IMAGE:?CERTBOT_IMAGE is required}
+      BACKUP_IMAGE: ${BACKUP_IMAGE:?BACKUP_IMAGE is required}
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:?POSTGRES_DB is required}
+      PGUSER: app_migrate
+      PGPASSFILE: /run/secrets/app_migrate_pgpass
+    volumes:
+      - type: volume
+        source: file_data
+        target: /data/files
+      - type: volume
+        source: backup_state
+        target: /var/lib/backup
+      - type: bind
+        source: .
+        target: /source
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BACKUP_CONFIG_FILE:?BACKUP_CONFIG_FILE is required}
+        target: /run/config/contract.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BACKUP_RCLONE_CONFIG_FILE:?BACKUP_RCLONE_CONFIG_FILE is required}
+        target: /run/secrets/rclone.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RESTORE_PGPASS_FILE:?RESTORE_PGPASS_FILE is required}
+        target: /run/secrets/app_migrate_pgpass
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RESTORE_AGE_IDENTITY_FILE:?RESTORE_AGE_IDENTITY_FILE is required}
+        target: /run/secrets/age-identity.txt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RESTORE_MANIFEST_VERIFICATION_KEY_FILE:?RESTORE_MANIFEST_VERIFICATION_KEY_FILE is required}
+        target: /run/secrets/manifest-verification.key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RESTORE_VERIFICATION_AUTHENTICATION_KEY_FILE:?RESTORE_VERIFICATION_AUTHENTICATION_KEY_FILE is required}
+        target: /run/secrets/restore-verification-authentication.key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RESTORE_ENVIRONMENT_MARKER_FILE:?RESTORE_ENVIRONMENT_MARKER_FILE is required}
+        target: /run/config/environment-id
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RESTORE_AUTHORIZATION_FILE:?RESTORE_AUTHORIZATION_FILE is required}
+        target: /run/secrets/restore-authorization.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RESTORE_FUNCTIONAL_EVIDENCE_FILE:?RESTORE_FUNCTIONAL_EVIDENCE_FILE is required}
+        target: /run/config/functional-evidence.json
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /run/work:size=256m,mode=0700,uid=10002,gid=10002,noexec,nosuid,nodev
+    networks:
+      database: {}
+      frontend: {}
+
+volumes:
+  backup_state:
+    name: product_pdf_qr_backup_state

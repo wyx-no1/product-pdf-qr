@@ -1,0 +1,11 @@
+[Unit]
+Description=Product PDF QR daytime encrypted precopy schedule
+
+[Timer]
+OnCalendar=*-*-* 06,10,14,18,22:30:00 Asia/Shanghai
+Persistent=true
+AccuracySec=1min
+Unit=product-pdf-qr-backup-precopy.service
+
+[Install]
+WantedBy=timers.target

@@ -88,3 +88,36 @@ RUN apk add --no-cache openssl=3.5.7-r0 \
     && unlink /tmp/certbot-requirements.txt
 USER 1000:101
 ENTRYPOINT ["certbot"]
+
+
+# PR2A backup and recovery are explicit one-shot jobs. The final image contains
+# PostgreSQL 16 client tools, age authenticated encryption, rclone's S3 adapter,
+# and only the backup/recovery orchestration package plus its Ed25519 verifier
+# dependency (no application or test dependency).
+FROM python:3.12.13-alpine3.24@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df AS backup-recovery-runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+COPY deploy/backup/requirements.txt /tmp/backup-recovery-requirements.txt
+RUN apk add --no-cache \
+        acl=2.3.2-r1 \
+        age=1.3.1-r5 \
+        postgresql16-client=16.14-r0 \
+        rclone=1.74.1-r1 \
+    && pip install --no-cache-dir --no-compile --only-binary=:all: \
+        --require-hashes --requirement /tmp/backup-recovery-requirements.txt \
+    && unlink /tmp/backup-recovery-requirements.txt \
+    && addgroup -g 10002 -S backup \
+    && adduser -u 10002 -S -D -G backup -h /nonexistent -s /sbin/nologin backup \
+    && mkdir -p /var/lib/backup \
+    && touch /var/lib/backup/.volume-owner-10002 \
+    && chown -R 10002:10002 /var/lib/backup \
+    && chmod 0700 /var/lib/backup \
+    && unlink /var/log/apk.log
+WORKDIR /opt/backup-recovery
+COPY --chown=10002:10002 scripts/__init__.py ./scripts/__init__.py
+COPY --chown=10002:10002 scripts/backup_recovery ./scripts/backup_recovery
+COPY --chown=10002:10002 deploy/backup/contract.json ./deploy/backup/contract.json
+RUN find /opt/backup-recovery -type d -name __pycache__ -prune -exec rm -rf {} +
+USER 10002:10002
+ENTRYPOINT ["python", "-m", "scripts.backup_recovery.cli"]

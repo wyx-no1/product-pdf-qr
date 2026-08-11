@@ -204,6 +204,8 @@ class StorageService:
             suffix=".part",
             dir=self.temporary_root,
         )
+        # Keep untrusted/incomplete input private. The group-class ACL mask is
+        # restored only immediately before the validated file is published.
         temporary_path = Path(temporary_name)
         size_bytes = 0
         digest = hashlib.sha256()
@@ -356,7 +358,15 @@ class StorageService:
         if target.exists():
             upload.discard()
             return PublishedFile(relative, target, moved=False)
-        os.rename(upload.temporary_path, target)
+        descriptor = os.open(
+            upload.temporary_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fchmod(descriptor, 0o660)
+            os.rename(upload.temporary_path, target)
+        finally:
+            os.close(descriptor)
         return PublishedFile(relative, target, moved=True)
 
     async def _publish_lock(self, sha256: str) -> asyncio.Lock:

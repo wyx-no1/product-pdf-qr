@@ -1,0 +1,12 @@
+[Unit]
+Description=Product PDF QR authorized nightly backup window
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 Asia/Shanghai
+# Deliberately false: a missed night must never stop the app during daytime.
+Persistent=false
+AccuracySec=1min
+Unit=product-pdf-qr-backup-finalize.service
+
+[Install]
+WantedBy=timers.target
