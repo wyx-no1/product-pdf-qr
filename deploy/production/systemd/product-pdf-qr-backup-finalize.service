@@ -1,0 +1,14 @@
+[Unit]
+Description=Product PDF QR nightly consistent backup finalizer
+Documentation=docs/backup-recovery-pr2a.md
+After=docker.service
+Requires=docker.service
+OnFailure=product-pdf-qr-backup-alert@%n.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/product-pdf-qr
+ExecStart=/opt/product-pdf-qr/scripts/backup_recovery/backup-run.sh finalize
+TimeoutStartSec=20min
+UMask=0077

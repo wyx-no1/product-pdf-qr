@@ -1,0 +1,9 @@
+[Unit]
+Description=Product PDF QR highest-severity backup alert for %i
+
+[Service]
+Type=oneshot
+User=root
+Environment=ALERT_SEVERITY=critical
+ExecStart=/opt/product-pdf-qr/scripts/backup_recovery/emit-alert.sh %i
+UMask=0077

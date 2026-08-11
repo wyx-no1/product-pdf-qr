@@ -141,6 +141,14 @@ class QRCodeService:
         )
         temporary_path = Path(temporary_name)
         try:
+            # mkstemp(0600) closes the inherited default ACL mask. Reopen only
+            # the group-class mask so the volume's named UID-10002 ACL can read
+            # newly generated cache files; unrelated users remain denied.
+            try:
+                os.fchmod(file_descriptor, 0o660)
+            except BaseException:
+                os.close(file_descriptor)
+                raise
             with os.fdopen(file_descriptor, "wb") as output:
                 output.write(image_bytes)
                 output.flush()

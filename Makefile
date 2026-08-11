@@ -1,7 +1,9 @@
 .PHONY: \
 	build build-reproducible check-docs dev down format format-check \
 	lint migration-downgrade migration-upgrade test test-integration test-unit typecheck \
-	prod-config-check prod-env-check verify-clean-start
+	prod-config-check prod-env-check verify-clean-start \
+	backup-contract-check backup-config-check backup-image-build backup-image-reproducible \
+	backup-image-scan backup-recovery-rehearsal
 
 UV ?= uv
 CLEAN_START_ATTEMPTS ?= 3
@@ -59,6 +61,37 @@ prod-config-check:
 
 prod-env-check:
 	$(UV) run python scripts/production/validate_env_contract.py
+
+backup-contract-check:
+	$(UV) run python -m scripts.backup_recovery.cli \
+		--contract deploy/backup/contract.json validate-contract
+
+backup-config-check:
+	SOURCE_COMMIT=0000000000000000000000000000000000000000 \
+		docker compose \
+		--env-file .env.prod.example \
+		--env-file .env.backup.example \
+		-f compose.prod.yaml -f compose.backup.yaml \
+		--profile backup --profile restore --profile backup-volume-init \
+		config --format json | \
+		$(UV) run python scripts/backup_recovery/validate_compose.py
+
+backup-image-build:
+	SOURCE_DATE_EPOCH=1754006400 BUILDKIT_MULTI_PLATFORM=1 \
+		docker build --pull --provenance=false --target backup-recovery-runtime \
+		--tag product-pdf-qr-backup-recovery:local .
+
+backup-image-reproducible:
+	./scripts/backup_recovery/verify-reproducible-image.sh
+
+backup-image-scan: backup-image-build
+	docker run --rm --volume /var/run/docker.sock:/var/run/docker.sock \
+		aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
+		image --exit-code 1 --ignore-unfixed=false --severity CRITICAL,HIGH \
+		product-pdf-qr-backup-recovery:local
+
+backup-recovery-rehearsal:
+	./scripts/backup_recovery/rehearse-local.sh
 
 dev:
 	@test -f .env || cp .env.example .env

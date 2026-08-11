@@ -157,6 +157,14 @@ make check-docs
 
 依赖由 `pyproject.toml` 声明并由 `uv.lock` 锁定。禁止不更新锁文件地修改依赖。
 
+## 生产运行与灾备
+
+PR1 五服务生产面说明见
+[`docs/production-runtime-pr1.md`](docs/production-runtime-pr1.md)。PR2A 的独立一次性
+备份/恢复 overlay、每天凌晨一致封口、白天加密预复制、异地轮转与隔离恢复手册见
+[`docs/backup-recovery-pr2a.md`](docs/backup-recovery-pr2a.md)。两者都只授权本地合成
+验证；不授权 Agent 接触真实服务器、异地凭据、私钥或业务数据。
+
 ## 工程结构
 
 ```text
@@ -186,6 +194,6 @@ V1 沿用 Phase 1-A 的六表 schema、复合外键、只追加触发器与权�
 - Excel 批量 ZIP 下载
 - 完整审计查询界面
 - 孤儿文件自动清理、历史版本删除或任何不可逆操作
-- 公网反向代理、TLS、生产 Compose 或任何部署配置
+- 由 Agent 执行真实公网部署、正式异地传输、正式密钥操作或正式恢复
 
 G-09 自动化现覆盖产品生命周期、PDF 版本链路与 Excel 导入的成功/失败结果呈现；发布前仍须按对应任务书保存结构化报告与验收证据。在通过完整发布与安全门禁前，本仓库产物始终禁止对外暴露。

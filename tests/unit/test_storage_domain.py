@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import multiprocessing
+import os
 import resource
+import stat
 import subprocess
 import sys
 import time
@@ -142,9 +144,30 @@ async def test_valid_pdf_isolated_hashed_and_path_ignores_filename(tmp_path: Pat
     assert validated.original_filename == "../../unsafe.pdf"
     assert len(validated.sha256) == 64
     assert validated.size_bytes > 0
+    assert stat.S_IMODE(validated.temporary_path.stat().st_mode) == 0o600
     assert ".." not in storage.relative_path_for_hash(validated.sha256)
     validated.discard()
     assert not validated.temporary_path.exists()
+
+
+@pytest.mark.anyio
+async def test_shared_acl_mode_is_applied_only_at_formal_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = StorageService(tmp_path, max_pdf_bytes=1024 * 1024)
+
+    def fail_fchmod(_descriptor: int, _mode: int) -> None:
+        raise OSError("synthetic ACL-mask failure")
+
+    validated = await storage.receive_and_validate(upload_file(synthetic_pdf()))
+    assert stat.S_IMODE(validated.temporary_path.stat().st_mode) == 0o600
+    monkeypatch.setattr(os, "fchmod", fail_fchmod)
+    with pytest.raises(OSError, match="ACL-mask failure"):
+        await storage.publish(validated)
+
+    assert validated.temporary_path.is_file()
+    assert stat.S_IMODE(validated.temporary_path.stat().st_mode) == 0o600
+    validated.discard()
 
 
 @pytest.mark.anyio
