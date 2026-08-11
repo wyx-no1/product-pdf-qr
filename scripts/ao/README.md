@@ -186,23 +186,92 @@ enter review.
 
 ## Review integrity gate
 
-The repository-side merge gate audits every commit in a pull request:
+The repository-side merge gate audits every current commit in a pull request:
 
 ```bash
 python -m scripts.ao review-gate --pr 123
 ```
 
-A commit is metadata, and therefore exempt from CI and review, only when every
-changed path is below `docs/evidence/`. Every other commit must have successful
-`quality`, `database`, and `container` Checks (with Commit Statuses as a fallback)
-and at least one GitHub PR review whose `commit_id` exactly equals the commit SHA.
-The final code commit must have an approved verdict.
+### Four commit classifications
+
+Classification is fail closed and uses the Git commit tree before the GitHub files
+list:
+
+- `NOOP`: a single-parent commit whose tree SHA equals its parent tree SHA and whose
+  files list is empty. It does not advance the code anchor, block, or supersede.
+- `METADATA`: the tree changed and every file's new path—and, for a rename, its
+  `previous_filename`—is below `docs/evidence/`.
+- `SUPERSEDED`: a real non-final CODE commit. It is replaced only by the next CODE
+  in the current ordered chain; intervening METADATA/NOOP commits do not count.
+- `CODE(final)`: the last real CODE commit. Trailing METADATA/NOOP commits do not
+  change `final_code_sha`.
+
+`files=[]` never proves NOOP. The gate compares commit and parent trees. Missing
+tree/parent facts, roots, multi-parent merge commits, changed trees with empty files,
+unchanged trees with files, malformed full SHAs, broken ordering, duplicate commits,
+or inconsistent pagination are errors (exit `1`), not exempt commits.
+
+Rename classification preserves each file record's status, `filename`, and
+`previous_filename`. Moving `.github/**`, `scripts/**`, or source into Evidence
+therefore remains CODE; moving Evidence into a code path also remains CODE. Only a
+rename whose old and new paths are both Evidence is METADATA. A renamed record with
+a missing, malformed, identical, or otherwise inconsistent old path fails closed.
+
+### SUPERSEDED decision
+
+Per the business owner's **2026-08-10** governance decision, a trusted final
+full-version approval implicitly accepts all earlier CODE states in the current PR
+chain. Non-final CODE commits are therefore exempt from their own CI/review
+requirements, even when their historical CI failed or their review is absent or
+`changes_requested`. Their history remains audit-only and cannot determine PASS.
+
+This is safe because final approval is a responsibility statement over
+`base...final_code_sha`, not the last commit patch. GitHub provides immutable version
+anchoring and the cumulative PR comparison; it does not prove that a human read
+every line. The trusted reviewer accepts that responsibility. The gate mechanically
+rebuilds the server-provided cumulative changed-files input and verifies that it is
+bound to the exact base/final, merge base, and current commit chain. The Compare
+response is the authoritative net changed-path set; the gate additionally verifies
+that every PR-created CODE path retained in the final tree is present. Transient
+add-then-delete paths and intermediate rename names are intentionally absent from
+that net set.
+If a future review tool shows only a single-commit patch, this premise must be
+re-reviewed and the gate must fail closed until governance explicitly accepts a new
+contract.
+
+Each superseded result prints the full SHA,
+`superseded_by=<next CODE full SHA>`, and `prior_verdict=<trusted value or missing>`.
+`prior_verdict` is read only from submitted, non-dismissed, exact-SHA GitHub Review
+API objects by configured trusted numeric reviewer identities. PR summary fields,
+ordinary comments, commit messages, and author-created files never enter it.
+Force-pushed SHAs absent from the current commits API do not enter current results.
+
+### Strict final CODE requirements
+
+Only `CODE(final)` determines the business gate result. It must have all of:
+
+1. `quality`, `database`, and `container` on the exact final SHA, each with the
+   authoritative state strictly equal to `success`;
+2. the latest submitted, non-dismissed/non-pending Review API object from a trusted
+   GitHub numeric reviewer ID, with `commit_id` exactly equal to final and one
+   uniquely parseable approved verdict;
+3. trusted cumulative review input bound to `base...final_code_sha`, the current
+   merge base/chain, with a complete net changed-path set covering retained
+   PR-created CODE paths.
+
+Approvals on an earlier CODE, METADATA, or NOOP SHA are stale and never cover final.
+A later trusted `changes_requested` on final reverses an earlier approved; a later
+approved may close an older changes-requested conclusion. Dismissed and pending
+reviews are unusable. Login text, account type, `author_association`, GitHub's PR
+summary `review_decision`, author comments, and Evidence files cannot create a
+verdict.
 
 When GitHub returns duplicate observations for one required job, the newest
 terminal observation is authoritative. A newer queued, pending, or running rerun
 cannot hide a completed result for the same immutable commit, while a newer
 terminal failure still supersedes an earlier success. If no terminal observation
-exists, the transient state remains a `REVIEW_GAP`.
+exists, the transient state remains a `REVIEW_GAP`. Checks are authoritative before
+Statuses; the two sources are not combined to manufacture a green result.
 
 AO submits reviews with GitHub state `COMMENTED`, so that state is not treated as a
 verdict. A verdict is accepted only from a configured trusted GitHub numeric user ID;
@@ -232,8 +301,9 @@ or its Chinese form:
 ## 审查结论：需要修改
 ```
 
-When a commit has multiple trusted bodies with a valid heading, the latest submitted
-review is selected deterministically by `submitted_at` and then GitHub review ID.
+When a commit has multiple trusted submitted bodies, the latest review is selected
+deterministically by `submitted_at` and then GitHub review ID, and that latest body
+must contain a valid heading.
 The parser first collects every `## Review verdict:` and `## 审查结论：` heading in
 a body — both languages count toward the same exactly-one requirement — and accepts
 only one complete known value from the heading's own language. A body containing
@@ -245,6 +315,43 @@ that remains without a parseable verdict for more than 30 minutes is additionall
 reported as `STALLED`, without triggering a retry. The command exits `0` only for
 `PASS`, `2` for `REVIEW_GAP`, and `1` when required GitHub evidence cannot be
 retrieved or validated.
+
+The CLI contract is therefore: `PASS` uses exit `0`, `REVIEW_GAP` uses exit `2`,
+and fail-closed input/API/parse/race errors use exit `1`.
+
+The gate reads the PR base/head before collection and again after reviews, CI, and
+cumulative input. A changed snapshot is an error. It also validates every full SHA,
+single parent, parent/tree adjacency, list order, merge base, final ancestry, and
+compare commit count. No partial PASS is returned after any API, JSON, pagination,
+tree, identity, binding, or race error.
+
+Pure METADATA, pure NOOP, and mixed METADATA/NOOP PRs pass with no
+`final_code_sha`; they do not call CI/review/cumulative verdict APIs. Output is
+ordered by the current PR chain and always includes each full SHA and a mechanical
+classification reason.
+
+### Trusted cumulative evidence and bootstrap
+
+The primary cumulative-input source is the GitHub Compare API response fetched by
+the gate itself. An equivalent Evidence Check/Status is accepted only when its
+server-authenticated issuer is the configured numeric GitHub Actions app
+(`15368`) or publisher bot (`41898282`), it binds the exact base/final and complete
+changed-files set, the newest trusted observation is `success`, and its net path set
+exactly matches an authoritative GitHub Compare observation for that base/final.
+An alternate attestation without Compare corroboration cannot support PASS. A
+same-name check/status from another issuer, wrong SHA, newer trusted failure, ordinary
+`AO / evidence-snapshot` file/comment, or metadata attestation that does not bind its
+parent CODE to final cannot support PASS.
+
+Changes under `scripts/ao/**` alter the Trusted Execution Surface. A Trusted Surface
+PR cannot use the modified gate to approve itself. The Coordinator/Agent may collect the
+2026-08-10 business decision, old-gate result, `requires-re-review`, final three-job
+CI, and full trust-surface diff, but an authorized human gate owner/repository
+maintainer must leave a server-authenticated bootstrap approval/override on the
+exact final SHA. If the repair itself needs multiple commits, the same final-SHA
+bootstrap covers the cumulative diff; history is not rewritten and no intermediate
+failure is silently waived. After merge, run the default-branch gate read-only
+against the frozen PR #37 fixture and preserve the PASS audit output.
 
 ## Advisor workspace workflow
 
