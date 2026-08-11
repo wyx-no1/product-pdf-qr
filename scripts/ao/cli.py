@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     review_gate = commands.add_parser(
         "review-gate",
-        help="verify CI and exact-SHA GitHub review coverage for every PR code commit",
+        help="audit PR commits and strictly verify the final CODE state",
     )
     review_gate.add_argument("--repo", type=Path, default=Path("."))
     review_gate.add_argument("--pr", type=int, required=True)
