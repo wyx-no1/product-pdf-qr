@@ -32,6 +32,25 @@ IMAGE = re.compile(r"^[^@\s]+:[^@\s]+@sha256:([0-9a-f]{64})$", re.ASCII)
 
 RUNNING_IMAGES = frozenset({"app", "migrate", "proxy", "db", "certbot", "pr2a"})
 STAGES = ("prepared", "migrated", "isolated_validated", "public_cutover")
+REQUIRED_COMPATIBILITY_ACTIONS = frozenset(
+    {
+        "login",
+        "create",
+        "import",
+        "upload",
+        "history_restore",
+        "enable",
+        "disable",
+        "no_upload",
+        "public_read",
+        "audit_append",
+        "constraints",
+        "defaults",
+        "enums",
+        "triggers",
+        "permissions",
+    }
+)
 REQUIRED_RECOVERY_CONFIG = frozenset(
     {
         "compose.prod.yaml",
@@ -589,26 +608,9 @@ def validate_release_record(record: Mapping[str, Any]) -> str:
     parse_time(compatibility["decided_at"], field="compatibility.decided_at")
     _validate_approval(compatibility["approval"], field="compatibility")
     actions = compatibility["full_read_write_actions"]
-    required_actions = {
-        "login",
-        "create",
-        "import",
-        "upload",
-        "history_restore",
-        "enable",
-        "disable",
-        "no_upload",
-        "public_read",
-        "audit_append",
-        "constraints",
-        "defaults",
-        "enums",
-        "triggers",
-        "permissions",
-    }
     if (
         not isinstance(actions, dict)
-        or set(actions) != required_actions
+        or set(actions) != REQUIRED_COMPATIBILITY_ACTIONS
         or any(not isinstance(value, bool) for value in actions.values())
     ):
         raise RollbackSafetyError("complete old-app read/write compatibility evidence is required")
@@ -777,6 +779,63 @@ def validate_watermark(watermark: Any) -> str:
     if not isinstance(audit, str) or SHA256.fullmatch(audit) is None:
         raise RollbackSafetyError("audit projection digest is required")
     return digest_json(watermark)
+
+
+def validate_compatibility_validation_plan(
+    plan: Any,
+    *,
+    record: Mapping[str, Any],
+    operation_id: str,
+    baseline_watermark: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate a predeclared mutating old-app test delta and W1 retention proof."""
+
+    expected_fields = {
+        "schema_version",
+        "release_id",
+        "release_identity",
+        "operation_id",
+        "baseline_watermark_sha256",
+        "expected_after_watermark",
+        "delta_id",
+        "full_read_write_actions",
+        "preservation_assertions",
+    }
+    if not isinstance(plan, dict) or set(plan) != expected_fields:
+        raise RollbackSafetyError("compatibility validation plan schema mismatch")
+    if plan["schema_version"] != SCHEMA_VERSION:
+        raise RollbackSafetyError("compatibility validation plan version mismatch")
+    if (
+        plan["release_id"] != record["release_id"]
+        or plan["release_identity"] != release_identity(record)
+        or plan["operation_id"] != operation_id
+        or plan["baseline_watermark_sha256"] != validate_watermark(baseline_watermark)
+    ):
+        raise RollbackSafetyError("compatibility validation plan identity mismatch")
+    if SAFE_ID.fullmatch(str(plan["delta_id"])) is None:
+        raise RollbackSafetyError("compatibility validation delta_id is invalid")
+    actions = plan["full_read_write_actions"]
+    if (
+        not isinstance(actions, dict)
+        or set(actions) != REQUIRED_COMPATIBILITY_ACTIONS
+        or any(value is not True for value in actions.values())
+    ):
+        raise RollbackSafetyError("compatibility plan must exercise every supported action")
+    preservation = plan["preservation_assertions"]
+    required_preservation = {
+        "all_preexisting_relation_rows_retained",
+        "all_preexisting_files_retained",
+        "all_preexisting_audit_events_retained",
+        "schema_db_image_volumes_secrets_unchanged",
+    }
+    if (
+        not isinstance(preservation, dict)
+        or set(preservation) != required_preservation
+        or any(value is not True for value in preservation.values())
+    ):
+        raise RollbackSafetyError("compatibility plan lacks complete W1 preservation assertions")
+    validate_watermark(plan["expected_after_watermark"])
+    return plan
 
 
 def validate_execution_environment(

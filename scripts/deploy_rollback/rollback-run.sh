@@ -225,20 +225,53 @@ case "$action" in
         "$PR2B_RESULT"
     )"
     "$PR2B_STABLE_CHECKOUT/scripts/backup_recovery/restore-run.sh" "$backup_id"
-    external_ready_at="$(
-      "$PR2B_PYTHON" -c \
-        'from datetime import UTC,datetime; print(datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00","Z"))'
-    )"
     acquire_pr2a_lock
     PR2B_LEASE_OWNER_PID=$$
     export PR2B_LEASE_OWNER_PID
+    # PR2A has completed its own state machine. Re-isolate before accepting the
+    # result, then measure the actual restored DB/files/audit rather than W0 input.
+    "$PR2B_STABLE_CHECKOUT/scripts/production/prod-compose.sh" stop --timeout 60 proxy
+    post_restore_watermark="${PR2B_WATERMARK_FILE}.post-restore.${operation_id}.$$"
+    [ ! -e "$post_restore_watermark" ] ||
+      fail "post-restore watermark target already exists"
+    cli capture-watermark \
+      --repository-root "$PR2B_STABLE_CHECKOUT" \
+      --output "$post_restore_watermark" >/dev/null
+    cli verify-pr2a-result \
+      --store "$PR2B_RELEASE_STORE" \
+      --release-id "$release_id" \
+      --operation-id "$operation_id" \
+      --rto-state "$PR2B_RTO_STATE" \
+      --state "$PR2B_PUBLICATION_STATE" \
+      --watermark "$post_restore_watermark" \
+      --audit "$PR2B_AUDIT_LOG" \
+      --operator "$operator" >/dev/null
+    "$PR2B_STABLE_CHECKOUT/scripts/production/prod-compose.sh" start proxy
+    if ! readiness="$(
+      cli verify-external-readiness \
+        --store "$PR2B_RELEASE_STORE" \
+        --release-id "$release_id" \
+        --operation-id "$operation_id" \
+        --operator "$operator" \
+        --environment-marker "$PR2B_ENVIRONMENT_MARKER" \
+        --environment-confirmation "$PR2B_ENVIRONMENT_CONFIRMATION" \
+        --repository-root "$PR2B_STABLE_CHECKOUT"
+    )"; then
+      "$PR2B_STABLE_CHECKOUT/scripts/production/prod-compose.sh" \
+        stop --timeout 60 proxy >/dev/null 2>&1 || true
+      fail "post-restore external readiness failed; proxy re-isolated"
+    fi
+    external_ready_at="$(
+      printf '%s\n' "$readiness" |
+        "$PR2B_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["external_ready_at"])'
+    )"
     cli complete-pr2a \
       --store "$PR2B_RELEASE_STORE" \
       --release-id "$release_id" \
       --operation-id "$operation_id" \
       --rto-state "$PR2B_RTO_STATE" \
       --state "$PR2B_PUBLICATION_STATE" \
-      --watermark "$frozen_watermark" \
+      --watermark "$post_restore_watermark" \
       --external-ready-at "$external_ready_at" \
       --audit "$PR2B_AUDIT_LOG" \
       --operator "$operator"

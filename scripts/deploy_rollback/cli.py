@@ -179,11 +179,27 @@ def parser() -> argparse.ArgumentParser:
     stable.add_argument("--production-env", type=Path, required=True)
     stable.add_argument("--backup-env", type=Path, required=True)
 
+    verify_pr2a = commands.add_parser("verify-pr2a-result")
+    _add_operation(verify_pr2a)
+    verify_pr2a.add_argument("--state", type=Path, required=True)
+    verify_pr2a.add_argument("--watermark", type=Path, required=True)
+    verify_pr2a.add_argument("--audit", type=Path, required=True)
+    verify_pr2a.add_argument("--operator", required=True)
+    verify_pr2a.add_argument("--authorized-data-loss", action="store_true")
+    verify_pr2a.add_argument("--authorization-reference")
+
+    readiness = commands.add_parser("verify-external-readiness")
+    _add_record_lookup(readiness)
+    readiness.add_argument("--operation-id", required=True)
+    readiness.add_argument("--operator", required=True)
+    readiness.add_argument("--environment-marker", type=Path, required=True)
+    readiness.add_argument("--environment-confirmation", required=True)
+    readiness.add_argument("--repository-root", type=Path, required=True)
+
     complete = commands.add_parser("complete-pr2a")
     _add_operation(complete)
     complete.add_argument("--state", type=Path, required=True)
-    complete.add_argument("--watermark", type=Path)
-    complete.add_argument("--use-persisted-baseline", action="store_true")
+    complete.add_argument("--watermark", type=Path, required=True)
     complete.add_argument("--external-ready-at", required=True)
     complete.add_argument("--audit", type=Path, required=True)
     complete.add_argument("--operator", required=True)
@@ -430,17 +446,86 @@ def run(arguments: list[str] | None = None) -> int:
                 options.production_env,
                 options.backup_env,
             )
+        elif options.command == "verify-pr2a-result":
+            _assert_shared_lease()
+            expected = _state(options, record).read()["baseline_watermark"]
+            observed = _json(options.watermark)
+            observed_sha256 = validate_watermark(observed)
+            if canonical_json(expected) != canonical_json(observed):
+                raise RollbackSafetyError("PR2A result differs from complete pre-release watermark")
+            if options.authorized_data_loss and not options.authorization_reference:
+                raise RollbackSafetyError(
+                    "authorized data loss verification needs its approval reference"
+                )
+            AuditLog(options.audit).append(
+                {
+                    "schema_version": 1,
+                    "release_id": record["release_id"],
+                    "release_identity": release_identity(record),
+                    "operation_id": options.operation_id,
+                    "environment_id": record["environment_id"],
+                    "operator": options.operator,
+                    "at": format_time(datetime.now(tz=UTC)),
+                    "path": (
+                        "preserve_forward_data"
+                        if options.authorized_data_loss
+                        else "pre_public_restore"
+                    ),
+                    "stage": "pr2a_post_restore_isolated_verification",
+                    "result": "post_restore_watermark_verified",
+                    "backup_id": record["pre_release_backup"]["backup_id"],
+                    "watermark_sha256": observed_sha256,
+                    "human_authorization_reference": (options.authorization_reference or "none"),
+                }
+            )
+            result = {
+                "status": "post_restore_watermark_verified",
+                "watermark_sha256": observed_sha256,
+            }
+        elif options.command == "verify-external-readiness":
+            _assert_shared_lease()
+            environment = validate_execution_environment(
+                options.environment_marker,
+                record=record,
+                operation_id=options.operation_id,
+                operator=options.operator,
+                confirmation=options.environment_confirmation,
+            )
+            if not ShellHostAdapter(
+                repository_root=options.repository_root,
+                docker_context=str(environment["docker_context"]),
+            ).external_readiness():
+                raise RollbackSafetyError("external readiness failed")
+            result = {
+                "status": "external_ready",
+                "external_ready_at": format_time(datetime.now(tz=UTC)),
+            }
         elif options.command == "complete-pr2a":
             _assert_shared_lease()
             expected = _state(options, record).read()["baseline_watermark"]
-            if (options.watermark is None) == (not options.use_persisted_baseline):
-                raise RollbackSafetyError(
-                    "choose exactly one observed watermark or persisted PR2A baseline"
-                )
-            observed = expected if options.use_persisted_baseline else _json(options.watermark)
-            validate_watermark(observed)
+            observed = _json(options.watermark)
+            observed_sha256 = validate_watermark(observed)
             if canonical_json(expected) != canonical_json(observed):
                 raise RollbackSafetyError("PR2A result differs from complete pre-release watermark")
+            expected_path = (
+                "preserve_forward_data" if options.authorized_data_loss else "pre_public_restore"
+            )
+            verification_exists = any(
+                event.get("release_id") == record["release_id"]
+                and event.get("operation_id") == options.operation_id
+                and event.get("path") == expected_path
+                and event.get("result") == "post_restore_watermark_verified"
+                and event.get("watermark_sha256") == observed_sha256
+                and (
+                    not options.authorized_data_loss
+                    or event.get("human_authorization_reference") == options.authorization_reference
+                )
+                for event in AuditLog(options.audit).verify()
+            )
+            if not verification_exists:
+                raise RollbackSafetyError(
+                    "fresh isolated post-restore watermark verification is required"
+                )
             external_ready_at = parse_time(
                 options.external_ready_at,
                 field="external_ready_at",
@@ -472,7 +557,7 @@ def run(arguments: list[str] | None = None) -> int:
                     "stage": "pr2a_external_readiness",
                     "result": completion_result if passed else "RTO_EXCEEDED",
                     "backup_id": record["pre_release_backup"]["backup_id"],
-                    "watermark_sha256": validate_watermark(observed),
+                    "watermark_sha256": observed_sha256,
                     "human_authorization_reference": (options.authorization_reference or "none"),
                 }
             )

@@ -32,6 +32,7 @@ from scripts.deploy_rollback.model import (
     format_time,
     release_identity,
     switch_runtime_identity,
+    validate_compatibility_validation_plan,
     validate_execution_environment,
     validate_lossy_authorization,
     validate_release_record,
@@ -224,6 +225,48 @@ def watermark(marker: str = "w0") -> dict[str, Any]:
     }
 
 
+def validation_watermark(baseline: dict[str, Any]) -> dict[str, Any]:
+    result = deepcopy(baseline)
+    for relation in ("products", "pdf_files", "pdf_versions", "audit_events"):
+        result["relations"][relation] = hashlib.sha256(
+            f"validation:{relation}:{result['relations'][relation]}".encode()
+        ).hexdigest()
+    result["audit_projection"] = result["relations"]["audit_events"]
+    result["files"].append(
+        {
+            "path": "synthetic-validation/created-upload.pdf",
+            "size": 20,
+            "sha256": hashlib.sha256(b"synthetic-validation").hexdigest(),
+        }
+    )
+    result["files"].sort(key=lambda item: item["path"])
+    validate_watermark(result)
+    return result
+
+
+def validation_plan(
+    record: dict[str, Any],
+    baseline: dict[str, Any],
+    expected_after: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "release_id": record["release_id"],
+        "release_identity": release_identity(record),
+        "operation_id": "operation-40",
+        "baseline_watermark_sha256": validate_watermark(baseline),
+        "expected_after_watermark": expected_after,
+        "delta_id": "synthetic-validation-delta-40",
+        "full_read_write_actions": {action: True for action in sorted(ACTIONS)},
+        "preservation_assertions": {
+            "all_preexisting_relation_rows_retained": True,
+            "all_preexisting_files_retained": True,
+            "all_preexisting_audit_events_retained": True,
+            "schema_db_image_volumes_secrets_unchanged": True,
+        },
+    }
+
+
 def publication(
     tmp_path: Path,
     record: dict[str, Any],
@@ -258,6 +301,8 @@ class FakeHost:
         self.proxy_stopped = True
         self.calls: list[str] = []
         self.active_version = "candidate"
+        self.validation_plan_value: dict[str, Any] | None = None
+        self.validation_after = validation_watermark(current)
 
     def retain_exact_artifacts(self, record: Any) -> None:
         validate_release_record(record)
@@ -280,7 +325,14 @@ class FakeHost:
 
     def full_old_app_validation(self) -> bool:
         self.calls.append("full_old_app_validation")
+        if self.old_app_passes:
+            self.watermark = self.validation_after
         return self.old_app_passes
+
+    def compatibility_validation_plan(self) -> dict[str, Any]:
+        self.calls.append("compatibility_validation_plan")
+        assert self.validation_plan_value is not None
+        return self.validation_plan_value
 
     def candidate_validation(self) -> bool:
         self.calls.append("candidate_validation")
@@ -315,6 +367,7 @@ def engine(
     *,
     isolated: bool,
 ) -> RollbackEngine:
+    host.validation_plan_value = validation_plan(record, current, host.validation_after)
     return RollbackEngine(
         record=record,
         operation_id="operation-40",
@@ -531,11 +584,13 @@ def test_t40_16_to_20_compatible_path_two_preserves_w0_and_w1(
     assert host.active_version == "stable"
     assert host.calls == [
         "retain_exact_artifacts",
+        "compatibility_validation_plan",
         "stop_proxy",
         "assert_proxy_stopped",
         "stop_app",
         "start_app:stable",
         "assert_proxy_stopped",
+        "current_watermark",
         "full_old_app_validation",
         "current_watermark",
         "authorize_proxy",
@@ -579,6 +634,34 @@ def test_t40_18_19_runtime_pointer_has_no_db_volume_or_secret_surface(
         assert forbidden not in serialized
     switch_runtime_identity(tmp_path / "runtime.json", identity)
     assert json.loads((tmp_path / "runtime.json").read_text()) == identity
+
+
+def test_t40_16_17_mutating_validation_requires_predeclared_delta_and_w1_proof(
+    tmp_path: Path,
+) -> None:
+    record = release_record()
+    baseline = watermark("w0-plus-w1")
+    expected_after = validation_watermark(baseline)
+    plan = validation_plan(record, baseline, expected_after)
+    assert (
+        validate_compatibility_validation_plan(
+            plan,
+            record=record,
+            operation_id="operation-40",
+            baseline_watermark=baseline,
+        )
+        == plan
+    )
+    changed = deepcopy(plan)
+    changed["expected_after_watermark"] = watermark("observed-after-the-fact")
+    host = FakeHost(baseline)
+    host.validation_plan_value = changed
+    state = publication(tmp_path, record, public=True)
+    rollback = engine(tmp_path, record, state, baseline, host, isolated=False)
+    host.validation_plan_value = changed
+    with pytest.raises(RollbackSafetyError, match="predeclared expected delta"):
+        rollback.run()
+    assert host.active_version == "candidate"
 
 
 def test_t40_20_22_incompatible_path_two_is_fixed_nonzero_decision(
@@ -853,6 +936,23 @@ def test_t40_35_37_static_surface_reuses_pr2a_and_has_no_data_cleanup_bypass() -
     assert (
         '"$PR2B_STABLE_CHECKOUT/scripts/backup_recovery/restore-run.sh" "$backup_id"' in authorized
     )
+    ordinary_restore = wrapper.rindex(
+        '"$PR2B_STABLE_CHECKOUT/scripts/backup_recovery/restore-run.sh" "$backup_id"'
+    )
+    assert ordinary_restore < wrapper.index("post_restore_watermark=", ordinary_restore)
+    assert wrapper.index("post_restore_watermark=", ordinary_restore) < wrapper.index(
+        "cli verify-pr2a-result", ordinary_restore
+    )
+    assert wrapper.index("cli verify-pr2a-result", ordinary_restore) < wrapper.index(
+        "cli complete-pr2a", ordinary_restore
+    )
+    authorized_restore = authorized.index(
+        '"$PR2B_STABLE_CHECKOUT/scripts/backup_recovery/restore-run.sh" "$backup_id"'
+    )
+    assert authorized.index("activate_stable_stopped_identity") < authorized_restore
+    assert authorized_restore < authorized.index("post_restore_watermark=", authorized_restore)
+    assert "--use-persisted-baseline" not in wrapper
+    assert "--use-persisted-baseline" not in authorized
     for forbidden in (
         "alembic downgrade",
         "pg_restore",
