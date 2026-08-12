@@ -1,0 +1,46 @@
+# PR2B read-only watermark probe. Adds no port, writable business volume, or
+# production-service override and is off unless its explicit profile is selected.
+services:
+  rollback-watermark:
+    image: ${BACKUP_IMAGE:?BACKUP_IMAGE must be an immutable tag@sha256 reference}
+    user: "10002:10002"
+    profiles: ["rollback-watermark"]
+    entrypoint: ["python", "-m", "scripts.deploy_rollback.watermark"]
+    command: []
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:?POSTGRES_DB is required}
+      PGUSER: app_backup
+      PGPASSFILE: /run/secrets/app_backup_pgpass
+      PR2B_FILE_ROOT: /data/files
+    volumes:
+      - type: volume
+        source: file_data
+        target: /data/files
+        read_only: true
+      - type: bind
+        source: .
+        target: /source
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BACKUP_PGPASS_FILE:?BACKUP_PGPASS_FILE is required}
+        target: /run/secrets/app_backup_pgpass
+        read_only: true
+        bind:
+          create_host_path: false
+    working_dir: /source
+    tmpfs:
+      - /tmp:size=8m,mode=0700,uid=10002,gid=10002,noexec,nosuid,nodev
+    networks:
+      database: {}
+    privileged: false
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    restart: "no"
