@@ -910,7 +910,11 @@ def test_t40_35_37_static_surface_reuses_pr2a_and_has_no_data_cleanup_bypass() -
     ordinary_restore = wrapper.rindex(
         '"$PR2B_STABLE_CHECKOUT/scripts/backup_recovery/restore-run.sh" "$backup_id"'
     )
-    assert wrapper.index("fence fence-engage") < ordinary_restore
+    frozen_fallback = wrapper.index('if [ "$frozen_action" != "INVOKE_UNMODIFIED_PR2A_RESTORE" ]')
+    fence_engage = wrapper.index("fence fence-engage")
+    assert frozen_fallback < fence_engage < ordinary_restore
+    assert wrapper.index('execute "$frozen_action" "$frozen_watermark" yes') < fence_engage
+    assert fence_engage < wrapper.index("activate_stable_stopped_identity", fence_engage)
     assert ordinary_restore < wrapper.index("fence fence-assert", ordinary_restore)
     assert ordinary_restore < wrapper.index("post_restore_watermark=", ordinary_restore)
     assert wrapper.index("post_restore_watermark=", ordinary_restore) < wrapper.index(

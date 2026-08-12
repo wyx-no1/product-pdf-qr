@@ -151,6 +151,38 @@ def _reset_b0() -> None:
     _reset_files_b0()
 
 
+def _inject_last_write() -> None:
+    """Add W1 once while the wrapper freezes a stale path-one decision."""
+
+    with psycopg.connect(_psycopg_url()) as connection:
+        connection.execute(
+            """
+            INSERT INTO products (
+                id, code, public_token, status, current_version_id,
+                created_at, updated_at, name
+            ) VALUES (
+                2, 'W1_PRODUCT', '1123456789ABCDEFGHJKMNPQRS', 'active', NULL,
+                '2026-08-12T00:01:00Z', '2026-08-12T00:01:00Z', 'W1'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO audit_events (
+                id, occurred_at, actor_type, actor_id, action, target_type,
+                target_id, product_code, result, request_id, detail
+            ) VALUES (
+                2, '2026-08-12T00:01:00Z', 'admin', 1, 'w1_public_write',
+                'product', 2, 'W1_PRODUCT', 'success', NULL,
+                '{"must_survive": true}'::jsonb
+            )
+            """
+        )
+    Path(_required("PR2B_FILE_ROOT"), "w1-after-cutover.pdf").write_bytes(
+        b"%PDF-1.4\nsynthetic W1\n"
+    )
+
+
 def _isolated_full_validation() -> None:
     """Exercise dynamic writes in a transaction/file sandbox, then discard them."""
 
@@ -316,6 +348,15 @@ def docker(arguments: list[str]) -> int:
     if command == "config":
         print("{}")
     elif command == "stop":
+        selected = _selected_services(remainder)
+        if (
+            os.environ.get("PR2B_SYNTHETIC_INJECT_LAST_WRITE_ON_FREEZE") == "yes"
+            and {"app", "proxy"}.issubset(selected)
+            and not value.get("last_write_injected", False)
+        ):
+            _inject_last_write()
+            value["last_write_injected"] = True
+            value["calls"].append("synthetic:last-write-before-freeze")
         for service in _selected_services(remainder):
             value["services"][service]["running"] = False
         _save(value)

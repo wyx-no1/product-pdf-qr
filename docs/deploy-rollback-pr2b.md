@@ -184,6 +184,9 @@ PR2B 会重新取得 lease、证明 fence 仍启用并再次隔离 compose proxy
 DB/files/audit 水位；只有它精确等于 publication state 中的 B0，才写入库外验证审计并重新
 启动 proxy、执行 fence 内 readiness，并由已批准 fence 命令原子完成最终公开与 readiness。
 普通和人工获批有损路径都不能用保存的 B0 文件冒充恢复结果。
+路径一的持久围栏只在锁内停止 app/proxy、重采水位且再次确认仍可恢复 B0 后启用；若最后一笔写入
+使冻结判定转为兼容路径二，app-only 切换不会继承未发布的 restore 围栏，也不会误报已恢复但客户
+流量仍被阻断。
 外部 readiness 的完成时间在返回瞬间固定；随后写审计的等待不会错误延长或重置 RTO。
 
 库外审计是 mode 0600 的 JSONL hash chain 加持久 head/count anchor。成功、拒绝、失败、重试、路径、

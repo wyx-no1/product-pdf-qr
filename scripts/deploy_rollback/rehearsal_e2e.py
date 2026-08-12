@@ -555,6 +555,64 @@ def run_round(run_root: Path, migration_url: str, backup_url: str) -> None:
     ):
         raise RuntimeError("compatible wrapper identity/data semantics are incorrect")
 
+    # Stale path-one decision: inject a final W1 write while app/proxy freeze.
+    # The fresh watermark must transfer to app-only without ever engaging the
+    # restore fence, and the wrapper must preserve W1 and return publicly ready.
+    _reset_b0()
+    race_paths = _scenario_paths(run_root, "path-one-race")
+    race, image_ids = _record(checkout, release_id="release-path-one-race", compatible=True, w0=w0)
+    ReleaseStore(race_paths["store"]).seal(race)
+    atomic_write(race_paths["watermark"], canonical_json(w0))
+    _service_state(race_paths["service"], race, image_ids)
+    environment = _common_environment(
+        checkout,
+        run_root,
+        race,
+        race_paths["service"],
+        migration_url,
+        backup_url,
+        file_root,
+    )
+    _bind_paths(environment, race_paths)
+    environment["PR2B_ENVIRONMENT_CONFIRMATION"] = (
+        "synthetic:synthetic-pr2b-e2e:publication-path-one-race"
+    )
+    _publication(
+        checkout,
+        environment,
+        release_id=race["release_id"],
+        operation_id="publication-path-one-race",
+        public=False,
+    )
+    environment["PR2B_ENVIRONMENT_CONFIRMATION"] = (
+        "synthetic:synthetic-pr2b-e2e:rollback-path-one-race"
+    )
+    environment["PR2B_PROXY_CONTINUOUSLY_ISOLATED"] = "yes"
+    environment["PR2B_SYNTHETIC_INJECT_LAST_WRITE_ON_FREEZE"] = "yes"
+    _run(
+        [
+            str(checkout / "scripts/deploy_rollback/rollback-run.sh"),
+            race["release_id"],
+            "rollback-path-one-race",
+            "synthetic-operator",
+        ],
+        cwd=checkout,
+        environment=environment,
+    )
+    race_w1 = build_watermark(database_url=backup_url, file_root=file_root)
+    service = json.loads(race_paths["service"].read_text(encoding="utf-8"))
+    if (
+        "synthetic:last-write-before-freeze" not in service["calls"]
+        or service["services"]["app"]["image"] != race["stable"]["images"]["app"]
+        or service["services"]["proxy"]["running"] is not True
+        or service["fence"]["engaged"] is not False
+        or any(call.startswith("publication-fence:") for call in service["calls"])
+        or any("restore-database" in call for call in service["calls"])
+        or any("restore-files" in call for call in service["calls"])
+        or race_w1 == w0
+    ):
+        raise RuntimeError("path-one race fallback did not safely preserve and publish W1")
+
     # Pre-public path: the real PR2B wrapper must hand off to the real PR2A entrypoint.
     _reset_b0()
     path_one_paths = _scenario_paths(run_root, "path-one")
@@ -714,6 +772,7 @@ def run_round(run_root: Path, migration_url: str, backup_url: str) -> None:
     print("real_wrappers=publication,rollback,authorized-lossy,pr2a-restore")
     print("real_postgresql=true real_file_state=true")
     print("path_one_b0_verified=true path_two_w1_preserved=true authorized_b0_verified=true")
+    print("path_one_race_fallback_w1_preserved=true stale_fence_absent=true")
     print("publication_fence_continuous=true production_validation_nonmutating=true")
 
 

@@ -199,7 +199,6 @@ case "$action" in
     set_operation_context
     verify_exact_artifacts
     require_stable_checkout
-    fence fence-engage >/dev/null
     "$repository_root/scripts/production/prod-compose.sh" stop --timeout 60 proxy app
     frozen_watermark="${PR2B_WATERMARK_FILE}.pre-public-freeze"
     cli capture-watermark \
@@ -229,6 +228,10 @@ case "$action" in
       execute "$frozen_action" "$frozen_watermark" yes
       fail "NEEDS_ROLLBACK_DECISION unexpectedly returned success after freeze"
     fi
+    # The shared lease and stopped app/proxy made the frozen decision atomic.
+    # Engage the persistent fence only after path one remains proven, so a
+    # last-write fallback to app-only cannot return success behind a stale fence.
+    fence fence-engage >/dev/null
     # app/proxy are now stopped and cannot change the W0 watermark. Release the
     # preparation lease so the unchanged PR2A restore can own it without nesting.
     activate_stable_stopped_identity
