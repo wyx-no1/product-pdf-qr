@@ -936,9 +936,7 @@ def test_container_watermark_uses_pr2a_read_only_pg_environment(
     file_root = tmp_path / "files"
     file_root.mkdir()
     (file_root / "history.pdf").write_bytes(b"synthetic")
-    projection: dict[str, list[object]] = {
-        relation: [] for relation in sorted(RELATIONS)
-    }
+    projection: dict[str, list[object]] = {relation: [] for relation in sorted(RELATIONS)}
 
     def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(
