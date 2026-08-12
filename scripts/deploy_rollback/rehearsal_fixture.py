@@ -7,16 +7,21 @@ and applies deterministic B0/validation database and file changes.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import psycopg
 
-from scripts.deploy_rollback.model import RollbackSafetyError, atomic_write, canonical_json
+from scripts.deploy_rollback.model import (
+    RollbackSafetyError,
+    atomic_write,
+    canonical_json,
+    format_time,
+)
 
 
 def _required(name: str) -> str:
@@ -146,7 +151,9 @@ def _reset_b0() -> None:
     _reset_files_b0()
 
 
-def _apply_validation() -> None:
+def _isolated_full_validation() -> None:
+    """Exercise dynamic writes in a transaction/file sandbox, then discard them."""
+
     with psycopg.connect(_psycopg_url()) as connection:
         connection.execute(
             """
@@ -154,46 +161,10 @@ def _apply_validation() -> None:
                 id, code, public_token, status, current_version_id,
                 created_at, updated_at, name
             ) VALUES (
-                100, 'VALIDATION_PRODUCT', 'ZYXWVUTSRQPONMLKJHGFEDCBA1',
-                'active', NULL, '2026-08-12T00:02:00Z',
-                '2026-08-12T00:02:00Z', 'validation'
+                900, 'ISOLATED_VALIDATION', '2123456789ABCDEFGHJKMNPQRS',
+                'active', NULL, now(), now(), 'isolated'
             )
             """
-        )
-        content = b"%PDF-1.4\nsynthetic validation\n"
-        digest = hashlib.sha256(content).hexdigest()
-        connection.execute(
-            """
-            INSERT INTO pdf_files (id, sha256, size_bytes, storage_path, created_at)
-            VALUES (100, %s, %s, 'validation-upload.pdf', '2026-08-12T00:02:00Z')
-            """,
-            (digest, len(content)),
-        )
-        connection.execute(
-            """
-            INSERT INTO pdf_versions (
-                id, product_id, pdf_file_id, version_no, original_filename,
-                uploaded_by, uploaded_at
-            ) VALUES (
-                100, 100, 100, 1, 'validation.pdf', 1, '2026-08-12T00:02:00Z'
-            )
-            """
-        )
-        connection.execute(
-            "UPDATE products SET current_version_id = 100, status = 'disabled', "
-            "updated_at = '2026-08-12T00:03:00Z' WHERE id = 100"
-        )
-        connection.execute(
-            """
-            INSERT INTO admin_sessions (
-                id, admin_id, token_hash, issued_at, expires_at, revoked_at
-            ) VALUES (
-                '00000000-0000-0000-0000-000000000100', 1,
-                %s, '2026-08-12T00:02:00Z', '2026-08-12T01:02:00Z',
-                '2026-08-12T00:03:00Z'
-            )
-            """,
-            ("a" * 64,),
         )
         connection.execute(
             """
@@ -201,14 +172,117 @@ def _apply_validation() -> None:
                 id, occurred_at, actor_type, actor_id, action, target_type,
                 target_id, product_code, result, request_id, detail
             ) VALUES (
-                100, '2026-08-12T00:03:00Z', 'admin', 1,
-                'compatibility_validation', 'product', 100,
-                'VALIDATION_PRODUCT', 'success', NULL,
-                '{"all_supported_actions": true}'::jsonb
+                900, now(), 'system', NULL, 'isolated_full_read_write',
+                'product', NULL, 'ISOLATED_VALIDATION', 'success', NULL,
+                '{"discarded": true}'::jsonb
             )
             """
         )
-    Path(_required("PR2B_FILE_ROOT"), "validation-upload.pdf").write_bytes(content)
+        connection.rollback()
+    temporary = Path(_required("PR2B_FILE_ROOT"), "temporary", "isolated-validation.pdf")
+    temporary.parent.mkdir(parents=True, exist_ok=True)
+    temporary.write_bytes(b"%PDF-1.4\nisolated dynamic validation\n")
+    temporary.unlink()
+
+
+def _assert_w1() -> None:
+    with psycopg.connect(_psycopg_url()) as connection:
+        products = {
+            row[0]
+            for row in connection.execute(
+                "SELECT code FROM products WHERE code IN ('B0_PRODUCT', 'W1_PRODUCT')"
+            )
+        }
+        audits = {
+            row[0]
+            for row in connection.execute(
+                "SELECT action FROM audit_events WHERE action IN ('b0_seed', 'w1_public_write')"
+            )
+        }
+    root = Path(_required("PR2B_FILE_ROOT"))
+    if (
+        products != {"B0_PRODUCT", "W1_PRODUCT"}
+        or audits != {"b0_seed", "w1_public_write"}
+        or not (root / "b0-history.pdf").is_file()
+        or not (root / "w1-after-cutover.pdf").is_file()
+    ):
+        raise RollbackSafetyError("synthetic non-mutating W1 validation failed")
+
+
+def _publication_fence(arguments: list[str]) -> None:
+    action = arguments[0] if arguments else ""
+    values = {arguments[index]: arguments[index + 1] for index in range(1, len(arguments) - 1, 2)}
+    value = _state()
+    fence = value["fence"]
+    release_id = values.get("--release-id", "")
+    operation_id = values.get("--operation-id", "")
+    environment_id = values.get("--environment-id", "")
+    if action == "engage":
+        fence.update(
+            {
+                "engaged": True,
+                "fence_id": f"fence-{operation_id}",
+                "release_id": release_id,
+                "operation_id": operation_id,
+                "environment_id": environment_id,
+            }
+        )
+        _record_call(value, "publication-fence:engage")
+        value = _state()
+        fence = value["fence"]
+    elif any(
+        (
+            fence["release_id"] != release_id,
+            fence["operation_id"] != operation_id,
+            fence["environment_id"] != environment_id,
+            not fence["engaged"],
+        )
+    ):
+        raise RollbackSafetyError("synthetic publication fence is not engaged")
+    if action == "publish":
+        if (
+            value["services"]["app"]["image"] != _required("PR2B_SYNTHETIC_EXPECTED_APP_IMAGE")
+            or value["services"]["app"]["running"] is not True
+            or value["services"]["proxy"]["running"] is not True
+        ):
+            raise RollbackSafetyError("synthetic fence refused an unready identity")
+        fence["engaged"] = False
+        _record_call(value, "publication-fence:publish")
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "release_id": release_id,
+                    "operation_id": operation_id,
+                    "environment_id": environment_id,
+                    "fence_id": fence["fence_id"],
+                    "engaged": False,
+                    "customer_traffic_blocked": False,
+                    "readiness_probe_allowed": True,
+                    "external_ready": True,
+                    "published_at": format_time(datetime.now(tz=UTC)),
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    if action not in {"engage", "status"}:
+        raise RollbackSafetyError("unknown synthetic publication fence action")
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "release_id": release_id,
+                "operation_id": operation_id,
+                "environment_id": environment_id,
+                "fence_id": fence["fence_id"],
+                "engaged": True,
+                "customer_traffic_blocked": True,
+                "readiness_probe_allowed": True,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def docker(arguments: list[str]) -> int:
@@ -295,8 +369,14 @@ def main() -> None:
     command = sys.argv[1] if len(sys.argv) > 1 else ""
     if command == "docker":
         raise SystemExit(docker(sys.argv[2:]))
-    if command == "apply-validation":
-        _apply_validation()
+    if command == "isolated-full-validation":
+        _isolated_full_validation()
+        return
+    if command == "assert-w1":
+        _assert_w1()
+        return
+    if command == "publication-fence":
+        _publication_fence(sys.argv[2:])
         return
     if command == "reset-b0":
         _reset_b0()

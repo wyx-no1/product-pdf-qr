@@ -32,7 +32,6 @@ from scripts.deploy_rollback.model import (
     format_time,
     release_identity,
     switch_runtime_identity,
-    validate_compatibility_validation_plan,
     validate_execution_environment,
     validate_lossy_authorization,
     validate_release_record,
@@ -184,6 +183,11 @@ def release_record(*, compatible: bool = True, migrated: bool = True) -> dict[st
             },
         },
         "release_approval": deepcopy(approval),
+        "publication_fence": {
+            "command_sha256": digest_json(["/usr/bin/synthetic-publication-fence"]),
+            "readiness_bypass_only": True,
+            "approval": deepcopy(approval),
+        },
         "stable_isolation_smoke": {
             "passed": True,
             "run_id": "stable-smoke-40",
@@ -244,29 +248,6 @@ def validation_watermark(baseline: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def validation_plan(
-    record: dict[str, Any],
-    baseline: dict[str, Any],
-    expected_after: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "release_id": record["release_id"],
-        "release_identity": release_identity(record),
-        "operation_id": "operation-40",
-        "baseline_watermark_sha256": validate_watermark(baseline),
-        "expected_after_watermark": expected_after,
-        "delta_id": "synthetic-validation-delta-40",
-        "full_read_write_actions": {action: True for action in sorted(ACTIONS)},
-        "preservation_assertions": {
-            "all_preexisting_relation_rows_retained": True,
-            "all_preexisting_files_retained": True,
-            "all_preexisting_audit_events_retained": True,
-            "schema_db_image_volumes_secrets_unchanged": True,
-        },
-    }
-
-
 def publication(
     tmp_path: Path,
     record: dict[str, Any],
@@ -301,8 +282,7 @@ class FakeHost:
         self.proxy_stopped = True
         self.calls: list[str] = []
         self.active_version = "candidate"
-        self.validation_plan_value: dict[str, Any] | None = None
-        self.validation_after = validation_watermark(current)
+        self.validation_mutates = False
 
     def retain_exact_artifacts(self, record: Any) -> None:
         validate_release_record(record)
@@ -323,16 +303,11 @@ class FakeHost:
         self.calls.append("assert_proxy_stopped")
         return self.proxy_stopped
 
-    def full_old_app_validation(self) -> bool:
-        self.calls.append("full_old_app_validation")
-        if self.old_app_passes:
-            self.watermark = self.validation_after
+    def nonmutating_old_app_validation(self) -> bool:
+        self.calls.append("nonmutating_old_app_validation")
+        if self.validation_mutates:
+            self.watermark = validation_watermark(self.watermark)
         return self.old_app_passes
-
-    def compatibility_validation_plan(self) -> dict[str, Any]:
-        self.calls.append("compatibility_validation_plan")
-        assert self.validation_plan_value is not None
-        return self.validation_plan_value
 
     def candidate_validation(self) -> bool:
         self.calls.append("candidate_validation")
@@ -340,7 +315,7 @@ class FakeHost:
 
     def authorize_proxy(self, evidence: Any) -> None:
         assert (
-            evidence.get("full_read_write_validated") is True
+            evidence.get("nonmutating_production_validation") is True
             or evidence.get("roll_forward") is True
         )
         self.calls.append("authorize_proxy")
@@ -367,7 +342,6 @@ def engine(
     *,
     isolated: bool,
 ) -> RollbackEngine:
-    host.validation_plan_value = validation_plan(record, current, host.validation_after)
     return RollbackEngine(
         record=record,
         operation_id="operation-40",
@@ -584,14 +558,13 @@ def test_t40_16_to_20_compatible_path_two_preserves_w0_and_w1(
     assert host.active_version == "stable"
     assert host.calls == [
         "retain_exact_artifacts",
-        "compatibility_validation_plan",
         "stop_proxy",
         "assert_proxy_stopped",
         "stop_app",
         "start_app:stable",
         "assert_proxy_stopped",
         "current_watermark",
-        "full_old_app_validation",
+        "nonmutating_old_app_validation",
         "current_watermark",
         "authorize_proxy",
         "start_proxy",
@@ -636,30 +609,16 @@ def test_t40_18_19_runtime_pointer_has_no_db_volume_or_secret_surface(
     assert json.loads((tmp_path / "runtime.json").read_text()) == identity
 
 
-def test_t40_16_17_mutating_validation_requires_predeclared_delta_and_w1_proof(
+def test_t40_16_17_production_validation_is_nonmutating_and_mechanically_preserves_w1(
     tmp_path: Path,
 ) -> None:
     record = release_record()
     baseline = watermark("w0-plus-w1")
-    expected_after = validation_watermark(baseline)
-    plan = validation_plan(record, baseline, expected_after)
-    assert (
-        validate_compatibility_validation_plan(
-            plan,
-            record=record,
-            operation_id="operation-40",
-            baseline_watermark=baseline,
-        )
-        == plan
-    )
-    changed = deepcopy(plan)
-    changed["expected_after_watermark"] = watermark("observed-after-the-fact")
     host = FakeHost(baseline)
-    host.validation_plan_value = changed
+    host.validation_mutates = True
     state = publication(tmp_path, record, public=True)
     rollback = engine(tmp_path, record, state, baseline, host, isolated=False)
-    host.validation_plan_value = changed
-    with pytest.raises(RollbackSafetyError, match="predeclared expected delta"):
+    with pytest.raises(RollbackSafetyError, match="production W1 changed"):
         rollback.run()
     assert host.active_version == "candidate"
 
@@ -877,6 +836,7 @@ def test_t40_33_environment_marker_rejects_default_context_and_generic_confirmat
         "compose_project": "synthetic-run-40",
         "resource_prefix": "synthetic-run-40",
         "target_marker": "SYNTHETIC_PR2B_LOCAL_ONLY",
+        "publication_fence_command": ["/usr/bin/synthetic-publication-fence"],
     }
     path.write_bytes(canonical_json(marker))
     path.chmod(0o600)
@@ -890,6 +850,17 @@ def test_t40_33_environment_marker_rejects_default_context_and_generic_confirmat
         )
         == marker
     )
+    marker["publication_fence_command"] = ["/usr/bin/unapproved-fence"]
+    path.write_bytes(canonical_json(marker))
+    with pytest.raises(RollbackSafetyError, match="differs from release approval"):
+        validate_execution_environment(
+            path,
+            record=record,
+            operation_id="operation-40",
+            operator="synthetic-operator",
+            confirmation="synthetic:synthetic-pr2b:operation-40",
+        )
+    marker["publication_fence_command"] = ["/usr/bin/synthetic-publication-fence"]
     marker["docker_context"] = "default"
     path.write_bytes(canonical_json(marker))
     with pytest.raises(RollbackSafetyError, match="default context"):
@@ -939,6 +910,8 @@ def test_t40_35_37_static_surface_reuses_pr2a_and_has_no_data_cleanup_bypass() -
     ordinary_restore = wrapper.rindex(
         '"$PR2B_STABLE_CHECKOUT/scripts/backup_recovery/restore-run.sh" "$backup_id"'
     )
+    assert wrapper.index("fence fence-engage") < ordinary_restore
+    assert ordinary_restore < wrapper.index("fence fence-assert", ordinary_restore)
     assert ordinary_restore < wrapper.index("post_restore_watermark=", ordinary_restore)
     assert wrapper.index("post_restore_watermark=", ordinary_restore) < wrapper.index(
         "cli verify-pr2a-result", ordinary_restore
@@ -946,11 +919,19 @@ def test_t40_35_37_static_surface_reuses_pr2a_and_has_no_data_cleanup_bypass() -
     assert wrapper.index("cli verify-pr2a-result", ordinary_restore) < wrapper.index(
         "cli complete-pr2a", ordinary_restore
     )
+    assert wrapper.index("cli verify-pr2a-result", ordinary_restore) < wrapper.index(
+        "fence fence-publish", ordinary_restore
+    )
     authorized_restore = authorized.index(
         '"$PR2B_STABLE_CHECKOUT/scripts/backup_recovery/restore-run.sh" "$backup_id"'
     )
     assert authorized.index("activate_stable_stopped_identity") < authorized_restore
+    assert authorized.index("fence fence-engage") < authorized_restore
+    assert authorized_restore < authorized.index("fence fence-assert", authorized_restore)
     assert authorized_restore < authorized.index("post_restore_watermark=", authorized_restore)
+    assert authorized.index("cli verify-pr2a-result", authorized_restore) < authorized.index(
+        "fence fence-publish", authorized_restore
+    )
     assert "--use-persisted-baseline" not in wrapper
     assert "--use-persisted-baseline" not in authorized
     for forbidden in (
@@ -995,6 +976,7 @@ def test_t40_36_any_exact_release_change_invalidates_old_g19() -> None:
             "sha256", "7" * 64
         ),
         lambda item: item["pre_release_backup"].__setitem__("g19_watermark_sha256", "6" * 64),
+        lambda item: item["publication_fence"].__setitem__("command_sha256", "5" * 64),
     )
     for mutation in mutations:
         changed = deepcopy(record)

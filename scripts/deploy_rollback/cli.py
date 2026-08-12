@@ -196,6 +196,15 @@ def parser() -> argparse.ArgumentParser:
     readiness.add_argument("--environment-confirmation", required=True)
     readiness.add_argument("--repository-root", type=Path, required=True)
 
+    for name in ("fence-engage", "fence-assert", "fence-publish"):
+        fence = commands.add_parser(name)
+        _add_record_lookup(fence)
+        fence.add_argument("--operation-id", required=True)
+        fence.add_argument("--operator", required=True)
+        fence.add_argument("--environment-marker", type=Path, required=True)
+        fence.add_argument("--environment-confirmation", required=True)
+        fence.add_argument("--fence-state", type=Path, required=True)
+
     complete = commands.add_parser("complete-pr2a")
     _add_operation(complete)
     complete.add_argument("--state", type=Path, required=True)
@@ -291,6 +300,89 @@ def _verify_stable_checkout(
         "backup_id": record["pre_release_backup"]["backup_id"],
         "restore_entrypoint": str(checkout / "scripts/backup_recovery/restore-run.sh"),
     }
+
+
+def _fence_result(
+    environment: dict[str, Any],
+    *,
+    action: str,
+    record: dict[str, Any],
+    operation_id: str,
+) -> dict[str, Any]:
+    command = environment["publication_fence_command"]
+    result = subprocess.run(
+        [
+            *command,
+            action,
+            "--release-id",
+            str(record["release_id"]),
+            "--operation-id",
+            operation_id,
+            "--environment-id",
+            str(record["environment_id"]),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RollbackSafetyError(f"publication fence {action} failed")
+    try:
+        observed = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RollbackSafetyError("publication fence returned invalid JSON") from error
+    common = {
+        "schema_version": 1,
+        "release_id": record["release_id"],
+        "operation_id": operation_id,
+        "environment_id": record["environment_id"],
+    }
+    if not isinstance(observed, dict) or any(
+        observed.get(key) != value for key, value in common.items()
+    ):
+        raise RollbackSafetyError("publication fence evidence is cross-bound")
+    return observed
+
+
+def _assert_fence_evidence(
+    observed: dict[str, Any],
+    *,
+    engaged: bool,
+    fence_id: str | None = None,
+) -> str:
+    expected_fields = {
+        "schema_version",
+        "release_id",
+        "operation_id",
+        "environment_id",
+        "fence_id",
+        "engaged",
+        "customer_traffic_blocked",
+        "readiness_probe_allowed",
+    }
+    if set(observed) != expected_fields:
+        raise RollbackSafetyError("publication fence evidence schema mismatch")
+    observed_fence_id = observed["fence_id"]
+    if (
+        not isinstance(observed_fence_id, str)
+        or not observed_fence_id
+        or (fence_id is not None and observed_fence_id != fence_id)
+        or observed["engaged"] is not engaged
+        or observed["customer_traffic_blocked"] is not engaged
+        or observed["readiness_probe_allowed"] is not True
+    ):
+        raise RollbackSafetyError("publication fence is not in the required state")
+    return observed_fence_id
+
+
+def _fence_environment(options: argparse.Namespace, record: dict[str, Any]) -> dict[str, Any]:
+    return validate_execution_environment(
+        options.environment_marker,
+        record=record,
+        operation_id=options.operation_id,
+        operator=options.operator,
+        confirmation=options.environment_confirmation,
+    )
 
 
 def run(arguments: list[str] | None = None) -> int:
@@ -446,6 +538,98 @@ def run(arguments: list[str] | None = None) -> int:
                 options.production_env,
                 options.backup_env,
             )
+        elif options.command == "fence-engage":
+            _assert_shared_lease()
+            environment = _fence_environment(options, record)
+            observed = _fence_result(
+                environment,
+                action="engage",
+                record=record,
+                operation_id=options.operation_id,
+            )
+            fence_id = _assert_fence_evidence(observed, engaged=True)
+            atomic_write(
+                options.fence_state,
+                canonical_json(
+                    {
+                        "schema_version": 1,
+                        "release_id": record["release_id"],
+                        "release_identity": release_identity(record),
+                        "operation_id": options.operation_id,
+                        "environment_id": record["environment_id"],
+                        "fence_id": fence_id,
+                        "engaged_at": format_time(datetime.now(tz=UTC)),
+                    }
+                ),
+            )
+            result = {"status": "publication_fenced", "fence_id": fence_id}
+        elif options.command == "fence-assert":
+            _assert_shared_lease()
+            state = read_json_file(options.fence_state)
+            if (
+                state.get("release_id") != record["release_id"]
+                or state.get("release_identity") != release_identity(record)
+                or state.get("operation_id") != options.operation_id
+                or state.get("environment_id") != record["environment_id"]
+            ):
+                raise RollbackSafetyError("publication fence state is cross-bound")
+            environment = _fence_environment(options, record)
+            observed = _fence_result(
+                environment,
+                action="status",
+                record=record,
+                operation_id=options.operation_id,
+            )
+            fence_id = _assert_fence_evidence(
+                observed,
+                engaged=True,
+                fence_id=str(state.get("fence_id", "")),
+            )
+            result = {"status": "publication_fenced", "fence_id": fence_id}
+        elif options.command == "fence-publish":
+            _assert_shared_lease()
+            state = read_json_file(options.fence_state)
+            if (
+                state.get("release_id") != record["release_id"]
+                or state.get("release_identity") != release_identity(record)
+                or state.get("operation_id") != options.operation_id
+                or state.get("environment_id") != record["environment_id"]
+            ):
+                raise RollbackSafetyError("publication fence state is cross-bound")
+            environment = _fence_environment(options, record)
+            observed = _fence_result(
+                environment,
+                action="publish",
+                record=record,
+                operation_id=options.operation_id,
+            )
+            expected_fields = {
+                "schema_version",
+                "release_id",
+                "operation_id",
+                "environment_id",
+                "fence_id",
+                "engaged",
+                "customer_traffic_blocked",
+                "readiness_probe_allowed",
+                "external_ready",
+                "published_at",
+            }
+            if (
+                set(observed) != expected_fields
+                or observed.get("fence_id") != state.get("fence_id")
+                or observed.get("engaged") is not False
+                or observed.get("customer_traffic_blocked") is not False
+                or observed.get("readiness_probe_allowed") is not True
+                or observed.get("external_ready") is not True
+            ):
+                raise RollbackSafetyError("publication fence did not atomically publish readiness")
+            published_at = parse_time(str(observed.get("published_at")), field="published_at")
+            result = {
+                "status": "published",
+                "fence_id": state["fence_id"],
+                "published_at": format_time(published_at),
+            }
         elif options.command == "verify-pr2a-result":
             _assert_shared_lease()
             expected = _state(options, record).read()["baseline_watermark"]

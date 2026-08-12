@@ -24,15 +24,25 @@ from scripts.deploy_rollback.model import (
     ReleaseStore,
     atomic_write,
     canonical_json,
+    digest_json,
     format_time,
     release_identity,
     validate_watermark,
 )
-from scripts.deploy_rollback.rehearsal_fixture import _apply_validation, _reset_b0
+from scripts.deploy_rollback.rehearsal_fixture import _reset_b0
 from scripts.deploy_rollback.watermark import build_watermark
 
 ROOT = Path(__file__).parents[2]
 BACKUP_ID = f"20260812T033000Z-{'b' * 32}"
+
+
+def _fence_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "scripts.deploy_rollback.rehearsal_fixture",
+        "publication-fence",
+    ]
 
 
 def _run(
@@ -188,6 +198,11 @@ def _record(
             },
         },
         "release_approval": deepcopy(approval),
+        "publication_fence": {
+            "command_sha256": digest_json(_fence_command()),
+            "readiness_bypass_only": True,
+            "approval": deepcopy(approval),
+        },
         "stable_isolation_smoke": {
             "passed": True,
             "run_id": f"smoke-{release_id}",
@@ -291,6 +306,13 @@ def _service_state(path: Path, record: dict[str, Any], image_ids: dict[str, str]
                 },
                 "image_ids": image_ids,
                 "calls": [],
+                "fence": {
+                    "engaged": False,
+                    "fence_id": "",
+                    "release_id": "",
+                    "operation_id": "",
+                    "environment_id": "",
+                },
             }
         ),
     )
@@ -328,6 +350,7 @@ def _common_environment(
                 "compose_project": "synthetic-pr2b-e2e",
                 "resource_prefix": "synthetic-pr2b-e2e",
                 "target_marker": "SYNTHETIC_PR2B_LOCAL_ONLY",
+                "publication_fence_command": _fence_command(),
             }
         ),
     )
@@ -353,8 +376,8 @@ def _common_environment(
             "PR2B_WATERMARK_COMMAND_JSON": json.dumps(
                 [python, "-m", "scripts.deploy_rollback.watermark"]
             ),
-            "PR2B_FULL_VALIDATION_COMMAND_JSON": json.dumps(
-                [python, "-m", "scripts.deploy_rollback.rehearsal_fixture", "apply-validation"]
+            "PR2B_NONMUTATING_VALIDATION_COMMAND_JSON": json.dumps(
+                [python, "-m", "scripts.deploy_rollback.rehearsal_fixture", "assert-w1"]
             ),
             "PR2B_CANDIDATE_VALIDATION_COMMAND_JSON": json.dumps(
                 [
@@ -371,7 +394,12 @@ def _common_environment(
                 [python, "-m", "scripts.deploy_rollback.rehearsal_fixture", "noop"]
             ),
             "PR2B_ISOLATED_VALIDATION_COMMAND_JSON": json.dumps(
-                [python, "-m", "scripts.deploy_rollback.rehearsal_fixture", "noop"]
+                [
+                    python,
+                    "-m",
+                    "scripts.deploy_rollback.rehearsal_fixture",
+                    "isolated-full-validation",
+                ]
             ),
             "PR2B_PUBLICATION_COMMAND_JSON": json.dumps(
                 [python, "-m", "scripts.deploy_rollback.rehearsal_fixture", "publish-candidate"]
@@ -433,6 +461,7 @@ def _scenario_paths(run_root: Path, prefix: str) -> dict[str, Path]:
         "runtime": root / "runtime.json",
         "result": root / "result.json",
         "service": root / "services.json",
+        "fence": root / "publication-fence.json",
     }
 
 
@@ -447,6 +476,7 @@ def _bind_paths(environment: dict[str, str], paths: dict[str, Path]) -> None:
             "PR2B_RUNTIME_IDENTITY": str(paths["runtime"]),
             "PR2B_RESULT": str(paths["result"]),
             "PR2B_SYNTHETIC_SERVICE_STATE": str(paths["service"]),
+            "PR2B_PUBLICATION_FENCE_STATE": str(paths["fence"]),
         }
     )
 
@@ -470,7 +500,7 @@ def run_round(run_root: Path, migration_url: str, backup_url: str) -> None:
     _reset_b0()
     w0 = build_watermark(database_url=backup_url, file_root=file_root)
 
-    # Compatible, post-cutover path: W1 must remain and validation has an explicit delta.
+    # Compatible path: release rehearsal is mutating; production switch is read-only.
     compatible_paths = _scenario_paths(run_root, "compatible")
     compatible, image_ids = _record(
         checkout, release_id="release-compatible", compatible=True, w0=w0
@@ -501,36 +531,6 @@ def run_round(run_root: Path, migration_url: str, backup_url: str) -> None:
     _add_w1(migration_url, file_root)
     w1 = build_watermark(database_url=backup_url, file_root=file_root)
     atomic_write(compatible_paths["watermark"], canonical_json(w1))
-    _apply_validation()
-    expected_after = build_watermark(database_url=backup_url, file_root=file_root)
-    _reset_b0()
-    _add_w1(migration_url, file_root)
-    plan = {
-        "schema_version": 1,
-        "release_id": compatible["release_id"],
-        "release_identity": release_identity(compatible),
-        "operation_id": "rollback-compatible",
-        "baseline_watermark_sha256": validate_watermark(w1),
-        "expected_after_watermark": expected_after,
-        "delta_id": "e2e-compatible-delta",
-        "full_read_write_actions": {
-            action: True for action in sorted(REQUIRED_COMPATIBILITY_ACTIONS)
-        },
-        "preservation_assertions": {
-            "all_preexisting_relation_rows_retained": True,
-            "all_preexisting_files_retained": True,
-            "all_preexisting_audit_events_retained": True,
-            "schema_db_image_volumes_secrets_unchanged": True,
-        },
-    }
-    plan_path = compatible_paths["root"] / "validation-plan.json"
-    atomic_write(plan_path, canonical_json(plan), mode=0o400)
-    atomic_write(
-        plan_path.with_suffix(".json.sha256"),
-        (hashlib.sha256(plan_path.read_bytes()).hexdigest() + "\n").encode(),
-        mode=0o400,
-    )
-    environment["PR2B_COMPATIBILITY_VALIDATION_PLAN"] = str(plan_path)
     environment["PR2B_ENVIRONMENT_CONFIRMATION"] = (
         "synthetic:synthetic-pr2b-e2e:rollback-compatible"
     )
@@ -545,8 +545,8 @@ def run_round(run_root: Path, migration_url: str, backup_url: str) -> None:
         cwd=checkout,
         environment=environment,
     )
-    if build_watermark(database_url=backup_url, file_root=file_root) != expected_after:
-        raise RuntimeError("compatible wrapper did not preserve W1 plus expected validation delta")
+    if build_watermark(database_url=backup_url, file_root=file_root) != w1:
+        raise RuntimeError("compatible wrapper did not mechanically preserve exact W1")
     service = json.loads(compatible_paths["service"].read_text(encoding="utf-8"))
     if (
         service["services"]["app"]["image"] != compatible["stable"]["images"]["app"]
@@ -600,10 +600,15 @@ def run_round(run_root: Path, migration_url: str, backup_url: str) -> None:
     if (
         service["services"]["app"]["image"] != path_one["stable"]["images"]["app"]
         or service["services"]["proxy"]["running"] is not True
+        or service["fence"]["engaged"] is not False
         or not any("restore-database" in call for call in service["calls"])
         or not any("restore-files" in call for call in service["calls"])
+        or service["calls"].index("publication-fence:engage")
+        > next(index for index, call in enumerate(service["calls"]) if "restore-database" in call)
+        or service["calls"].index("publication-fence:publish")
+        < next(index for index, call in enumerate(service["calls"]) if "restore-files" in call)
     ):
-        raise RuntimeError("path one did not drive exact stable PR2A restore")
+        raise RuntimeError("path one did not fence the exact stable PR2A restore")
 
     # Incompatible authorized path: decision 78 first, then exact stable identity and B0.
     _reset_b0()
@@ -699,11 +704,17 @@ def run_round(run_root: Path, migration_url: str, backup_url: str) -> None:
     if (
         service["services"]["app"]["image"] != lossy["stable"]["images"]["app"]
         or service["services"]["proxy"]["running"] is not True
+        or service["fence"]["engaged"] is not False
+        or service["calls"].index("publication-fence:engage")
+        > next(index for index, call in enumerate(service["calls"]) if "restore-database" in call)
+        or service["calls"].index("publication-fence:publish")
+        < next(index for index, call in enumerate(service["calls"]) if "restore-files" in call)
     ):
-        raise RuntimeError("authorized path restarted candidate identity against B0")
+        raise RuntimeError("authorized path exposed candidate/B0 outside the fence")
     print("real_wrappers=publication,rollback,authorized-lossy,pr2a-restore")
     print("real_postgresql=true real_file_state=true")
     print("path_one_b0_verified=true path_two_w1_preserved=true authorized_b0_verified=true")
+    print("publication_fence_continuous=true production_validation_nonmutating=true")
 
 
 def main() -> None:

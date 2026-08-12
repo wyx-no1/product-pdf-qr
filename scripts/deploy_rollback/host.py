@@ -153,46 +153,12 @@ class ShellHostAdapter:
         )
         return not result.stdout.strip()
 
-    def full_old_app_validation(self) -> bool:
+    def nonmutating_old_app_validation(self) -> bool:
         try:
-            self._run(_command_from_environment("PR2B_FULL_VALIDATION_COMMAND_JSON"))
+            self._run(_command_from_environment("PR2B_NONMUTATING_VALIDATION_COMMAND_JSON"))
         except RollbackSafetyError:
             return False
         return True
-
-    def compatibility_validation_plan(self) -> Mapping[str, Any]:
-        path_value = os.environ.get("PR2B_COMPATIBILITY_VALIDATION_PLAN", "")
-        path = Path(path_value)
-        if (
-            not path.is_absolute()
-            or path == Path("/")
-            or path.is_symlink()
-            or not path.is_file()
-            or path.stat().st_mode & 0o022
-        ):
-            raise RollbackSafetyError(
-                "compatibility validation plan must be a bounded immutable file"
-            )
-        digest_path = path.with_suffix(f"{path.suffix}.sha256")
-        if (
-            digest_path.is_symlink()
-            or not digest_path.is_file()
-            or digest_path.stat().st_mode & 0o022
-        ):
-            raise RollbackSafetyError("compatibility validation plan seal is unavailable")
-        payload = path.read_bytes()
-        expected = digest_path.read_text(encoding="ascii").strip()
-        import hashlib
-
-        if hashlib.sha256(payload).hexdigest() != expected:
-            raise RollbackSafetyError("compatibility validation plan seal mismatch")
-        try:
-            plan = json.loads(payload)
-        except json.JSONDecodeError as error:
-            raise RollbackSafetyError("compatibility validation plan is invalid JSON") from error
-        if not isinstance(plan, dict):
-            raise RollbackSafetyError("compatibility validation plan must be a JSON object")
-        return plan
 
     def candidate_validation(self) -> bool:
         try:

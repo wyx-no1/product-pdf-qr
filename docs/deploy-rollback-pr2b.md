@@ -30,13 +30,13 @@
   接口。旧 app 任一验证失败会在 proxy 停止时精确恢复候选 app/config；候选验证通过后，只有路径二
   才恢复公开服务。
 
-完整读写验证会合法地产生产品、版本、文件、session 和追加审计，因此不再把验证后水位错误地要求为
-W1 原值。操作开始前必须提供 mode 不可写且带 SHA-256 seal 的
-`PR2B_COMPATIBILITY_VALIDATION_PLAN`，绑定 exact release/operation、W1 摘要、十五项动作、预先
-计算的完整期望 delta 水位，以及“既有关系行、历史文件、既有审计、schema/db image/卷/秘密引用均
-保留”的四项断言。脚本在变更前先重算并确认 W1，再执行读写验证，最后要求实际水位精确等于这个
-预声明 delta；不能拿执行后的实际值反向充当期望值。验证中途失败时精确 roll-forward 候选 app，
-并以失败瞬间的完整水位为不再变化的基线，保留已经追加的合成验证记录。
+完整读写验证会合法地产生产品、版本、文件、session 和追加审计，所以它只能在公开发布前的隔离副本
+上完成并固化到 release record 的迁移责任方 exact-SHA 证据中。生产回滚切换不接受运行时计划中的
+自报布尔值或任意关系摘要；稳定 app 启动后只执行
+`PR2B_NONMUTATING_VALIDATION_COMMAND_JSON` 的只读兼容探测，并在探测前后各采集一次完整
+DB/files/audit 水位。两次水位都必须机械地精确等于已观察的 W1，否则保持 proxy 隔离并精确
+roll-forward 候选 app。因此真实时间戳、UUID 或追加审计不会被伪装成可预声明 delta，既有 W1 的
+任一行、文件或审计丢失也不能通过。
 
 兼容的含义是旧 app 对候选 schema 和候选已写值完成登录、创建、导入、上传、历史恢复、启停、
 未上传三态、公开读取、审计追加，并验证约束、默认值、枚举、触发器和权限。判定必须来自迁移责任方，
@@ -140,12 +140,12 @@ PR2B_ENVIRONMENT_MARKER
 PR2B_ENVIRONMENT_CONFIRMATION
 PR2B_STABLE_CHECKOUT
 PR2B_PROXY_CONTINUOUSLY_ISOLATED=yes|no
-PR2B_FULL_VALIDATION_COMMAND_JSON
-PR2B_COMPATIBILITY_VALIDATION_PLAN
+PR2B_NONMUTATING_VALIDATION_COMMAND_JSON
 PR2B_CANDIDATE_VALIDATION_COMMAND_JSON
 PR2B_WATERMARK_COMMAND_JSON
 PR2B_EXTERNAL_READINESS_COMMAND_JSON
 PR2B_PROXY_AUTHORIZATION_PATH
+PR2B_PUBLICATION_FENCE_STATE
 PR2B_MIGRATION_COMMAND_JSON
 PR2B_ISOLATED_VALIDATION_COMMAND_JSON
 PR2B_PUBLICATION_COMMAND_JSON
@@ -177,9 +177,13 @@ app-only 路径在取得 `scripts/backup_recovery/lock.sh` 的 owner lease 后�
 死/损坏 owner 必须人工核对，cleanup 只释放自身 lease。路径一先在共享 lease 内停
 proxy/app 并重算完整 W0；若水位竞态变化，就在同一 operation 转路径二而不恢复旧库。W0 冻结后
 释放准备 lease，再由原 `restore-run.sh` 从 preflight 到 proxy-last 全程持有同一 lease，避免
-嵌套死锁。PR2A 返回后，PR2B 会重新取得 lease 并立即再次隔离 proxy，重新采集恢复后的真实
+嵌套死锁。调用 PR2A 前还必须启用 release approval 和 environment marker 共同绑定的持久
+publication fence；它阻断全部客户流量，只允许 exact readiness 探针。PR2A 即使启动 compose
+proxy，客户仍不能写入或观察恢复结果；若 PR2B 重新取 lease 失败，fence 保持启用。PR2A 返回后，
+PR2B 会重新取得 lease、证明 fence 仍启用并再次隔离 compose proxy，重新采集恢复后的真实
 DB/files/audit 水位；只有它精确等于 publication state 中的 B0，才写入库外验证审计并重新
-proxy-last、执行外部 readiness。普通和人工获批有损路径都不能用保存的 B0 文件冒充恢复结果。
+启动 proxy、执行 fence 内 readiness，并由已批准 fence 命令原子完成最终公开与 readiness。
+普通和人工获批有损路径都不能用保存的 B0 文件冒充恢复结果。
 外部 readiness 的完成时间在返回瞬间固定；随后写审计的等待不会错误延长或重置 RTO。
 
 库外审计是 mode 0600 的 JSONL hash chain 加持久 head/count anchor。成功、拒绝、失败、重试、路径、
@@ -196,8 +200,9 @@ Issue #40 评论中的 T40-01 至 T40-37 不增删。实现级测试按同一编
 本地回滚演练连续执行两轮独立资源。每轮启动真实隔离 PostgreSQL 与文件树，执行真实
 `publication-run.sh`、`rollback-run.sh`、`authorized-lossy-run.sh` 和 PR2A
 `restore-run.sh`；只把 Docker 服务控制与外部 HTTPS 边界替换为记录 exact identity/阶段的本地
-适配器。每轮机械断言路径一恢复后真实水位等于 B0、兼容路径二保留 W1 并只增加预声明验证 delta、
-有损授权路径在 PR2A 前创建稳定 stopped identity 且恢复后为 B0。
+适配器。每轮机械断言路径一恢复后真实水位等于 B0、兼容路径二的生产只读探测前后水位精确等于
+W1、有损授权路径在 PR2A 前创建稳定 stopped identity 且恢复后为 B0；两条 PR2A 路径还断言
+publication fence 从 restore 前持续到 B0 验证和最终原子发布。
 
 ```sh
 make deploy-rollback-rehearsal

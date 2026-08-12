@@ -35,6 +35,7 @@ esac
 : "${PR2B_RESULT:?PR2B_RESULT is required}"
 : "${PR2B_ENVIRONMENT_MARKER:?PR2B_ENVIRONMENT_MARKER is required}"
 : "${PR2B_ENVIRONMENT_CONFIRMATION:?PR2B_ENVIRONMENT_CONFIRMATION is required}"
+: "${PR2B_PUBLICATION_FENCE_STATE:?PR2B_PUBLICATION_FENCE_STATE is required}"
 : "${PR2B_PROXY_CONTINUOUSLY_ISOLATED:?yes or no is required}"
 : "${PR2B_PYTHON:=python3}"
 
@@ -47,6 +48,7 @@ for path in \
   "$PR2B_RUNTIME_IDENTITY" \
   "$PR2B_RESULT" \
   "$PR2B_ENVIRONMENT_MARKER" \
+  "$PR2B_PUBLICATION_FENCE_STATE" \
   "$repository_root"; do
   case "$path" in
     /*) ;;
@@ -61,6 +63,17 @@ done
 
 cli() {
   "$PR2B_PYTHON" -m scripts.deploy_rollback.cli "$@"
+}
+
+fence() {
+  cli "$1" \
+    --store "$PR2B_RELEASE_STORE" \
+    --release-id "$release_id" \
+    --operation-id "$operation_id" \
+    --operator "$operator" \
+    --environment-marker "$PR2B_ENVIRONMENT_MARKER" \
+    --environment-confirmation "$PR2B_ENVIRONMENT_CONFIRMATION" \
+    --fence-state "$PR2B_PUBLICATION_FENCE_STATE"
 }
 
 # Persist the single RTO start before lock waits, artifact checks, or decisions.
@@ -186,6 +199,7 @@ case "$action" in
     set_operation_context
     verify_exact_artifacts
     require_stable_checkout
+    fence fence-engage >/dev/null
     "$repository_root/scripts/production/prod-compose.sh" stop --timeout 60 proxy app
     frozen_watermark="${PR2B_WATERMARK_FILE}.pre-public-freeze"
     cli capture-watermark \
@@ -228,6 +242,11 @@ case "$action" in
     acquire_pr2a_lock
     PR2B_LEASE_OWNER_PID=$$
     export PR2B_LEASE_OWNER_PID
+    if ! fence fence-assert >/dev/null; then
+      "$PR2B_STABLE_CHECKOUT/scripts/production/prod-compose.sh" \
+        stop --timeout 60 proxy >/dev/null 2>&1 || true
+      fail "publication fence continuity could not be proved"
+    fi
     # PR2A has completed its own state machine. Re-isolate before accepting the
     # result, then measure the actual restored DB/files/audit rather than W0 input.
     "$PR2B_STABLE_CHECKOUT/scripts/production/prod-compose.sh" stop --timeout 60 proxy
@@ -261,9 +280,14 @@ case "$action" in
         stop --timeout 60 proxy >/dev/null 2>&1 || true
       fail "post-restore external readiness failed; proxy re-isolated"
     fi
+    if ! publication="$(fence fence-publish)"; then
+      "$PR2B_STABLE_CHECKOUT/scripts/production/prod-compose.sh" \
+        stop --timeout 60 proxy >/dev/null 2>&1 || true
+      fail "atomic publication fence release failed; proxy re-isolated"
+    fi
     external_ready_at="$(
-      printf '%s\n' "$readiness" |
-        "$PR2B_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["external_ready_at"])'
+      printf '%s\n' "$publication" |
+        "$PR2B_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["published_at"])'
     )"
     cli complete-pr2a \
       --store "$PR2B_RELEASE_STORE" \

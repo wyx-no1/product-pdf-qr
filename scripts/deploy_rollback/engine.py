@@ -19,7 +19,6 @@ from scripts.deploy_rollback.model import (
     format_time,
     release_identity,
     switch_runtime_identity,
-    validate_compatibility_validation_plan,
     validate_release_record,
     validate_watermark,
 )
@@ -46,11 +45,8 @@ class HostAdapter(Protocol):
     def proxy_is_stopped(self) -> bool:
         """Return positive isolation evidence."""
 
-    def full_old_app_validation(self) -> bool:
-        """Exercise every supported read/write action against the forward schema."""
-
-    def compatibility_validation_plan(self) -> Mapping[str, Any]:
-        """Load the immutable expected delta declared before mutating validation."""
+    def nonmutating_old_app_validation(self) -> bool:
+        """Read the forward production state without changing rows, files, or audit."""
 
     def candidate_validation(self) -> bool:
         """Exercise the exact candidate after a failed old-app validation."""
@@ -239,12 +235,6 @@ class RollbackEngine:
         stage = "artifact_retention"
         try:
             self.host.retain_exact_artifacts(self.record)
-            plan = validate_compatibility_validation_plan(
-                self.host.compatibility_validation_plan(),
-                record=self.record,
-                operation_id=self.operation_id,
-                baseline_watermark=expected_watermark,
-            )
             stage = "proxy_isolation"
             proxy_stop_attempted = True
             self.host.stop_proxy()
@@ -264,25 +254,24 @@ class RollbackEngine:
             validate_watermark(observed_before)
             if digest_json(observed_before) != digest_json(expected_watermark):
                 raise RollbackSafetyError("data changed before old-app validation began")
-            stage = "stable_full_read_write_validation"
-            if not self.host.full_old_app_validation():
-                raise RollbackSafetyError("stable app full read/write validation failed")
-            stage = "expected_validation_delta"
+            stage = "stable_nonmutating_validation"
+            if not self.host.nonmutating_old_app_validation():
+                raise RollbackSafetyError("stable app non-mutating validation failed")
+            stage = "complete_watermark_validation"
             observed = self.host.current_watermark()
             validate_watermark(observed)
-            if digest_json(observed) != digest_json(plan["expected_after_watermark"]):
-                raise RollbackSafetyError(
-                    "old-app validation result differs from its predeclared expected delta"
-                )
+            if digest_json(observed) != digest_json(expected_watermark):
+                raise RollbackSafetyError("production W1 changed during app-only switch")
             evidence = {
                 "release_identity": release_identity(self.record),
                 "operation_id": self.operation_id,
                 "path": path,
                 "watermark_sha256": digest_json(observed),
-                "full_read_write_validated": True,
-                "validation_delta_id": plan["delta_id"],
+                "nonmutating_production_validation": True,
                 "baseline_watermark_sha256": digest_json(expected_watermark),
-                "preservation_assertions": plan["preservation_assertions"],
+                "approved_full_read_write_rehearsal": self.record["compatibility"]["g19_rehearsal"][
+                    "run_id"
+                ],
             }
             stage = "proxy_authorization"
             self.host.authorize_proxy(evidence)
