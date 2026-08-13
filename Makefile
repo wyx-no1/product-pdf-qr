@@ -3,7 +3,7 @@
 	lint migration-downgrade migration-upgrade test test-integration test-unit typecheck \
 	prod-config-check prod-env-check verify-clean-start \
 	backup-contract-check backup-config-check backup-image-build backup-image-reproducible \
-	backup-image-scan backup-recovery-rehearsal
+	backup-image-scan backup-recovery-rehearsal deploy-rollback-rehearsal
 
 UV ?= uv
 CLEAN_START_ATTEMPTS ?= 3
@@ -92,6 +92,9 @@ backup-image-scan: backup-image-build
 
 backup-recovery-rehearsal:
 	./scripts/backup_recovery/rehearse-local.sh
+
+deploy-rollback-rehearsal:
+	./scripts/deploy_rollback/rehearse-local.sh
 
 dev:
 	@test -f .env || cp .env.example .env
