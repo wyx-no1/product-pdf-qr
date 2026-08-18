@@ -207,7 +207,11 @@ async def _generate_with_audit(
     product: Product,
 ) -> QRCodeResult:
     try:
-        result = await qrcode_service.get_or_generate(product.code, product.public_token)
+        result = await qrcode_service.get_or_generate(
+            product.code,
+            product.public_token,
+            product.name or product.code,
+        )
     except QRCodeGenerationError as error:
         await _record_qrcode_outcome(
             database,
