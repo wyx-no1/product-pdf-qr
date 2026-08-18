@@ -41,7 +41,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-product_pdf_qr = ["templates/*.html"]
+product_pdf_qr = ["assets/*.md", "assets/*.otf", "assets/*.txt", "templates/*.html"]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"

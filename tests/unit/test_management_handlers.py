@@ -125,7 +125,7 @@ async def test_create_survives_qrcode_generation_failure(
 ) -> None:
     qrcode_service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
 
-    def fail_generate(_code: str, _token: str) -> bytes:
+    def fail_generate(_code: str, _token: str, _name: str) -> bytes:
         from product_pdf_qr.domains.qrcode import QRCodeGenerationError
 
         raise QRCodeGenerationError("synthetic generation failure")
@@ -171,7 +171,7 @@ async def test_list_and_detail_handlers_expose_persisted_state(tmp_path: Path) -
     assert "current_version_id IS NULL" in list_connection.queries[0]
 
     qrcode_service = QRCodeService(tmp_path, "http://127.0.0.1:8000")
-    await qrcode_service.get_or_generate("A001", "A" * 26)
+    await qrcode_service.get_or_generate("A001", "A" * 26, "测试产品")
     detail_database = as_database(ScriptedDatabase(ScriptedConnection([uploaded])))
 
     detail = await get_product_endpoint(5, detail_database, qrcode_service)
