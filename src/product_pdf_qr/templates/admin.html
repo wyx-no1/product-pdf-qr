@@ -356,6 +356,37 @@
       background: #fff;
     }
 
+    .qrcode-actions {
+      display: flex;
+      justify-content: center;
+      margin-top: 1rem;
+    }
+
+    .qrcode-download {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
+      padding: 0.7rem 1rem;
+      border-radius: 0.5rem;
+      color: #fff;
+      background: #2457d6;
+      text-decoration: none;
+      transition:
+        background-color 150ms ease,
+        transform 150ms ease;
+    }
+
+    .qrcode-download:hover {
+      color: #fff;
+      background: #1d47b2;
+      transform: translateY(-1px);
+    }
+
+    .qrcode-download:active {
+      transform: scale(0.98);
+    }
+
     .secondary-link {
       display: inline-block;
       margin-top: 1.25rem;
@@ -396,6 +427,15 @@
       *::before,
       *::after {
         scroll-behavior: auto !important;
+      }
+
+      .qrcode-download {
+        transition: none;
+      }
+
+      .qrcode-download:hover,
+      .qrcode-download:active {
+        transform: none;
       }
     }
   </style>
@@ -573,6 +613,9 @@
             <h3 id="qrcode-heading">产品二维码</h3>
             <p class="hint">二维码下方显示产品名称，下载或打印后也能辨认对应产品。</p>
             <img id="qrcode-image" class="qrcode" alt="产品公开访问二维码" hidden>
+            <div class="qrcode-actions">
+              <a id="qrcode-download" class="qrcode-download" hidden>下载二维码</a>
+            </div>
             <p id="qrcode-feedback" class="feedback" role="status" aria-live="polite"></p>
           </section>
         </div>
@@ -643,6 +686,7 @@
       const versionRows = document.querySelector("#version-rows");
       const qrcodeFeedback = document.querySelector("#qrcode-feedback");
       const qrcodeImage = document.querySelector("#qrcode-image");
+      const qrcodeDownload = document.querySelector("#qrcode-download");
       const emptyList = document.querySelector("#empty-list");
       const productTable = document.querySelector("#product-table");
       const productRows = document.querySelector("#product-rows");
@@ -733,6 +777,10 @@
         productContent.hidden = true;
         qrcodeImage.hidden = true;
         qrcodeImage.removeAttribute("src");
+        qrcodeDownload.hidden = true;
+        qrcodeDownload.removeAttribute("href");
+        qrcodeDownload.removeAttribute("download");
+        qrcodeDownload.removeAttribute("aria-label");
         setFeedback(uploadFeedback, "");
         setFeedback(lifecycleFeedback, "");
         setFeedback(historyFeedback, "");
@@ -781,6 +829,10 @@
         qrcodeImage.hidden = false;
         qrcodeImage.src = product.qrcode_url;
         qrcodeImage.alt = `${product.code} 产品公开访问二维码`;
+        qrcodeDownload.href = product.qrcode_url;
+        qrcodeDownload.download = `${product.code}.png`;
+        qrcodeDownload.setAttribute("aria-label", `下载 ${product.code} 产品二维码`);
+        qrcodeDownload.hidden = false;
       }
 
       function showMissingProduct(message) {

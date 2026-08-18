@@ -70,6 +70,7 @@ async def test_authenticated_admin_pages_render(
     assert 'id="detail-view"' in response.text
     assert 'id="status-toggle-button"' in response.text
     assert 'id="version-table"' in response.text
+    assert '<a id="qrcode-download" class="qrcode-download" hidden>下载二维码</a>' in response.text
     assert "管理员：business-owner" in response.text  # noqa: RUF001
     assert f'value="{csrf_token_for_session("browser-token")}"' in response.text
 
@@ -124,6 +125,10 @@ async def test_admin_page_uses_session_identity_for_complete_browser_workflow(
     assert "managementFetch(`/api/products/${productId}`)" in page
     assert "未找到该产品，可能已被移除。" in page  # noqa: RUF001
     assert "暂无产品。请使用上方表单创建第一个产品。" in page
+    assert 'qrcodeDownload.removeAttribute("href")' in page
+    assert "qrcodeDownload.href = product.qrcode_url" in page
+    assert "qrcodeDownload.download = `${product.code}.png`" in page
+    assert "qrcodeDownload.hidden = false" in page
 
 
 async def test_admin_page_routes_do_not_expand_openapi_surface() -> None:
